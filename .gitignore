@@ -1,0 +1,44 @@
+/.claude
+node_modules/
+dist/
+.vite/
+.wrangler/
+.dev.vars
+.dev.vars.*
+*.ait
+.env
+.env.*
+!.env.example
+!.env.*.example
+.env.cloudflare-turn.example
+.env.signaling.example
+promo/frames/
+promo/output/
+.workshop/promo/frames/
+.workshop/promo/output/
+# Frozen advertisement scenes, native captures, licensed audio and vendored render assets.
+.workshop/promo/source/
+
+# Test reports
+e2e-report.json
+e2e-results.log
+e2e/e2e-report-data.js
+e2e/report-viewer.js
+test-results/
+coverage/
+release-artifacts/
+
+# Ad-hoc debugging artifacts (SEO header dumps, git log exports, one-off fetch scripts)
+# If you need these, put them under scratch/ which is also ignored.
+gitlog*.txt
+gitlog*.diff
+headers.txt
+headers.json
+headers_*.json
+test.js
+test.mjs
+test_*.mjs
+scratch/
+
+# Local-only internal docs and operational notes
+docs/private/

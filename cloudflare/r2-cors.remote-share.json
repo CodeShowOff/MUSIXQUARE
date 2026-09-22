@@ -1,0 +1,36 @@
+{
+  "rules": [
+    {
+      "id": "remote-share-direct-put",
+      "allowed": {
+        "origins": [
+          "https://musixquare.com",
+          "https://www.musixquare.com",
+          "https://musixquare.apps.tossmini.com",
+          "https://musixquare.private-apps.tossmini.com",
+          "http://localhost:3000",
+          "http://127.0.0.1:3000",
+          "http://localhost:5173",
+          "http://127.0.0.1:5173",
+          "http://localhost:4173",
+          "http://127.0.0.1:4173"
+        ],
+        "methods": ["PUT"],
+        "headers": [
+          "content-type",
+          "if-match",
+          "x-amz-meta-cleanup-token",
+          "x-amz-meta-expires-at",
+          "x-amz-meta-format-version",
+          "x-amz-meta-mime",
+          "x-amz-meta-name",
+          "x-amz-meta-object-id",
+          "x-amz-meta-room-id",
+          "x-amz-meta-stored-size"
+        ]
+      },
+      "exposeHeaders": ["etag"],
+      "maxAgeSeconds": 3600
+    }
+  ]
+}

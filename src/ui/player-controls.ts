@@ -1,0 +1,1875 @@
+/**
+ * MUSIXQUARE — Player Controls (UI)
+ *
+ * Manages: Play/pause/prev/next buttons, volume slider, seek bar,
+ * mute toggle, role badge, media source popup, YouTube popup.
+ */
+
+import { log } from '../core/log.ts';
+import { bus, createBusScope } from '../core/events.ts';
+import { getState } from '../core/state.ts';
+import { MAX_SYSTEM_AUDIO_DEVICES, MSG, PLAYBACK_STATE } from '../core/constants.ts';
+import { safeSend } from '../network/peer.ts';
+import { formatSystemAudioProfileLabel } from '../core/system-audio-profile.ts';
+import { IS_ANDROID, IS_IOS, canCaptureSystemAudio } from '../core/platform.ts';
+import { setManagedTimer, clearManagedTimer } from '../core/timers.ts';
+import { t } from '../i18n/index.ts';
+import type { I18nKey } from '../i18n/index.ts';
+import { showToast } from './toast.ts';
+import { bindDemoInlineControls } from './demo-inline-controls.ts';
+import { applyUserTextFontFallback } from './user-text-font.ts';
+import { switchTab } from './tabs.ts';
+import {
+  cycleFocusWithin,
+  getUiElement,
+  syncOverlayState,
+  animateTransition,
+  copyTextToClipboard,
+  updateTitleWithMarquee,
+  normalizeEmptyContentEditable,
+} from './dom.ts';
+import { showDialog } from './dialog.ts';
+import { isFilePipelineBusyForPlay, togglePlay } from '../player/transport.ts';
+import { toggleRepeat, toggleShuffle } from '../player/playlist.ts';
+import { getCurrentAudioBuffer } from '../player/_state.ts';
+import { exitYouTubeFullscreen } from '../player/video.ts';
+import { getCurrentQueueItemId } from '../player/queue-model.ts';
+import { AUDIO_FILE_ACCEPT } from '../media/audio-file.ts';
+import {
+  clearPreviewDebounce,
+  clearYouTubeInputState,
+  getYouTubeInputIntent,
+} from '../youtube/search.ts';
+import { primeYouTubePlayer, waitForPendingYouTubePrimeBounce } from '../youtube/iframe.ts';
+import { YOUTUBE_PRIME_BOUNCE_TIMEOUT_MS } from '../youtube/constants.ts';
+import { getYouTubePlayer } from '../youtube/_state.ts';
+import { isYouTubeZeroStartProtocolActive } from '../youtube/zero-start.ts';
+import { initSeekBar } from './seekbar.ts';
+import { installRangeDragGuard, syncRangeProgress } from './range-drag.ts';
+import { initTabTitleMarquee, setTabTitlePlaying, setTabTitleTrack } from './tab-title-marquee.ts';
+import { getTrackDisplayTitle } from '../player/track-display.ts';
+import { createFileStartLoadingController } from './file-start-loading.ts';
+import type {
+  ProPlaybackUiControlKind,
+  TrackMeta,
+  YouTubeSyncLoadingOwner,
+} from '../types/index.ts';
+import { scheduleSessionReset } from '../core/session-reset.ts';
+import { navigateToAppHome } from '../core/navigation.ts';
+import { scopePlaybackModeActivity } from './_state-hooks.ts';
+import {
+  isPlaybackModeFile,
+  isPlaybackModeSystemAudio,
+  isPlaybackModeYouTube,
+} from '../player/ownership.ts';
+import {
+  getRoomContext,
+  hasRoomCapability,
+  isActiveStandardRoomCoordinator,
+  isCoordinator,
+} from '../rooms/authority.ts';
+import {
+  roomCapabilityRequiredMessage,
+  showRoomCapabilityRequired,
+} from '../rooms/permission-feedback.ts';
+import {
+  clearProRoomTrackChangeIntent,
+  isProRoomTrackChangeIntentPending,
+} from '../player/track-change-intent.ts';
+import { hasSystemAudioDeviceCapacity } from '../audio/system-audio-policy.ts';
+import {
+  canPublishProSystemAudioWithCurrentCoordinator,
+  getProSystemAudioOwnerDisplayName,
+  getProSystemAudioViewState,
+  isLocalProSystemAudioOwner,
+} from '../pro-room/system-audio-bridge.ts';
+import { getCurrentAccountNickname } from '../account/nickname.ts';
+import {
+  canPublishSynchronizedSettings,
+  isSettingsSyncEnabled,
+  isSynchronizedVolumeLocked,
+} from '../audio/effects.ts';
+
+// ─── Constants ───────────────────────────────────────────────────
+
+const STANDARD_ROLE_MAP: Record<string, { labelKey: I18nKey; placementToastKey: I18nKey }> = {
+  '0': { labelKey: 'common.original', placementToastKey: 'role.center_placement' },
+  '-1': { labelKey: 'common.left', placementToastKey: 'role.left_placement' },
+  '1': { labelKey: 'common.right', placementToastKey: 'role.right_placement' },
+  '2': { labelKey: 'common.woofer', placementToastKey: 'role.subwoofer_placement' },
+};
+
+let _ytPlayButtonLoading = false;
+const _ytSyncLoadingOwners = new Set<YouTubeSyncLoadingOwner | 'legacy'>();
+let _filePlayButtonLoading = false;
+let _scheduledFileStartLoading = false;
+let _fileStartLoadingController: ReturnType<typeof createFileStartLoadingController> | null = null;
+let _proPlaybackControlLoading = false;
+let _proPlaybackTransitionLoading = false;
+let _proPlaybackControlToken: number | null = null;
+let _proPlaybackControlKind: ProPlaybackUiControlKind | null = null;
+let _mediaSourcePreviousFocus: HTMLElement | null = null;
+let _youtubePopupPreviousFocus: HTMLElement | null = null;
+let _playButtonMediaEnabled = false;
+let _mainSyncPending = false;
+let _mainSyncRequestToken = 0;
+let _mediaSourceAttentionButton: HTMLElement | null = null;
+let _mediaSourceAttentionEnd: ((event: AnimationEvent) => void) | null = null;
+
+function clearMediaSourceAttentionHint(): void {
+  if (_mediaSourceAttentionButton && _mediaSourceAttentionEnd) {
+    _mediaSourceAttentionButton.removeEventListener('animationend', _mediaSourceAttentionEnd);
+  }
+  _mediaSourceAttentionButton?.classList.remove('attention-hint');
+  _mediaSourceAttentionButton = null;
+  _mediaSourceAttentionEnd = null;
+}
+
+function revealMediaSourceButton(): void {
+  const button = getUiElement<HTMLButtonElement>('btn-media-source');
+  if (!button) return;
+
+  const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+  button.scrollIntoView?.({
+    behavior: reducedMotion ? 'auto' : 'smooth',
+    block: 'nearest',
+    inline: 'nearest',
+  });
+  button.focus({ preventScroll: true });
+
+  clearMediaSourceAttentionHint();
+  // Bootstrap may already be animating this button without going through
+  // this helper. Always remove the target class itself before forcing reflow.
+  button.classList.remove('attention-hint');
+  // Restart the same three-pulse hint used after host bootstrap, even when
+  // Play is tapped repeatedly before the previous animation finishes.
+  void button.offsetWidth;
+  button.classList.add('attention-hint');
+  const onAnimationEnd = (event: AnimationEvent) => {
+    if (event.target !== button || event.animationName !== 'attention-hint-fill') return;
+    clearMediaSourceAttentionHint();
+  };
+  _mediaSourceAttentionButton = button;
+  _mediaSourceAttentionEnd = onAnimationEnd;
+  button.addEventListener('animationend', onAnimationEnd);
+}
+
+function isFilePlayButtonLoading(): boolean {
+  const lifecycle = getState('playback.lifecycle');
+  return (
+    _scheduledFileStartLoading ||
+    isProRoomTrackChangeIntentPending() ||
+    lifecycle === PLAYBACK_STATE.DOWNLOADING ||
+    lifecycle === PLAYBACK_STATE.AWAITING_PRELOAD ||
+    lifecycle === PLAYBACK_STATE.DECODING
+  );
+}
+
+function syncPlayButtonLoadingClass(): void {
+  const btn = getUiElement('play-btn');
+  const iframeOwnedLoading =
+    _ytPlayButtonLoading || _proPlaybackControlLoading || _proPlaybackTransitionLoading;
+  const systemAudioPendingLoading =
+    isPlaybackModeSystemAudio() && getState('playback.activity') === 'pending';
+  const loading = iframeOwnedLoading || _filePlayButtonLoading || systemAudioPendingLoading;
+  if (btn) {
+    btn.classList.toggle('is-loading', loading);
+    btn.setAttribute('aria-busy', String(loading));
+  }
+  bus.emit('ui:play-loading-state', loading);
+
+  const videoWrapper = document.querySelector<HTMLElement>('.video-wrapper');
+  const youtubeContainer = getUiElement('youtube-player-container');
+  const overlay = getUiElement('youtube-sync-loading-overlay');
+  // File preparation never makes the YouTube iframe inert. The iframe shield
+  // is owned only by YouTube and PRO transition feedback.
+  const showYouTubeOverlay = iframeOwnedLoading && getState('playback.mode') === 'youtube';
+  if (videoWrapper) videoWrapper.setAttribute('aria-busy', String(showYouTubeOverlay));
+  if (youtubeContainer instanceof HTMLElement) {
+    youtubeContainer.toggleAttribute('inert', showYouTubeOverlay);
+  }
+  if (overlay) {
+    overlay.hidden = !showYouTubeOverlay;
+    overlay.setAttribute('aria-hidden', String(!showYouTubeOverlay));
+  }
+}
+
+function syncPlayButtonAuthority(): void {
+  const context = getRoomContext();
+  const roomAuthorityApplies = context.kind === 'pro' || getState('network.appRole') !== 'idle';
+  const hasAuthority = !roomAuthorityApplies || hasRoomCapability('playback.control');
+  const authorityMessage = roomCapabilityRequiredMessage('playback.control');
+  const systemAudioLocked = isPlaybackModeSystemAudio();
+  for (const id of ['play-btn', 'btn-prev', 'btn-next']) {
+    const transportButton = getUiElement(id);
+    if (!transportButton) continue;
+    // Sharing has no transport controls. Native disabled also blocks keyboard
+    // activation; authority/readiness alone remain clickable for feedback.
+    transportButton.toggleAttribute('disabled', systemAudioLocked);
+    transportButton.setAttribute(
+      'aria-disabled',
+      String(systemAudioLocked || !hasAuthority || (id === 'play-btn' && !_playButtonMediaEnabled)),
+    );
+    if (!hasAuthority) transportButton.title = authorityMessage;
+    else transportButton.removeAttribute('title');
+  }
+}
+
+function refreshFilePlayButtonLoading(): void {
+  _filePlayButtonLoading = isFilePlayButtonLoading();
+  syncPlayButtonLoadingClass();
+}
+
+export function getRoleLabelByChannelMode(mode: number): string {
+  return t(getStandardRolePreset(mode).labelKey);
+}
+
+export function getStandardRolePreset(mode: number): {
+  labelKey: I18nKey;
+  placementToastKey: I18nKey;
+} {
+  return STANDARD_ROLE_MAP[String(mode)] || STANDARD_ROLE_MAP['0'];
+}
+
+export function showPlacementToastForChannel(mode: number): void {
+  showToast(t(getStandardRolePreset(mode).placementToastKey));
+}
+
+// ─── Volume ──────────────────────────────────────────────────────
+
+let _preMuteVolume = 0.5;
+
+function updateVolumeIcon(): void {
+  const vol = getState('audio.masterVolume') ?? 1;
+  const muted = vol === 0;
+  for (const id of ['vol-icon-btn', 'demo-vol-icon-btn']) {
+    const icon = getUiElement(id);
+    if (!icon) continue;
+    icon.classList.toggle('is-muted', muted);
+    icon.setAttribute('aria-pressed', String(muted));
+  }
+}
+
+function getFileExtensionLabel(name: string): string {
+  const match = /\.([a-z0-9]{1,8})$/i.exec(name.trim());
+  return match?.[1]?.toUpperCase() || '';
+}
+
+function getCurrentFileSize(item: TrackMeta): number | null {
+  const resident = getState('files.current');
+  if (!resident) return null;
+  const currentQueueItemId = item.queueItemId ?? getCurrentQueueItemId();
+  const matchesCurrentTrack =
+    !!currentQueueItemId &&
+    resident.queueItemId === currentQueueItemId &&
+    (!item.name || resident.name === item.name);
+  if (!matchesCurrentTrack || !Number.isFinite(resident.size) || resident.size <= 0) return null;
+  return resident.size;
+}
+
+function getAverageBitrateLabel(item: TrackMeta): string {
+  const duration = getCurrentAudioBuffer()?.duration;
+  const size = getCurrentFileSize(item);
+  if (!size || !Number.isFinite(duration) || !duration || duration <= 0) return '';
+
+  // File size / decoded duration is a container-average estimate. It remains
+  // useful for VBR and lossless files without pretending we parsed codec tags.
+  const kbps = Math.round((size * 8) / duration / 1000);
+  return Number.isFinite(kbps) && kbps > 0 && kbps < 100_000 ? `≈${kbps} kbps` : '';
+}
+
+function getTrackSubtitle(item: TrackMeta): string {
+  if (item.systemAudioMode || item.systemAudioPlaceholder) {
+    return formatSystemAudioProfileLabel(item.systemAudioSurface);
+  }
+
+  if (item.type === 'youtube') return item.artist?.trim() || t('common.youtube_video');
+
+  return [getAverageBitrateLabel(item), getFileExtensionLabel(item.name || item.file?.name || '')]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+function updateTrackSubtitle(item: TrackMeta | null): void {
+  const artistEl = getUiElement('track-artist');
+  if (!artistEl) return;
+
+  const subtitle = item ? getTrackSubtitle(item) : t('player.select_file_hint');
+  artistEl.textContent = subtitle;
+  if (subtitle) {
+    artistEl.title = subtitle;
+    applyUserTextFontFallback(artistEl, subtitle);
+  } else {
+    artistEl.removeAttribute('title');
+  }
+}
+
+/** Refresh the track title and its source metadata row. */
+function refreshTrackTitle(): void {
+  const item = getState('player.currentTrackMeta');
+  if (!item) {
+    updateTitleWithMarquee(t('player.no_media'));
+    updateTrackSubtitle(null);
+    return;
+  }
+
+  // System audio mode: always use translated string (survives language switch)
+  const title =
+    item.name === 'system-audio'
+      ? t('system_audio.sharing')
+      : item.name === 'system-audio-receiving'
+        ? t('system_audio.receiving')
+        : getTrackDisplayTitle(item, t('common.unknown'));
+
+  updateTitleWithMarquee(title);
+  updateTrackSubtitle(item);
+}
+
+function getTabTitleTrack(): string {
+  const item = getState('player.currentTrackMeta');
+  if (!item) return '';
+
+  return item.name === 'system-audio'
+    ? t('system_audio.sharing')
+    : item.name === 'system-audio-receiving'
+      ? t('system_audio.receiving')
+      : getTrackDisplayTitle(item);
+}
+
+function getTabTitlePlaying(): boolean | undefined {
+  const mode = getState('playback.mode');
+  const activity = getState('playback.activity');
+  if (activity !== 'playing') return false;
+  if (mode !== 'youtube') return true;
+
+  const playerState = getYouTubePlayer()?.getPlayerState?.();
+  if (playerState === 1) return true;
+  if (playerState === 0 || playerState === 2) return false;
+
+  // During iframe creation, background restoration, or BUFFERING, YouTube may
+  // not expose a stable state. Preserve the last confirmed marquee state until
+  // ui:update-play-state supplies the next authoritative transition.
+  return undefined;
+}
+
+function getTabTitleSnapshot(): { track: string; playing?: boolean } {
+  const playing = getTabTitlePlaying();
+
+  return {
+    track: getTabTitleTrack(),
+    ...(playing === undefined ? {} : { playing }),
+  };
+}
+
+function onVolInput(val: number): void {
+  if (isSynchronizedVolumeLocked()) {
+    syncVolumeSlider();
+    return;
+  }
+  bus.emit('audio:set-volume', val / 100);
+}
+
+function onVolChange(val: number): void {
+  if (isSynchronizedVolumeLocked()) {
+    syncVolumeSlider();
+    return;
+  }
+  showToast(t('common.volume_percent', { val: Math.round(val) }));
+  if (isSettingsSyncEnabled() && canPublishSynchronizedSettings()) {
+    bus.emit('settings-sync:publish-local');
+  }
+}
+
+function toggleMute(): void {
+  if (isSynchronizedVolumeLocked()) return;
+  const masterVolume = getState('audio.masterVolume') ?? 1;
+  if (masterVolume > 0) {
+    _preMuteVolume = masterVolume;
+    bus.emit('audio:set-volume', 0);
+    showToast(t('common.muted'));
+  } else {
+    bus.emit('audio:set-volume', _preMuteVolume || 0.5);
+    const newVol = _preMuteVolume || 0.5;
+    showToast(t('common.volume_percent', { val: Math.round(newVol * 100) }));
+  }
+  if (isSettingsSyncEnabled() && canPublishSynchronizedSettings()) {
+    bus.emit('settings-sync:publish-local');
+  }
+}
+
+// ─── Role Badge ──────────────────────────────────────────────────
+// Badge text is intentionally English-only (HOST, PEER, GUEST, etc.)
+// — treated as a brand/UI label, not translatable content.
+
+export function updateRoleBadge(): void {
+  const badge = getUiElement('role-badge');
+  const text = getUiElement('role-text');
+  if (!badge || !text) return;
+
+  const nickname = getCurrentAccountNickname() || '';
+  const roleLabel = getRoomContext().kind !== 'pro' && isCoordinator() ? 'HOST' : 'PEER';
+  
+  const displayText = nickname || roleLabel;
+
+  badge.classList.remove('connected', 'remote', 'pro-equal', 'account-authenticated');
+  text.dir = 'auto';
+  text.textContent = displayText;
+  applyUserTextFontFallback(text, text.textContent);
+  badge.setAttribute('aria-label', `${t('account.account_title')}: ${displayText}`);
+}
+
+// ─── Invite Code ─────────────────────────────────────────────────
+
+export function getInviteCode(): string {
+  const codes = [getState('network.sessionCode') || '', getState('network.lastJoinCode') || ''];
+  return codes.find((code) => /^\d{6}$/.test(code)) || '------';
+}
+
+export function updateInviteCodeUI(): void {
+  const code = getInviteCode();
+  const elements = document.querySelectorAll('.invite-code-value');
+  elements.forEach((el) => {
+    el.textContent = code;
+    el.setAttribute('data-code', code);
+  });
+}
+
+function getConnectedDeviceCount(): number {
+  const lastKnownDeviceList = getState('network.lastKnownDeviceList');
+  if (Array.isArray(lastKnownDeviceList) && lastKnownDeviceList.length) {
+    return lastKnownDeviceList.filter((d) => d && d.status === 'connected').length;
+  }
+  const connectedPeers = getState('network.connectedPeers');
+  const hostConn = getState('network.hostConn');
+  const appRole = getState('network.appRole');
+  const sessionStarted = getState('setup.sessionStarted');
+  const peerConnected = Array.isArray(connectedPeers)
+    ? connectedPeers.filter((p) => p && p.status === 'connected').length
+    : 0;
+  if (!hostConn && (appRole === 'host' || sessionStarted || peerConnected > 0)) {
+    return 1 + peerConnected;
+  }
+  if (hostConn && hostConn.open) return 2;
+  return 1;
+}
+
+async function copyInviteCode(): Promise<void> {
+  const code = getInviteCode();
+  if (code === '------') return;
+
+  const ok = await copyTextToClipboard(code);
+  if (ok) {
+    const cnt = getConnectedDeviceCount();
+    showToast(t('toast.invite_code_info', { count: cnt, code }));
+    document.querySelectorAll('.invite-code-value').forEach((el) => {
+      el.classList.add('copied');
+      setManagedTimer(
+        'copied-feedback',
+        () => {
+          document
+            .querySelectorAll('.invite-code-value')
+            .forEach((e) => e.classList.remove('copied'));
+        },
+        600,
+      );
+    });
+  } else {
+    showToast(t('toast.copy_failed'));
+  }
+}
+
+// ─── Media Source Popup ──────────────────────────────────────────
+
+function rememberOverlayOpener(fallbackId: string): HTMLElement | null {
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && active !== document.body) return active;
+  return getUiElement(fallbackId);
+}
+
+function restoreOverlayOpener(opener: HTMLElement | null, overlay: HTMLElement): void {
+  queueMicrotask(() => {
+    const active = document.activeElement;
+    if (
+      opener?.isConnected &&
+      (!active || active === document.body || active === overlay || overlay.contains(active))
+    ) {
+      opener.focus({ preventScroll: true });
+    }
+  });
+}
+
+function getOverlayFocusableElements(overlay: HTMLElement): HTMLElement[] {
+  return Array.from(
+    overlay.querySelectorAll<HTMLElement>(
+      'button, input, textarea, select, a[href], [contenteditable="true"], [tabindex]',
+    ),
+  ).filter(
+    (element) =>
+      element.tabIndex >= 0 &&
+      !element.hasAttribute('disabled') &&
+      !element.hidden &&
+      element.getAttribute('aria-hidden') !== 'true',
+  );
+}
+
+function handleFullscreenOverlayKeydown(
+  overlay: HTMLElement,
+  event: KeyboardEvent,
+  onClose: () => void,
+): void {
+  if (event.key === 'Escape') {
+    if (event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    event.stopPropagation();
+    onClose();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+
+  cycleFocusWithin(event, getOverlayFocusableElements(overlay), overlay);
+}
+
+function isKeyboardLikeActivation(event: Event): boolean {
+  return !(event instanceof MouseEvent) || event.detail === 0;
+}
+
+function openMediaSourcePopup(focusFirstAction = true): void {
+  if (!hasRoomCapability('media.add') && !hasRoomCapability('asset.upload')) {
+    showRoomCapabilityRequired('media.add');
+    return;
+  }
+  const systemAudioButton = getUiElement('btn-system-audio');
+  if (systemAudioButton) {
+    const isProRoom = getRoomContext().kind === 'pro';
+    systemAudioButton.hidden = isProRoom ? !hasRoomCapability('system-audio.publish') : false;
+  }
+  _mediaSourcePreviousFocus = rememberOverlayOpener('btn-media-source');
+  syncSystemAudioSourceButton();
+  animateTransition(() => {
+    const overlay = getUiElement('media-source-overlay');
+    if (overlay) {
+      overlay.classList.add('active');
+      syncOverlayState('media-source-overlay');
+      setManagedTimer(
+        'media-source-focus',
+        () => {
+          const focusTarget = focusFirstAction
+            ? (getOverlayFocusableElements(overlay)[0] ?? overlay)
+            : overlay;
+          focusTarget.focus({ preventScroll: true });
+        },
+        0,
+      );
+    }
+  });
+}
+
+function showProSystemAudioOwnerToast(): void {
+  const view = getProSystemAudioViewState();
+  const name = getProSystemAudioOwnerDisplayName();
+  if (view.localRequestPending || (view.isLocalOwner && view.phase === 'preparing')) {
+    showToast(t('system_audio.pro_preparing'));
+  } else if (name && view.phase === 'preparing') {
+    showToast(t('system_audio.owner_preparing', { name }));
+  } else if (name && view.phase === 'live') {
+    showToast(t('system_audio.owner_active', { name }));
+  } else {
+    showToast(t('system_audio.pro_publish_failed'));
+  }
+}
+
+function syncSystemAudioSourceButton(): void {
+  const button = getUiElement<HTMLButtonElement>('btn-system-audio');
+  if (!button) return;
+  const label = button.querySelector<HTMLElement>('.media-source-label-text');
+  const isProRoom = getRoomContext().kind === 'pro';
+  const view = getProSystemAudioViewState();
+  const pending = isProRoom && view.localRequestPending;
+  button.disabled = pending;
+  button.setAttribute('aria-busy', String(pending));
+  if (!label) return;
+  const key: I18nKey = pending ? 'system_audio.pro_preparing' : 'system_audio.button';
+  label.textContent = t(key);
+  label.setAttribute('data-i18n', key);
+}
+
+function syncMainMediaSourceButtonLabel(): void {
+  const button = getUiElement('btn-media-source');
+  const label = button?.querySelector<HTMLElement>('span');
+  if (!button || !label) return;
+  const isSystemAudio = isPlaybackModeSystemAudio();
+  const canStopSystemAudio =
+    isSystemAudio &&
+    (getRoomContext().kind === 'pro'
+      ? isLocalProSystemAudioOwner()
+      : !getState('network.hostConn'));
+  const visibleKey: I18nKey = canStopSystemAudio
+    ? 'system_audio.stop_compact'
+    : 'player.play_media_compact';
+  const accessibleKey: I18nKey = canStopSystemAudio ? 'system_audio.stop' : 'player.play_media';
+  label.textContent = t(visibleKey);
+  label.setAttribute('data-i18n', visibleKey);
+  button.setAttribute('aria-label', t(accessibleKey));
+  button.setAttribute('data-i18n-aria-label', accessibleKey);
+  button.classList.toggle('sys-audio-guest', isSystemAudio && !canStopSystemAudio);
+}
+
+function syncMediaSourceButtonAuthority(): void {
+  syncMainMediaSourceButtonLabel();
+  const canSelectMedia = hasRoomCapability('media.add') || hasRoomCapability('asset.upload');
+  for (const id of ['btn-media-source', 'btn-add-media']) {
+    const mediaBtn = getUiElement(id);
+    if (!mediaBtn) continue;
+    const canStopSystemAudio =
+      id === 'btn-media-source' &&
+      isPlaybackModeSystemAudio() &&
+      (getRoomContext().kind === 'pro'
+        ? isLocalProSystemAudioOwner()
+        : !getState('network.hostConn'));
+    const enabled =
+      id === 'btn-add-media'
+        ? canSelectMedia
+        : isPlaybackModeSystemAudio()
+          ? canStopSystemAudio
+          : canSelectMedia;
+    mediaBtn.setAttribute('aria-disabled', String(!enabled));
+    if (enabled) {
+      mediaBtn.removeAttribute('title');
+    } else {
+      mediaBtn.title = isPlaybackModeSystemAudio()
+        ? t('system_audio.sharing')
+        : roomCapabilityRequiredMessage('media.add');
+    }
+  }
+}
+
+function canConfigureQueueMode(): boolean {
+  return hasRoomCapability('queue.mutate');
+}
+
+function syncQueueModeButtonAuthority(): void {
+  const enabled = canConfigureQueueMode();
+  for (const id of ['btn-repeat', 'btn-shuffle']) {
+    const button = getUiElement(id);
+    if (!button) continue;
+    button.setAttribute('aria-disabled', String(!enabled));
+  }
+}
+
+function closeMediaSourcePopup(restoreFocus = true): void {
+  clearManagedTimer('media-source-focus');
+  const returnFocus = _mediaSourcePreviousFocus;
+  _mediaSourcePreviousFocus = null;
+  animateTransition(() => {
+    const overlay = getUiElement('media-source-overlay');
+    if (overlay) {
+      overlay.classList.remove('active');
+      syncOverlayState();
+      if (restoreFocus) restoreOverlayOpener(returnFocus, overlay);
+    }
+  });
+}
+
+function openYouTubePopup(returnFocus?: HTMLElement | null): void {
+  if (!hasRoomCapability('media.add')) {
+    showRoomCapabilityRequired('media.add');
+    return;
+  }
+  invalidateYouTubeGestureSubmit();
+  _youtubePopupPreviousFocus =
+    returnFocus ?? rememberOverlayOpener('btn-youtube-source') ?? _mediaSourcePreviousFocus;
+  // This click is a second explicit iOS gesture after room setup. If the
+  // eager primer was not ready for the setup tap (or its first bounce timed
+  // out), retry it here before the user spends time entering a URL.
+  primeYouTubePlayer();
+  animateTransition(() => {
+    const overlay = getUiElement('youtube-url-overlay');
+    if (overlay) {
+      overlay.classList.add('active');
+      syncOverlayState('youtube-url-overlay');
+    }
+    clearYouTubeInputState();
+    const input = getUiElement('youtube-url-input') as HTMLElement | null;
+    if (input) setManagedTimer('yt-url-focus', () => input.focus(), 100);
+  });
+}
+
+let youtubeGestureSubmitGeneration = 0;
+let youtubeGestureSubmitOwner: number | null = null;
+
+function invalidateYouTubeGestureSubmit(): void {
+  youtubeGestureSubmitGeneration++;
+  youtubeGestureSubmitOwner = null;
+  getUiElement('youtube-play-btn')?.removeAttribute('aria-busy');
+}
+
+function submitYouTubeSearch(input: HTMLElement): void {
+  const searchButton = getUiElement<HTMLButtonElement>('youtube-search-btn');
+  if (!searchButton || searchButton.disabled) return;
+  bus.emit('youtube:search-from-input');
+  if (IS_IOS || IS_ANDROID) input.blur();
+}
+
+function submitYouTubeFromGesture(input: HTMLElement): void {
+  if (youtubeGestureSubmitOwner !== null) return;
+
+  // Non-iOS and already-primed clients stay in this synchronous branch, so a
+  // concrete video load still runs in the original click/Enter call stack.
+  // retryPending makes this FINAL gesture call playVideo() again instead of
+  // merely waiting for an older popup-open attempt that may still time out.
+  const mustWaitForPrimeProof = primeYouTubePlayer({ retryPending: true });
+  if (!mustWaitForPrimeProof) {
+    bus.emit('youtube:load-from-input');
+    if (IS_IOS || IS_ANDROID) input.blur();
+    return;
+  }
+
+  // If popup-open priming was still pending, or its timeout re-armed a retry,
+  // spend this final gesture on the silent bounce first. Once PLAYING proves
+  // WebKit accepted it, the resident iframe remains unlocked for the concrete
+  // async load. A bounded failure simply falls through to the visible tap
+  // fallback rather than trapping the submit action.
+  const submitGeneration = ++youtubeGestureSubmitGeneration;
+  youtubeGestureSubmitOwner = submitGeneration;
+  const submittedText = input.textContent || '';
+  const playButton = getUiElement<HTMLButtonElement>('youtube-play-btn');
+  if (playButton) {
+    playButton.disabled = true;
+    playButton.setAttribute('aria-busy', 'true');
+  }
+
+  waitForPendingYouTubePrimeBounce(YOUTUBE_PRIME_BOUNCE_TIMEOUT_MS)
+    .catch((error) => log.debug('[YouTube Prime] submit wait failed:', error))
+    .then(() => {
+      if (
+        youtubeGestureSubmitGeneration !== submitGeneration ||
+        youtubeGestureSubmitOwner !== submitGeneration
+      ) {
+        return;
+      }
+      const overlay = getUiElement('youtube-url-overlay');
+      if (overlay && !overlay.classList.contains('active')) return;
+      if ((input.textContent || '') !== submittedText) return;
+      bus.emit('youtube:load-from-input');
+      if (IS_IOS || IS_ANDROID) input.blur();
+    })
+    .finally(() => {
+      if (
+        youtubeGestureSubmitGeneration !== submitGeneration ||
+        youtubeGestureSubmitOwner !== submitGeneration
+      ) {
+        return;
+      }
+      youtubeGestureSubmitOwner = null;
+      if (playButton?.isConnected) {
+        playButton.removeAttribute('aria-busy');
+        // A changed input owns its newer preview gate; only restore the exact
+        // submission whose text is still present.
+        if ((input.textContent || '') === submittedText) playButton.disabled = false;
+      }
+    })
+    .catch((error) => {
+      log.warn('[YouTube Prime] Submit flow failed', error);
+    });
+}
+
+function closeYouTubePopup(): void {
+  invalidateYouTubeGestureSubmit();
+  clearManagedTimer('yt-url-focus');
+  clearPreviewDebounce();
+  clearYouTubeInputState();
+  const ytInput = getUiElement('youtube-url-input');
+  if (ytInput) ytInput.textContent = '';
+  const returnFocus = _youtubePopupPreviousFocus;
+  _youtubePopupPreviousFocus = null;
+  animateTransition(() => {
+    const overlay = getUiElement('youtube-url-overlay');
+    if (overlay) {
+      overlay.classList.remove('active');
+      syncOverlayState();
+      restoreOverlayOpener(returnFocus, overlay);
+    }
+  });
+}
+
+// ─── File Selector ───────────────────────────────────────────────
+
+function openFileSelector(): void {
+  if (!hasRoomCapability('asset.upload')) {
+    showRoomCapabilityRequired('asset.upload');
+    return;
+  }
+  const input = getUiElement<HTMLInputElement>('file-input');
+  if (!input) {
+    log.warn('[UI] #file-input not found');
+    showToast(t('toast.cant_select_file'));
+    return;
+  }
+  input.click();
+}
+
+// ─── Sync Button ─────────────────────────────────────────────────
+
+type ManualSyncOverlayRuntime = typeof import('./manual-sync-overlay-runtime.ts');
+let _manualSyncOverlayRuntime: ManualSyncOverlayRuntime | null = null;
+let _manualSyncOverlayLoad: Promise<ManualSyncOverlayRuntime> | null = null;
+let _manualSyncOverlayRequest = 0;
+
+function loadManualSyncOverlayRuntime(): Promise<ManualSyncOverlayRuntime> {
+  _manualSyncOverlayLoad ??= import('./manual-sync-overlay-runtime.ts')
+    .then((runtime) => {
+      _manualSyncOverlayRuntime = runtime;
+      return runtime;
+    })
+    .catch((error: unknown) => {
+      _manualSyncOverlayLoad = null;
+      throw error;
+    });
+  return _manualSyncOverlayLoad;
+}
+
+function closeManualSyncOverlay(): void {
+  _manualSyncOverlayRequest += 1;
+  _manualSyncOverlayRuntime?.closeManualSyncOverlayRuntime();
+}
+
+type MainSyncUnavailableReason = 'no-media' | 'not-ready' | 'system-audio';
+
+function getMainSyncUnavailableReason(): MainSyncUnavailableReason | null {
+  if (_mainSyncPending) return 'not-ready';
+  if (isPlaybackModeSystemAudio()) return 'system-audio';
+  if (isPlaybackModeYouTube() && isYouTubeZeroStartProtocolActive()) return 'not-ready';
+
+  const hostConn = getState('network.hostConn');
+  const room = getRoomContext();
+  const isProRoom = room.kind === 'pro';
+  const hasMedia = isPlaybackModeFile() || isPlaybackModeYouTube();
+  if (!hasMedia) return hostConn ? 'not-ready' : 'no-media';
+  if (hostConn && !hostConn.open) return 'not-ready';
+  if (!hostConn && !isProRoom && !isActiveStandardRoomCoordinator()) return 'not-ready';
+
+  if (isPlaybackModeFile()) {
+    if (isFilePipelineBusyForPlay()) return 'not-ready';
+    if (hostConn && !getCurrentAudioBuffer()) return 'not-ready';
+    if (!hostConn && !isProRoom && (!getCurrentQueueItemId() || !getCurrentAudioBuffer())) {
+      return 'not-ready';
+    }
+  }
+  return null;
+}
+
+function getMainSyncUnavailableMessage(reason: MainSyncUnavailableReason): string {
+  if (reason === 'system-audio') return t('toast.sync_not_in_system_audio');
+  if (reason === 'no-media') return t('toast.sync_no_media');
+  return t('toast.sync_not_ready');
+}
+
+function syncMainSyncButtonState(): void {
+  const button = getUiElement('btn-sync');
+  if (!button) return;
+  const reason = getMainSyncUnavailableReason();
+  button.setAttribute('aria-disabled', String(reason !== null));
+  button.setAttribute('aria-busy', String(_mainSyncPending));
+  if (reason) {
+    button.title = getMainSyncUnavailableMessage(reason).replace(/\n/g, ' ');
+  } else {
+    button.removeAttribute('title');
+  }
+
+  const label = button.querySelector<HTMLElement>('span');
+  if (!label) return;
+  const visibleKey: I18nKey = _mainSyncPending ? 'player.syncing_compact' : 'player.sync_compact';
+  const accessibleKey: I18nKey = _mainSyncPending ? 'toast.yt_sync_start' : 'common.sync';
+  label.textContent = t(visibleKey);
+  label.setAttribute('data-i18n', visibleKey);
+  button.setAttribute('aria-label', t(accessibleKey));
+  button.setAttribute('data-i18n-aria-label', accessibleKey);
+}
+
+function beginMainSyncRequest(): number {
+  _mainSyncRequestToken += 1;
+  _mainSyncPending = true;
+  syncMainSyncButtonState();
+  return _mainSyncRequestToken;
+}
+
+function finishMainSyncRequest(token: number): void {
+  if (token !== _mainSyncRequestToken) return;
+  _mainSyncPending = false;
+  syncMainSyncButtonState();
+}
+
+function handleMainSyncBtn(): void {
+  const unavailableReason = getMainSyncUnavailableReason();
+  if (unavailableReason) {
+    closeManualSyncOverlay();
+    showToast(getMainSyncUnavailableMessage(unavailableReason));
+    return;
+  }
+  const request = ++_manualSyncOverlayRequest;
+  void loadManualSyncOverlayRuntime().then(
+    (runtime) => {
+      if (request !== _manualSyncOverlayRequest) return;
+      runtime.handleMainSyncButtonRuntime({
+        getUnavailableReason: getMainSyncUnavailableReason,
+        getUnavailableMessage: getMainSyncUnavailableMessage,
+        beginRequest: beginMainSyncRequest,
+        finishRequest: finishMainSyncRequest,
+      });
+    },
+    (error: unknown) => {
+      if (request !== _manualSyncOverlayRequest) return;
+      log.warn('[UI] Manual-sync controls failed to load', error);
+      showToast(t('toast.sync_not_ready'));
+    },
+  );
+}
+
+function handleDemoSyncBtn(): void {
+  if (!getState('demo.active') || isPlaybackModeSystemAudio()) return;
+  getUiElement('btn-demo-sync')?.focus();
+  const request = ++_manualSyncOverlayRequest;
+  void loadManualSyncOverlayRuntime().then(
+    (runtime) => {
+      if (request !== _manualSyncOverlayRequest || !getState('demo.active')) return;
+      runtime.openDemoSyncRuntime();
+    },
+    (error: unknown) => {
+      if (request !== _manualSyncOverlayRequest) return;
+      log.warn('[UI] Demo sync controls failed to load', error);
+      showToast(t('toast.sync_not_ready'));
+    },
+  );
+}
+
+function syncDemoTransportControls(): void {
+  const disabled =
+    !getState('demo.active') || !!getState('network.hostConn') || getState('demo.loading');
+  for (const id of ['btn-demo-next-track']) {
+    const button = getUiElement<HTMLButtonElement>(id);
+    if (!button) continue;
+    button.disabled = disabled;
+    button.setAttribute('aria-disabled', String(disabled));
+  }
+  const syncButton = getUiElement<HTMLButtonElement>('btn-demo-sync');
+  if (syncButton) syncButton.disabled = isPlaybackModeSystemAudio();
+}
+
+// ─── Logo Return to Main ─────────────────────────────────────────
+
+let _logoNavBusy = false;
+
+async function handleLogoReturnToMain(): Promise<void> {
+  if (_logoNavBusy) return;
+  _logoNavBusy = true;
+
+  try {
+    const setupOverlay = getUiElement('setup-overlay');
+    const isOnMain = !!(setupOverlay && setupOverlay.classList.contains('active'));
+    if (isOnMain) {
+      switchTab('play');
+      return;
+    }
+
+    const hostConn = getState('network.hostConn');
+    const appRole = getState('network.appRole');
+    const hasSession = !!(hostConn || appRole === 'host');
+    if (hasSession) {
+      const res = await showDialog({
+        title: t('dialog.return_home_title'),
+        message: t('dialog.return_home_msg') + '\n' + t('dialog.return_home_detail'),
+        buttonText: t('common.ok'),
+        secondaryText: t('common.stay'),
+        defaultFocus: 'secondary',
+      });
+      if (res.action !== 'ok') return;
+    }
+
+    // A hard same-origin replacement clears in-memory media without leaving an
+    // invite/PRO auto-join route behind in browser history.
+    let resetCurrent = true;
+    const navigateIfCurrent = () => {
+      if (resetCurrent) navigateToAppHome();
+    };
+    const resetHandle = scheduleSessionReset(t('dialog.leaving_session'), () => {
+      void import('../core/sw-hard-reset.ts')
+        .then((module) => {
+          if (resetCurrent) return module.default();
+        })
+        .then(navigateIfCurrent, navigateIfCurrent);
+    });
+    resetHandle?.onRecovered(() => {
+      resetCurrent = false;
+    });
+  } finally {
+    _logoNavBusy = false;
+  }
+}
+
+// ─── Android Range Drag Guard ────────────────────────────────────
+
+function installAndroidRangeScrollFix(signal: AbortSignal): void {
+  if (!IS_ANDROID) return;
+  try {
+    const locks = new Map<HTMLElement, { count: number; overflowY: string }>();
+    const options = { passive: true, signal };
+    document.querySelectorAll('input[type="range"]').forEach((range) => {
+      const scrollParent = range.closest('.tab-content') as HTMLElement | null;
+      if (!scrollParent) return;
+
+      const owner = locks.get(scrollParent) ?? { count: 0, overflowY: '' };
+      locks.set(scrollParent, owner);
+      let active = false;
+      const release = () => {
+        if (!active) return;
+        active = false;
+        if (--owner.count === 0) scrollParent.style.overflowY = owner.overflowY;
+      };
+      const onTouch = (event: Event) => {
+        if (event.type === 'touchstart') {
+          if (active) return;
+          active = true;
+          if (owner.count++ === 0) owner.overflowY = scrollParent.style.overflowY;
+          scrollParent.style.overflowY = 'hidden';
+        } else if (active && !(event as TouchEvent).targetTouches?.length) {
+          release();
+        }
+      };
+
+      for (const type of ['touchstart', 'touchend', 'touchcancel']) {
+        range.addEventListener(type, onTouch, options);
+      }
+      // Retiring this scope releases its lock even while a finger remains down.
+      signal.addEventListener('abort', release, { once: true });
+    });
+  } catch (e) {
+    log.debug('[Android] Range scroll fix init failed:', e);
+  }
+}
+
+// ─── Seek Bar Delegation ────────────────────────────────────────
+
+// ─── Volume Sync ─────────────────────────────────────────────────
+
+function syncVolumeSlider(): void {
+  const vol = getState('audio.masterVolume') ?? 1;
+  for (const id of ['volume-slider', 'demo-volume-slider']) {
+    const vSlider = getUiElement<HTMLInputElement>(id);
+    if (!vSlider) continue;
+    vSlider.value = String(vol * 100);
+    syncRangeProgress(vSlider);
+  }
+  updateVolumeIcon();
+}
+
+function syncVolumeAuthorityUI(): void {
+  const locked = isSynchronizedVolumeLocked();
+  for (const id of ['volume-control-group', 'demo-volume-control-group']) {
+    const group = getUiElement(id);
+    if (!group) continue;
+    if (locked) group.tabIndex = 0;
+    else group.removeAttribute('tabindex');
+    group.setAttribute(
+      'aria-label',
+      locked ? roomCapabilityRequiredMessage('effects.control') : t('player.volume'),
+    );
+  }
+  for (const id of ['volume-slider', 'vol-icon-btn', 'demo-volume-slider', 'demo-vol-icon-btn']) {
+    const control = getUiElement(id) as HTMLInputElement | HTMLButtonElement | null;
+    if (!control) continue;
+    control.disabled = locked;
+    control.setAttribute('aria-disabled', String(locked));
+  }
+}
+
+function explainLockedVolume(event: Event): void {
+  if (!isSynchronizedVolumeLocked()) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if (event instanceof KeyboardEvent && event.repeat) return;
+  showRoomCapabilityRequired('effects.control');
+}
+
+// ─── Module State ───────────────────────────────────────────────
+
+// ─── Init ────────────────────────────────────────────────────────
+
+const _busScope = createBusScope();
+let _domAbort: AbortController | null = null;
+let _closeDemoInlineControls = () => {};
+
+export function initPlayerControls(): void {
+  // Release prior-init subscriptions and replaceable DOM listeners so HMR /
+  // future re-init paths don't stack duplicate handlers. Matches the pattern
+  // in connect.ts and playlist-view.ts.
+  _busScope.dispose();
+  _domAbort?.abort();
+  _closeDemoInlineControls();
+  _fileStartLoadingController?.destroy();
+  _fileStartLoadingController = null;
+  clearMediaSourceAttentionHint();
+  _domAbort = new AbortController();
+  const { signal: domSignal } = _domAbort;
+  _ytSyncLoadingOwners.clear();
+  _ytPlayButtonLoading = false;
+  _filePlayButtonLoading = false;
+  _scheduledFileStartLoading = false;
+  _proPlaybackControlLoading = false;
+  _proPlaybackTransitionLoading = false;
+  _proPlaybackControlToken = null;
+  _proPlaybackControlKind = null;
+  _playButtonMediaEnabled = getUiElement('play-btn')?.getAttribute('aria-disabled') === 'false';
+  // Re-initialization must never inherit an interaction shield owned by a
+  // disposed subscription scope.
+  syncPlayButtonLoadingClass();
+  initTabTitleMarquee(getTabTitleSnapshot);
+
+  const $on = (id: string, evt: string, fn: EventListener) => {
+    const el = getUiElement(id);
+    if (el) el.addEventListener(evt, fn, { signal: domSignal });
+  };
+
+  const bindOverlayKeyboard = (id: string, close: () => void) => {
+    const overlay = getUiElement(id);
+    if (!overlay || overlay.dataset.keyboardBound === '1') return;
+    overlay.dataset.keyboardBound = '1';
+    overlay.addEventListener('keydown', (event) => {
+      handleFullscreenOverlayKeydown(overlay, event, close);
+    });
+  };
+  bindOverlayKeyboard('media-source-overlay', closeMediaSourcePopup);
+  bindOverlayKeyboard('youtube-url-overlay', closeYouTubePopup);
+
+  // Header
+  $on('btn-help', 'click', () => switchTab('guide'));
+  $on('btn-fullscreen', 'click', () => {
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element;
+      webkitExitFullscreen?: () => void;
+    };
+    const el = document.documentElement as HTMLElement & { webkitRequestFullscreen?: () => void };
+    const videoWrapper = document.querySelector('.video-wrapper') as
+      (HTMLElement & { webkitRequestFullscreen?: () => void }) | null;
+    const target = videoWrapper || el;
+
+    const enterFake = () => {
+      // A native fullscreen request can reject after playback has already
+      // advanced to a local file. Never let that late rejection resurrect the
+      // YouTube-only fake fullscreen shell around non-YouTube playback.
+      if (getState('playback.mode') !== 'youtube') return;
+      videoWrapper?.classList.add('fake-fullscreen');
+      document.body.classList.add('has-fake-fullscreen');
+    };
+    const exitFake = () => {
+      videoWrapper?.classList.remove('fake-fullscreen');
+      document.body.classList.remove('has-fake-fullscreen');
+    };
+
+    const isFakeFullscreen = videoWrapper?.classList.contains('fake-fullscreen');
+    const isFullscreen = !!(
+      document.fullscreenElement ||
+      doc.webkitFullscreenElement ||
+      isFakeFullscreen
+    );
+
+    try {
+      if (!isFullscreen) {
+        if (target.requestFullscreen) {
+          target.requestFullscreen().then(() => {
+            // A fullscreen request may settle after Next has already handed
+            // playback to a local file. Teardown again now that the browser
+            // has actually installed the fullscreen element.
+            if (getState('playback.mode') !== 'youtube') exitYouTubeFullscreen();
+          }, enterFake);
+        } else if (target.webkitRequestFullscreen) {
+          target.webkitRequestFullscreen();
+          // webkit's call is sync and silent on failure — verify after a tick.
+          setManagedTimer(
+            'webkit-fullscreen-fallback',
+            () => {
+              if (getState('playback.mode') !== 'youtube') {
+                exitYouTubeFullscreen();
+                return;
+              }
+              if (!document.fullscreenElement && !doc.webkitFullscreenElement) enterFake();
+            },
+            100,
+          );
+        } else {
+          enterFake();
+        }
+      } else if (isFakeFullscreen) {
+        exitFake();
+      } else if (document.exitFullscreen) {
+        document.exitFullscreen().catch((error) => {
+          log.warn('[Fullscreen] Native exit failed', error);
+        });
+      } else if (doc.webkitExitFullscreen) {
+        doc.webkitExitFullscreen();
+      }
+    } catch {
+      // Synchronous webkit call can throw — fall back to fake fullscreen toggle.
+      if (isFakeFullscreen) exitFake();
+      else enterFake();
+    }
+  });
+
+
+  // Logo — native <button>, so Enter/Space auto-fires click (no keydown handler needed)
+  const logo = getUiElement('app-logo') || document.querySelector('.app-logo');
+  if (logo) {
+    logo.addEventListener(
+      'click',
+      (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        handleLogoReturnToMain().catch((error) => {
+          log.warn('[Navigation] Logo return-to-main flow failed', error);
+          showToast(t('error.network_generic'));
+        });
+      },
+      { signal: domSignal },
+    );
+  }
+
+  // Player buttons
+  $on('btn-prev', 'click', () => {
+    if (!isPlaybackModeSystemAudio()) bus.emit('playlist:prev-track');
+  });
+  $on('play-btn', 'click', () => {
+    if (!isPlaybackModeSystemAudio()) bus.emit('player:toggle-play');
+  });
+  $on('btn-next', 'click', () => {
+    if (!isPlaybackModeSystemAudio()) bus.emit('playlist:next-track');
+  });
+  // Disabled native controls cannot deliver clicks. Their wrapper receives
+  // pointer attempts via CSS and stays keyboard reachable to explain the lock.
+  getUiElement('volume-control-group')?.addEventListener('click', explainLockedVolume, {
+    capture: true,
+    signal: domSignal,
+  });
+  $on('volume-control-group', 'keydown', (event) => {
+    const { key } = event as KeyboardEvent;
+    if (key === 'Enter' || key === ' ') explainLockedVolume(event);
+  });
+  // Mute button — native <button>, so Enter/Space auto-fires click
+  $on('vol-icon-btn', 'click', () => toggleMute());
+  $on('demo-vol-icon-btn', 'click', () => toggleMute());
+  $on('volume-slider', 'input', function (this: HTMLInputElement) {
+    onVolInput(Number(this.value));
+  });
+  $on('volume-slider', 'change', function (this: HTMLInputElement) {
+    onVolChange(Number(this.value));
+  });
+  $on('btn-sync', 'click', () => handleMainSyncBtn());
+  _closeDemoInlineControls = bindDemoInlineControls({
+    signal: domSignal,
+    onOpen: () => {
+      syncDemoTransportControls();
+      syncVolumeSlider();
+      syncVolumeAuthorityUI();
+    },
+    onClose: () => {
+      _manualSyncOverlayRequest += 1;
+    },
+    onSync: handleDemoSyncBtn,
+  });
+  $on('btn-demo-next-track', 'click', () => bus.emit('demo:next-track'));
+  getUiElement('demo-volume-control-group')?.addEventListener('click', explainLockedVolume, {
+    capture: true,
+    signal: domSignal,
+  });
+  $on('demo-volume-control-group', 'keydown', (event) => {
+    const { key } = event as KeyboardEvent;
+    if (key === 'Enter' || key === ' ') explainLockedVolume(event);
+  });
+  $on('demo-volume-slider', 'input', function (this: HTMLInputElement) {
+    onVolInput(Number(this.value));
+  });
+  $on('demo-volume-slider', 'change', function (this: HTMLInputElement) {
+    onVolChange(Number(this.value));
+  });
+  $on('btn-media-source', 'click', (event) => {
+    if (isPlaybackModeSystemAudio()) {
+      if (getRoomContext().kind === 'pro') {
+        if (!isLocalProSystemAudioOwner()) {
+          showProSystemAudioOwnerToast();
+          return;
+        }
+      } else if (getState('network.hostConn')) {
+        showRoomCapabilityRequired('system-audio.publish');
+        return;
+      }
+      bus.emit('system-audio:stop');
+    } else {
+      openMediaSourcePopup(isKeyboardLikeActivation(event));
+    }
+  });
+
+  // Playlist tab
+  $on('btn-repeat', 'click', () => {
+    if (!canConfigureQueueMode()) {
+      showRoomCapabilityRequired('queue.mutate');
+      return;
+    }
+    bus.emit('playlist:toggle-repeat');
+  });
+  $on('btn-shuffle', 'click', () => {
+    if (!canConfigureQueueMode()) {
+      showRoomCapabilityRequired('queue.mutate');
+      return;
+    }
+    bus.emit('playlist:toggle-shuffle');
+  });
+  $on('btn-add-media', 'click', (event) => openMediaSourcePopup(isKeyboardLikeActivation(event)));
+
+  // Media source popup
+  $on('btn-local-file', 'click', () => openFileSelector());
+  $on('btn-youtube-source', 'click', () => {
+    const returnFocus = _mediaSourcePreviousFocus;
+    closeMediaSourcePopup(false);
+    openYouTubePopup(returnFocus);
+  });
+  $on('btn-system-audio', 'click', () => {
+    const isProRoom = getRoomContext().kind === 'pro';
+    if (!hasRoomCapability('system-audio.publish')) {
+      showRoomCapabilityRequired('system-audio.publish');
+      return;
+    }
+    if (!isProRoom && !isCoordinator()) {
+      showRoomCapabilityRequired('system-audio.publish');
+      return;
+    }
+    if (isProRoom) {
+      const view = getProSystemAudioViewState();
+      if (view.localRequestPending || (view.initialized && view.phase !== 'idle')) {
+        showProSystemAudioOwnerToast();
+        return;
+      }
+      if (!canPublishProSystemAudioWithCurrentCoordinator()) {
+        showToast(t('system_audio.coordinator_update_required'));
+        return;
+      }
+    }
+    if (canCaptureSystemAudio()) {
+      if (!isProRoom && !hasSystemAudioDeviceCapacity()) {
+        showToast(t('system_audio.device_limit', { count: MAX_SYSTEM_AUDIO_DEVICES }));
+        return;
+      }
+      closeMediaSourcePopup();
+      bus.emit('system-audio:start');
+    } else {
+      showToast(t('system_audio.desktop_only'));
+    }
+  });
+  if (!canCaptureSystemAudio()) {
+    getUiElement('btn-system-audio')?.classList.add('unsupported');
+  }
+  $on('btn-close-media-popup', 'click', () => closeMediaSourcePopup());
+
+  // Demo button (Help tab — desktop + mobile)
+  function handleDemoMediaClick(): void {
+    if (isCoordinator()) {
+      bus.emit('demo:enter');
+      return;
+    }
+    const hostConn = getState('network.hostConn');
+    if (hasRoomCapability('room.configure') && hostConn?.open) {
+      safeSend(hostConn, { type: MSG.REQUEST_DEMO_ENTER });
+      return;
+    }
+    showToast(t('demo.host_only_exit'));
+  }
+  $on('btn-demo-media', 'click', handleDemoMediaClick);
+  $on('btn-demo-media-mobile', 'click', handleDemoMediaClick);
+
+  // YouTube popup (contenteditable)
+  const ytInput = getUiElement('youtube-url-input');
+  if (ytInput) {
+    ytInput.addEventListener(
+      'input',
+      (e) => {
+        invalidateYouTubeGestureSubmit();
+        // Stray-<br> placeholder restore — shared helper, see dom.ts.
+        normalizeEmptyContentEditable(ytInput, e);
+        const inputText = ytInput.textContent || '';
+        applyUserTextFontFallback(ytInput, inputText);
+        const searchButton = getUiElement('youtube-search-btn') as HTMLButtonElement | null;
+        if (searchButton) {
+          searchButton.disabled = getYouTubeInputIntent(inputText).kind !== 'search-query';
+          searchButton.removeAttribute('aria-busy');
+        }
+        bus.emit('youtube:preview', inputText);
+      },
+      { signal: domSignal },
+    );
+    ytInput.addEventListener(
+      'keydown',
+      (e) => {
+        if (e.key === 'Enter') {
+          if (e.isComposing || e.keyCode === 229) return;
+          e.preventDefault();
+          const searchButton = getUiElement('youtube-search-btn') as HTMLButtonElement | null;
+          if (searchButton && !searchButton.disabled) {
+            submitYouTubeSearch(ytInput);
+            return;
+          }
+          // URL preview deliberately keeps this button disabled while a
+          // playlist manifest is being prefetched. A fast Enter press must
+          // honor the same gate as a physical button click, otherwise iOS falls
+          // back to the asynchronous iframe indexer and loses this gesture.
+          const playButton = getUiElement('youtube-play-btn') as HTMLButtonElement | null;
+          if (playButton?.disabled) return;
+          submitYouTubeFromGesture(ytInput);
+        }
+      },
+      { signal: domSignal },
+    );
+    ytInput.addEventListener(
+      'paste',
+      (e) => {
+        e.preventDefault();
+        const clipboard = (e as ClipboardEvent).clipboardData;
+        const text =
+          clipboard?.getData('text/plain') ||
+          clipboard?.getData('text/uri-list') ||
+          clipboard?.getData('URL') ||
+          '';
+        document.execCommand('insertText', false, text);
+      },
+      { signal: domSignal },
+    );
+  }
+  $on('btn-yt-cancel', 'click', () => closeYouTubePopup());
+  if (ytInput) {
+    $on('youtube-search-btn', 'click', () => submitYouTubeSearch(ytInput));
+    $on('youtube-play-btn', 'click', () => submitYouTubeFromGesture(ytInput));
+  }
+
+  // Seek bar
+  initSeekBar(domSignal);
+
+  // Range sliders use their own dataset-backed one-shot installation and must
+  // remain live when the replaceable listener scope is aborted.
+  installRangeDragGuard();
+
+  syncVolumeSlider();
+  syncVolumeAuthorityUI();
+
+  // Prevent range drags from scrolling the containing tab on Android.
+  installAndroidRangeScrollFix(domSignal);
+
+  // Volume sync
+  _busScope.on('audio:volume-changed', () => {
+    syncVolumeSlider();
+  });
+  _busScope.on('settings-sync:changed', syncVolumeAuthorityUI);
+  _busScope.on('state:network.standardRoomCapabilities', syncVolumeAuthorityUI);
+  _busScope.on('state:room.context', syncVolumeAuthorityUI);
+  _busScope.on('state:setup.sessionStarted', syncVolumeAuthorityUI);
+
+  // Role badge update events
+  _busScope.on('network:role-badge-update', () => {
+    updateRoleBadge();
+    syncVolumeAuthorityUI();
+  });
+  // Latency update → refresh role badge. Automatic clock correction remains
+  // active but is intentionally no longer exposed as a second panel column.
+  _busScope.on('state:network.myDeviceLabel', updateRoleBadge);
+  _busScope.on('sync:latency-update', updateRoleBadge);
+
+  // Connection type updated (e.g. ICE resolved) → Re-trigger title update to check for Wi-Fi warning
+  _busScope.on('state:network.connectionType', () => {
+    refreshTrackTitle();
+    updateRoleBadge();
+  });
+
+  // Ordinary guests cannot select media, while every authenticated PRO
+  // controller can. Derive the visual affordance from the same capability
+  // guard as the click handler instead of the legacy host/guest topology.
+  _busScope.on('state:network.hostConn', () => {
+    syncMediaSourceButtonAuthority();
+    syncPlayButtonAuthority();
+    syncMainSyncButtonState();
+  });
+  _busScope.on('state:network.appRole', () => {
+    updateRoleBadge();
+    syncMediaSourceButtonAuthority();
+    syncQueueModeButtonAuthority();
+    syncPlayButtonAuthority();
+    syncMainSyncButtonState();
+  });
+  _busScope.on('state:network.standardRoomCapabilities', () => {
+    syncMediaSourceButtonAuthority();
+    syncQueueModeButtonAuthority();
+    syncPlayButtonAuthority();
+  });
+  _busScope.on('state:room.context', () => {
+    updateRoleBadge();
+    syncMediaSourceButtonAuthority();
+    syncQueueModeButtonAuthority();
+    syncPlayButtonAuthority();
+    syncMainSyncButtonState();
+  });
+  updateRoleBadge();
+  syncMediaSourceButtonAuthority();
+  syncQueueModeButtonAuthority();
+  syncPlayButtonAuthority();
+  syncMainSyncButtonState();
+
+  // Language switch → refresh translated track title + tab title
+  // i18n:changed fires after DOM translation, so playback metadata wins over placeholders.
+  const refreshPlayerText = () => {
+    refreshTrackTitle();
+    setTabTitleTrack(getTabTitleTrack());
+    syncMediaSourceButtonAuthority();
+    syncMainSyncButtonState();
+    syncVolumeAuthorityUI();
+  };
+  _busScope.on('i18n:changed', refreshPlayerText);
+  _busScope.on('ui:player-panel-visible', refreshPlayerText);
+
+  // Peer disconnected: update UI
+  _busScope.on('network:peer-disconnected', (peerId) => {
+    log.info(`[UI] Peer disconnected: ${peerId}`);
+    updateRoleBadge();
+  });
+
+  // Invite code container click delegation
+  document.addEventListener(
+    'click',
+    (e) => {
+      const target = (e.target as HTMLElement)?.closest?.('.invite-code-container');
+      if (target) {
+        e.preventDefault();
+        copyInviteCode().catch((error) => {
+          log.warn('[Connect] Invite code copy failed', error);
+          showToast(t('toast.copy_failed'));
+        });
+      }
+    },
+    { signal: domSignal },
+  );
+
+  // Invite code update events
+  _busScope.on('ui:settings-tab-opened', () => {
+    updateInviteCodeUI();
+  });
+
+  // File input handler
+  const fileInput = getUiElement<HTMLInputElement>('file-input');
+  if (fileInput) {
+    fileInput.accept = AUDIO_FILE_ACCEPT;
+    fileInput.addEventListener(
+      'change',
+      (e) => {
+        closeMediaSourcePopup();
+        bus.emit('app:files-selected', (e.target as HTMLInputElement).files);
+        (e.target as HTMLInputElement).value = '';
+      },
+      { signal: domSignal },
+    );
+  }
+
+  // Storage error handler (prevent silent error swallowing)
+  _busScope.on('storage:error', (error, filename) => {
+    log.error(`[Storage] Error for ${filename}:`, error);
+    showToast(t('toast.file_save_error', { name: filename || t('common.unknown') }));
+  });
+
+  _busScope.on('storage:read-error', (data) => {
+    const d = data as Record<string, unknown>;
+    log.error('[Storage] Read error:', d?.filename, d?.error);
+    showToast(t('toast.file_read_error', { name: String(d?.filename || t('common.unknown')) }));
+  });
+
+  _busScope.on('storage:session-mismatch', (data) => {
+    const d = data as Record<string, unknown>;
+    log.warn('[Storage] Session mismatch:', d?.filename);
+    showToast(t('toast.session_mismatch'));
+  });
+
+  // ── Bus Event Bridge ──────────────────────────────────────────
+
+  // Toast
+  _busScope.on('ui:show-toast', (message) => {
+    showToast(message);
+  });
+  _busScope.on('ui:reveal-media-source', revealMediaSourceButton);
+
+  // Play button state (enabled/disabled)
+  // aria-disabled instead of HTML `disabled` so the click handler still
+  // fires when there's no media — _internalPlay surfaces a toast hint
+  // (the empty-playlist hint) that real `disabled` would silence.
+  _busScope.on('ui:play-btn-state', (enabled) => {
+    // Media readiness and room authority change independently. Preserve the
+    // former across an administrator grant/revoke, then project both into the
+    // actual affordance so a room.context update cannot leave stale UI.
+    _playButtonMediaEnabled = enabled;
+    syncPlayButtonAuthority();
+  });
+
+  // Play/Pause visual state — derived from playback activity + YouTube play event
+  function updatePlayIcon(playing: boolean): void {
+    if (_proPlaybackControlKind === 'pause') {
+      playing = false;
+    }
+    const btn = getUiElement('play-btn');
+    const icon = btn?.querySelector('path');
+    if (icon) {
+      icon.setAttribute(
+        'd',
+        playing
+          ? 'M6 19h4V5H6v14zm8-14v14h4V5h-4z' // pause icon
+          : 'M8 5v14l11-7z',
+      ); // play icon
+    }
+  }
+
+  scopePlaybackModeActivity(
+    _busScope,
+    (playback) => {
+      syncPlayButtonAuthority();
+      syncMainSyncButtonState();
+      syncMediaSourceButtonAuthority();
+      let playing = playback.activity === 'playing' && playback.mode !== null;
+      if (playback.mode === 'youtube') {
+        // The playback mode transitions to youtube the moment iframe creation
+        // starts (setEngineMode in iframe.ts), well before the video actually
+        // plays — assuming "playing" here would briefly show the pause icon
+        // over a silent loading iframe. Defer to the iframe's real PlayerState
+        // (1 = PLAYING). ui:update-play-state below refines this once YT
+        // emits its first PLAYING/PAUSED transition.
+        const ytPlayer = getYouTubePlayer();
+        playing = ytPlayer?.getPlayerState?.() === 1;
+      }
+      updatePlayIcon(playing);
+
+      // Clear YouTube sync spinner when leaving YouTube mode
+      if (playback.mode !== 'youtube') {
+        _ytSyncLoadingOwners.clear();
+        _ytPlayButtonLoading = false;
+      }
+      // The composite loading state may outlive a mode boundary (notably a
+      // PRO transition). Reconcile the iframe shield on every mode change so
+      // it appears only while the active engine is YouTube.
+      syncPlayButtonLoadingClass();
+    },
+    { immediate: true },
+  );
+
+  // YouTube pause/play doesn't change playback activity — still need this event
+  _busScope.on('ui:update-play-state', (playing) => {
+    if (isPlaybackModeYouTube()) {
+      updatePlayIcon(playing);
+    }
+  });
+
+  // YouTube auto-sync loading spinner on play button
+  _busScope.on('youtube:sync-loading', (loading, owner) => {
+    if (owner) {
+      if (loading) _ytSyncLoadingOwners.add(owner);
+      else _ytSyncLoadingOwners.delete(owner);
+    } else if (loading) {
+      _ytSyncLoadingOwners.add('legacy');
+    } else {
+      // An unscoped false is the teardown hard reset used by mode/session
+      // owners that invalidate every outstanding synchronization operation.
+      _ytSyncLoadingOwners.clear();
+    }
+    _ytPlayButtonLoading = _ytSyncLoadingOwners.size > 0;
+    syncPlayButtonLoadingClass();
+    // Keep readiness projection current across busy transitions. Manual Sync
+    // remains disabled until the protocol itself reaches idle; onPhaseChange
+    // emits the final readiness event for that later boundary.
+    syncMainSyncButtonState();
+  });
+
+  // Coordinator-free PRO playback has a server-owned PREPARE barrier rather
+  // than the legacy YouTube rendezvous. Reflect that shared wait on every
+  // participant, including file transitions and devices that did not initiate
+  // the selection themselves.
+  _busScope.on('pro-playback:transition-loading', (loading) => {
+    _proPlaybackTransitionLoading = !!loading;
+    syncPlayButtonLoadingClass();
+  });
+
+  _busScope.on('pro-playback:ui-control-pending', (event) => {
+    _proPlaybackControlToken = event.token;
+    _proPlaybackControlKind = event.kind;
+    _proPlaybackControlLoading =
+      event.kind === 'play' || (event.kind === 'seek' && event.wasPlaying);
+    if (event.kind === 'pause') updatePlayIcon(false);
+    syncPlayButtonLoadingClass();
+  });
+
+  _busScope.on('pro-playback:ui-control-settled', (event) => {
+    if (_proPlaybackControlToken !== event.token) return;
+    _proPlaybackControlToken = null;
+    _proPlaybackControlKind = null;
+    _proPlaybackControlLoading = false;
+    syncPlayButtonLoadingClass();
+
+    if (event.status !== 'applied') {
+      const mode = getState('playback.mode');
+      const activity = getState('playback.activity');
+      const playing =
+        mode === 'youtube'
+          ? getYouTubePlayer()?.getPlayerState?.() === 1
+          : mode !== null && activity === 'playing';
+      updatePlayIcon(playing);
+    }
+  });
+
+  _fileStartLoadingController = createFileStartLoadingController((pending) => {
+    _scheduledFileStartLoading = pending;
+    refreshFilePlayButtonLoading();
+  });
+  _busScope.on('state:playback.lifecycle', () => {
+    refreshFilePlayButtonLoading();
+    syncMainSyncButtonState();
+  });
+  _busScope.on('state:network.pendingTrackChangeQueueItemId', () => {
+    refreshFilePlayButtonLoading();
+    syncMainSyncButtonState();
+  });
+  _busScope.on('state:network.hostConn', (hostConn) => {
+    if (!hostConn && isProRoomTrackChangeIntentPending()) {
+      clearProRoomTrackChangeIntent();
+    }
+  });
+  _busScope.on('state:network.isOperator', (isOperator) => {
+    if (!isOperator && isProRoomTrackChangeIntentPending()) {
+      clearProRoomTrackChangeIntent();
+    }
+    // A standard-room ADMIN grant/revoke changes media-source capabilities
+    // without changing hostConn or room.context.
+    syncMediaSourceButtonAuthority();
+    syncQueueModeButtonAuthority();
+    syncPlayButtonAuthority();
+  });
+  _busScope.on('state:room.context', () => {
+    const context = getState('room.context');
+    if (
+      isProRoomTrackChangeIntentPending() &&
+      (context.kind !== 'pro' || context.role !== 'member')
+    ) {
+      clearProRoomTrackChangeIntent();
+    }
+    syncSystemAudioSourceButton();
+    syncMediaSourceButtonAuthority();
+    syncQueueModeButtonAuthority();
+    syncMainSyncButtonState();
+  });
+  _busScope.on('pro-system-audio:state-changed', () => {
+    syncSystemAudioSourceButton();
+    syncMediaSourceButtonAuthority();
+  });
+  _busScope.on('state:playlist.items', () => {
+    const pendingQueueItemId = getState('network.pendingTrackChangeQueueItemId');
+    if (
+      pendingQueueItemId &&
+      !getState('playlist.items').some((item) => item.queueItemId === pendingQueueItemId)
+    ) {
+      clearProRoomTrackChangeIntent();
+    }
+  });
+
+  // Player actions
+  _busScope.on('player:toggle-play', () => {
+    togglePlay();
+  });
+
+  // Playlist actions
+  _busScope.on('playlist:toggle-repeat', () => {
+    toggleRepeat();
+  });
+
+  _busScope.on('playlist:toggle-shuffle', () => {
+    toggleShuffle();
+  });
+
+  // Metadata update (track title in player UI)
+  _busScope.on('state:player.currentTrackMeta', () => {
+    refreshTrackTitle();
+  });
+  _busScope.on('state:files.current', refreshTrackTitle);
+
+  // Sync display update. Automatic clock correction continues internally;
+  // this surface intentionally exposes only the participant's manual offset.
+  _busScope.on('sync:display-update', () => {
+    _manualSyncOverlayRuntime?.refreshManualSyncOverlayRuntime();
+  });
+  _busScope.on('sync:close-manual', closeManualSyncOverlay);
+  _busScope.on('state:demo.active', () => {
+    syncDemoTransportControls();
+    if (!getState('demo.active')) {
+      closeManualSyncOverlay();
+      _closeDemoInlineControls();
+    }
+  });
+  _busScope.on('state:demo.loading', syncDemoTransportControls);
+  _busScope.on('state:network.hostConn', syncDemoTransportControls);
+
+  const closeManualSyncIfInvalid = () => {
+    syncDemoTransportControls();
+    if (
+      getState('demo.active')
+        ? isPlaybackModeSystemAudio()
+        : _manualSyncOverlayRuntime
+          ? !_manualSyncOverlayRuntime.canUseManualSyncPanelRuntime()
+          : getMainSyncUnavailableReason() !== null
+    ) {
+      closeManualSyncOverlay();
+    }
+  };
+  const reconcileStandardRoomSyncAvailability = () => {
+    closeManualSyncIfInvalid();
+    // Standard-host readiness also depends on these two setup fields. During
+    // reload recovery, restored playback can render first and room activation
+    // can settle later; without repainting here aria-disabled/title stay stale
+    // even though the click guard correctly sees an active coordinator.
+    syncMainSyncButtonState();
+  };
+  _busScope.on('state:playback.mode', closeManualSyncIfInvalid);
+  _busScope.on('state:playback.activity', closeManualSyncIfInvalid);
+  _busScope.on('state:network.hostConn', closeManualSyncIfInvalid);
+  _busScope.on('state:network.appRole', closeManualSyncIfInvalid);
+  _busScope.on('state:room.context', closeManualSyncIfInvalid);
+  _busScope.on('state:setup.sessionStarted', reconcileStandardRoomSyncAvailability);
+  _busScope.on('state:network.sessionCode', reconcileStandardRoomSyncAvailability);
+  _busScope.on('player:buffer-changed', () => {
+    refreshTrackTitle();
+    closeManualSyncIfInvalid();
+    syncMainSyncButtonState();
+  });
+  _busScope.on('youtube:zero-start-readiness-changed', syncMainSyncButtonState);
+
+  // YouTube time update — handled by seekbar.ts
+
+  // ── Tab Title Marquee ───────────────────────────────────────────
+
+  // Metadata can arrive before or after the remote playback state. Keeping
+  // title and motion as independent inputs makes both event orders converge.
+  setTabTitleTrack(getTabTitleTrack());
+  _busScope.on('state:player.currentTrackMeta', () => {
+    setTabTitleTrack(getTabTitleTrack());
+  });
+
+  scopePlaybackModeActivity(
+    _busScope,
+    () => {
+      const playing = getTabTitlePlaying();
+      if (playing !== undefined) setTabTitlePlaying(playing);
+    },
+    { immediate: true },
+  );
+
+  // YouTube pause/play doesn't change playback activity — handle via play-state event
+  _busScope.on('ui:update-play-state', (playing) => {
+    if (!isPlaybackModeYouTube()) return;
+    setTabTitlePlaying(playing);
+  });
+
+  log.info('[PlayerControls] Initialized');
+}

@@ -1,0 +1,5 @@
+dist/
+node_modules/
+
+# Wrangler owns these compatibility-date-specific declarations byte for byte.
+cloudflare/types/*.generated.d.ts

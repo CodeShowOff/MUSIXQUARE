@@ -1,0 +1,17 @@
+{
+  "rules": [
+    {
+      "id": "Delete active remote share objects",
+      "enabled": true,
+      "conditions": {
+        "prefix": "room/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 86400
+        }
+      }
+    }
+  ]
+}

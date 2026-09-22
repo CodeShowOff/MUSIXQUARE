@@ -1,0 +1,83 @@
+{
+  "name": "musixquare",
+  "version": "8.6.61",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "packageManager": "npm@12.0.2",
+  "engines": {
+    "node": "24.20.0"
+  },
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json",
+    "lint": "eslint src/ --max-warnings=0",
+    "lint:fix": "eslint src/ --fix",
+    "format": "prettier --write \"src/**/*.{cts,mts,ts,tsx}\"",
+    "format:check": "prettier --check \"src/**/*.{cts,mts,ts,tsx}\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:all": "vitest run && npm run typecheck"
+  },
+  "devDependencies": {
+    "@csstools/postcss-cascade-layers": "6.0.0",
+    "@csstools/postcss-is-pseudo-class": "6.0.0",
+    "@eslint/js": "^10.0.1",
+    "@resvg/resvg-wasm": "^2.6.2",
+    "@types/jsdom": "^30.0.0",
+    "@types/node": "24.13.3",
+    "@types/qrcode": "^1.5.6",
+    "@types/three": "0.185.4",
+    "@vitest/coverage-v8": "^5.0.0",
+    "content-shield": "^0.8.0",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.10.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "17.12.0",
+    "jiti": "2.7.0",
+    "jsdom": "^30.0.1",
+    "lil-gui": "0.21.0",
+    "peer": "^1.0.2",
+    "postcss": "8.5.28",
+    "prettier": "^3.9.6",
+    "satori": "^0.33.4",
+    "serve": "14.2.6",
+    "subset-font": "^2.7.0",
+    "three": "0.186.0",
+    "three-types-0162": "npm:@types/three@0.162.0",
+    "tsx": "^4.23.13",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.70.0",
+    "vite": "^8.2.2",
+    "vitest": "^5.0.0",
+    "wrangler": "4.130.0",
+    "ws": "^8.21.3"
+  },
+  "dependencies": {
+    "jsqr": "^1.4.0",
+    "peerjs": "^1.5.5",
+    "qrcode": "^1.5.4"
+  },
+  "overrides": {
+    "miniflare": {
+      "sharp": "0.35.4"
+    },
+    "satori": {
+      "fflate": "0.7.5"
+    },
+    "@shuding/opentype.js": {
+      "fflate": "0.7.5"
+    },
+    "brace-expansion": "5.0.9",
+    "qs": "6.16.0",
+    "undici": "7.29.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "esbuild@0.28.1": true,
+    "workerd@1.20260908.1": true
+  }
+}

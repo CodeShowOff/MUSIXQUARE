@@ -1,0 +1,190 @@
+{
+  "schemaVersion": 4,
+  "r2Cors": [
+    {
+      "bucket": "musixquare-demo-tracks",
+      "source": "cloudflare/r2-cors.demo-tracks.json"
+    },
+    {
+      "bucket": "musixquare-remote-share",
+      "source": "cloudflare/r2-cors.remote-share.json"
+    },
+    {
+      "bucket": "musixquare-pro-media",
+      "source": "cloudflare/r2-cors.pro-media.json"
+    }
+  ],
+  "r2Lifecycle": {
+    "exactPolicies": [
+      {
+        "bucket": "musixquare-remote-share",
+        "source": "cloudflare/r2-lifecycle.remote-share.json"
+      }
+    ],
+    "forbiddenShortDeletePolicies": [
+      {
+        "bucket": "musixquare-pro-media",
+        "maxAgeSeconds": 86400
+      }
+    ]
+  },
+  "workerSecrets": [
+    {
+      "worker": "musixquare-app",
+      "expectedNames": [
+        "CLOUDFLARE_REALTIME_API_TOKEN",
+        "CLOUDFLARE_REALTIME_APP_ID",
+        "CLOUDFLARE_TURN_API_TOKEN",
+        "CLOUDFLARE_TURN_KEY_ID",
+        "GEMINI_API_KEY",
+        "GOOGLE_OAUTH_CLIENT_ID",
+        "GOOGLE_OAUTH_CLIENT_SECRET",
+        "MXQR_ADMIN_PASSWORD",
+        "MXQR_ADMIN_SESSION_SECRET",
+        "MXQR_AUTH_SESSION_PEPPER",
+        "MXQR_AUTH_SUBJECT_PEPPER",
+        "MXQR_CAPABILITY_SECRET",
+        "MXQR_DEVELOPER_API_KEY_PEPPER",
+        "MXQR_OAUTH_STATE_SECRET",
+        "MXQR_PRO_GRANT_VOUCHER_PEPPER",
+        "MXQR_PRO_ROOM_ACCOUNT_ASSERTION_SECRET",
+        "MXQR_STANDARD_ROOM_ACCOUNT_ASSERTION_SECRET",
+        "YOUTUBE_API_KEY"
+      ]
+    },
+    {
+      "worker": "musixquare-developer-api",
+      "expectedNames": ["MXQR_DEVELOPER_API_KEY_PEPPER", "MXQR_DEVELOPER_API_RATE_SECRET"]
+    },
+    {
+      "worker": "musixquare-developer-api-facade",
+      "expectedNames": []
+    },
+    {
+      "worker": "musixquare-pro-room",
+      "expectedNames": [
+        "MXQR_PRO_ROOM_ACCOUNT_ASSERTION_SECRET",
+        "PRO_ROOM_ACTIVATION_SECRET",
+        "PRO_ROOM_PIN_PEPPER",
+        "PRO_ROOM_RATE_LIMIT_SECRET",
+        "PRO_ROOM_SESSION_SECRET",
+        "PRO_SIGNALING_SECRET",
+        "R2_ACCESS_KEY_ID",
+        "R2_ACCOUNT_ID",
+        "R2_SECRET_ACCESS_KEY"
+      ]
+    },
+    {
+      "worker": "musixquare-remote-share",
+      "expectedNames": [
+        "MXQR_CAPABILITY_SECRET",
+        "MXQR_REMOTE_SHARE_UPLOAD_ASSERTION_SECRET",
+        "R2_ACCESS_KEY_ID",
+        "R2_ACCOUNT_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "REMOTE_SHARE_SIGNING_SECRET"
+      ]
+    },
+    {
+      "worker": "musixquare-signaling",
+      "expectedNames": [
+        "MXQR_REMOTE_SHARE_UPLOAD_ASSERTION_SECRET",
+        "MXQR_STANDARD_ROOM_ACCOUNT_ASSERTION_SECRET",
+        "MXQR_STANDARD_ROOM_PIN_PEPPER",
+        "PRO_SIGNALING_SECRET"
+      ]
+    }
+  ],
+  "workerSurfaces": [
+    {
+      "worker": "musixquare-app",
+      "source": "cloudflare/wrangler.app.toml",
+      "exposure": "custom-domains",
+      "environment": "production",
+      "workersDev": false,
+      "previewUrls": false,
+      "customDomains": ["musixquare.com", "www.musixquare.com"]
+    },
+    {
+      "worker": "musixquare-developer-api",
+      "source": "cloudflare/wrangler.developer-api.toml",
+      "exposure": "custom-domains",
+      "environment": "production",
+      "workersDev": false,
+      "previewUrls": false,
+      "customDomains": ["api.musixquare.com"]
+    },
+    {
+      "worker": "musixquare-developer-api-facade",
+      "source": "cloudflare/wrangler.developer-api-facade.toml",
+      "exposure": "none",
+      "environment": "production",
+      "workersDev": false,
+      "previewUrls": false,
+      "customDomains": []
+    },
+    {
+      "worker": "musixquare-pro-room",
+      "source": "cloudflare/wrangler.pro-room.toml",
+      "exposure": "none",
+      "environment": "production",
+      "workersDev": false,
+      "previewUrls": false,
+      "customDomains": []
+    },
+    {
+      "worker": "musixquare-remote-share",
+      "source": "cloudflare/wrangler.remote-share.toml",
+      "exposure": "custom-domains",
+      "environment": "production",
+      "workersDev": false,
+      "previewUrls": false,
+      "customDomains": ["share.musixquare.com"]
+    },
+    {
+      "worker": "musixquare-signaling",
+      "source": "cloudflare/wrangler.signaling.toml",
+      "exposure": "custom-domains",
+      "environment": "production",
+      "workersDev": false,
+      "previewUrls": false,
+      "customDomains": ["signal-alt.musixquare.com", "signal.musixquare.com"]
+    }
+  ],
+  "workerRoutes": {
+    "zoneIdEnv": "CLOUDFLARE_ZONE_ID",
+    "readTokenEnv": "CLOUDFLARE_WORKERS_ROUTES_READ_TOKEN",
+    "expected": []
+  },
+  "github": {
+    "repository": "hiefny/MUSIXQUARE",
+    "branch": "main",
+    "requiredEffectiveRuleTypes": ["deletion", "non_fast_forward"]
+  },
+  "manualChecks": [
+    {
+      "id": "cloudflare-access-admin",
+      "label": "Cloudflare Access and MFA protect /admin",
+      "runbook": "cloudflare/config-drift-ops.md",
+      "reason": "The Access application and identity-provider policy are account-level controls that this repository cannot prove with the R2-scoped audit token."
+    },
+    {
+      "id": "cloudflare-waf-cost-controls",
+      "label": "WAF rate limits and Worker/R2/D1 spend notifications are active",
+      "runbook": "cloudflare/config-drift-ops.md",
+      "reason": "Rule expressions, notification destinations, and billing thresholds require a separate privileged account review and must not be inferred from Worker source."
+    },
+    {
+      "id": "cloudflare-secondary-deployments",
+      "label": "No second Git-triggered production deployment path is enabled",
+      "runbook": "cloudflare/config-drift-ops.md",
+      "reason": "Cloudflare dashboard build integrations are external state and are intentionally reported as manual-only rather than guessed from GitHub workflow files."
+    },
+    {
+      "id": "github-review-policy",
+      "label": "The current main-branch review and required-check policy matches the operator's release policy",
+      "runbook": "cloudflare/config-drift-ops.md",
+      "reason": "The automated check proves the minimum history-protection rules only; whether pull requests or named checks must be mandatory is a product-operations decision."
+    }
+  ]
+}

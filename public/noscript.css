@@ -1,0 +1,9 @@
+body {
+  opacity: 1 !important;
+  animation: none !important;
+}
+
+.bootstrap-failure {
+  display: none !important;
+  animation: none !important;
+}

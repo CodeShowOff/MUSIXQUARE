@@ -1,0 +1,56 @@
+import { log } from './log.ts';
+
+// ─── Instance ID (unique per app load) ─────────────────────────────
+
+export const INSTANCE_ID: string =
+  typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : Date.now().toString(36) + Math.random().toString(36).slice(2, 11);
+
+// ─── Session ID Generator ──────────────────────────────────────────
+
+let _globalSessionCounter = Math.floor(Date.now() / 1000) + Math.floor(Math.random() * 100000);
+
+export function nextSessionId(): number {
+  if (_globalSessionCounter >= Number.MAX_SAFE_INTEGER - 100000) {
+    _globalSessionCounter = Math.floor(Date.now() / 1000);
+  }
+  return ++_globalSessionCounter;
+}
+
+// ─── Session ID Validation ─────────────────────────────────────────
+
+const _warnedBadSessionIds = new Set<string>();
+
+/**
+ * Validate and normalize a session ID to a safe integer.
+ * Returns 0 for invalid IDs (0 is the "no-session" sentinel).
+ *
+ * @param id - The raw session ID (may be string, number, or undefined)
+ * @param strict - If true, throws on invalid ID instead of returning 0
+ */
+export function validateSessionId(id: unknown, strict = false): number {
+  const n = Number(id);
+  const ok = Number.isSafeInteger(n) && n > 0;
+  const sid = ok ? n : 0;
+  if (!ok) {
+    const key = String(id);
+    // Evict the oldest half to bound warning-dedup memory; Set preserves insertion order.
+    if (_warnedBadSessionIds.size > 200) {
+      let evict = Math.floor(_warnedBadSessionIds.size / 2);
+      for (const v of _warnedBadSessionIds) {
+        if (evict-- <= 0) break;
+        _warnedBadSessionIds.delete(v);
+      }
+    }
+    if (!_warnedBadSessionIds.has(key)) {
+      _warnedBadSessionIds.add(key);
+      log.warn(`[Session] Invalid sessionId (${typeof id}):`, id);
+    }
+    if (strict) {
+      throw new Error(`Invalid sessionId: ${id}`);
+    }
+    return 0;
+  }
+  return sid;
+}

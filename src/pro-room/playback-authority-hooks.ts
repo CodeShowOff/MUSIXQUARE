@@ -1,0 +1,903 @@
+import { log } from '../core/log.ts';
+import { bus } from '../core/events.ts';
+import { getState } from '../core/state.ts';
+import { clearManagedTimer, setManagedTimer } from '../core/timers.ts';
+import { resetStandardHostManualOffsetTransaction } from '../youtube/standard-host-manual-offset-gate.ts';
+import type {
+  ProPlaybackUiControlKind,
+  ProPlaybackUiControlPendingEvent,
+  ProPlaybackUiControlSettlementStatus,
+  QueueItemId,
+} from '../types/index.ts';
+
+/**
+ * Coordinator-free PRO playback seam.
+ *
+ * User/media observations travel out through one command handler. Canonical
+ * server frames travel back through an explicitly branded authority token.
+ * The token is passed down the exact call stack that applies a frame; there is
+ * deliberately no page-global "applying server state" boolean. A slow R2
+ * decode therefore cannot accidentally authorize a concurrent user click.
+ */
+
+export type ProPlaybackMediaKind = 'file' | 'youtube';
+export type ProPlaybackCanonicalState = 'idle' | 'paused' | 'playing';
+
+interface ProPlaybackIntentBase {
+  roomId: string;
+  roomEpoch: number;
+  queueItemId: QueueItemId | null;
+  positionSeconds: number;
+  /** Participant-local UI correlation only; omitted from every Worker command. */
+  clientUiControlToken?: number;
+}
+
+export type ProPlaybackUserIntent =
+  | (ProPlaybackIntentBase & {
+      kind: 'select';
+      queueItemId: QueueItemId;
+      youtubeSubIndex: number | null;
+      youtubeVideoId: string | null;
+    })
+  | (ProPlaybackIntentBase & { kind: 'play' | 'pause' | 'stop' | 'seek' })
+  | (ProPlaybackIntentBase & { kind: 'next' | 'previous' })
+  | (ProPlaybackIntentBase & {
+      /**
+       * The YouTube iframe observed that the current persisted playlist item
+       * is crossing into its next sub-video. Unlike a user-initiated `next`,
+       * this observation must remain fenced to the exact locally committed
+       * playback revision so several browsers cannot advance the manifest
+       * more than once.
+       */
+      kind: 'advance-sub-video';
+      queueItemId: QueueItemId;
+      observedPlaybackRevision: number;
+    })
+  | (ProPlaybackIntentBase & {
+      kind: 'ended' | 'unavailable';
+      queueItemId: QueueItemId;
+      mediaKind: ProPlaybackMediaKind;
+      /**
+       * Exact canonical revision whose resident media emitted this
+       * observation.  It is stamped synchronously by
+       * routeProPlaybackCommand(), before the runtime command queue can move
+       * on to a newer selection/seek/pause revision.
+       */
+      observedPlaybackRevision: number;
+      observedPositionSeconds: number;
+      durationSeconds: number | null;
+      youtubeSubIndex?: number | null;
+      youtubeVideoId?: string | null;
+    });
+
+export type ProPlaybackCommandHandler = (
+  intent: Readonly<ProPlaybackUserIntent>,
+) => void | Promise<void>;
+
+let commandHandler: ProPlaybackCommandHandler | null = null;
+let selectionCommandSequence = 0;
+const pendingSelectionCommands = new Set<number>();
+
+export function registerProPlaybackCommandHandler(
+  handler: ProPlaybackCommandHandler | null,
+): () => void {
+  commandHandler = handler;
+  return () => {
+    if (commandHandler === handler) commandHandler = null;
+  };
+}
+
+/**
+ * True only while a PRO `select` command is crossing the server admission
+ * boundary. During this window the visible renderer still belongs to the
+ * outgoing row, so a seek routed from that renderer would carry stale UI
+ * intent into the incoming row.
+ */
+export function isProPlaybackTrackSelectionPending(): boolean {
+  return pendingSelectionCommands.size > 0;
+}
+
+type RoutedIntentOf<T> = T extends ProPlaybackUserIntent
+  ? Omit<T, 'roomId' | 'roomEpoch' | 'observedPlaybackRevision' | 'clientUiControlToken'>
+  : never;
+type RoutedIntent = RoutedIntentOf<ProPlaybackUserIntent>;
+type RoutedUiIntent = RoutedIntent & { kind: ProPlaybackUiControlKind };
+
+interface ProPlaybackUiProjection {
+  readonly wasPlaying: boolean;
+}
+
+const UI_CONTROL_TIMEOUT_TIMER = 'pro-playback-ui-control-timeout';
+const UI_CONTROL_FAIL_OPEN_MS = 15_000;
+let uiControlSequence = 0;
+let activeUiControl: Readonly<ProPlaybackUiControlPendingEvent> | null = null;
+
+function emitUiControlSettlement(
+  event: Readonly<ProPlaybackUiControlPendingEvent>,
+  status: ProPlaybackUiControlSettlementStatus,
+  positionSeconds?: number,
+): void {
+  bus.emit('pro-playback:ui-control-settled', {
+    token: event.token,
+    kind: event.kind,
+    queueItemId: event.queueItemId,
+    status,
+    ...(Number.isFinite(positionSeconds) ? { positionSeconds } : {}),
+  });
+}
+
+function beginUiControl(
+  intent: RoutedUiIntent,
+  projection: Readonly<ProPlaybackUiProjection>,
+): Readonly<ProPlaybackUiControlPendingEvent> {
+  const previous = activeUiControl;
+  if (previous) emitUiControlSettlement(previous, 'superseded');
+
+  const event = Object.freeze({
+    token: ++uiControlSequence,
+    kind: intent.kind,
+    queueItemId: intent.queueItemId,
+    targetSeconds: Number.isFinite(intent.positionSeconds)
+      ? Math.max(0, intent.positionSeconds)
+      : 0,
+    wasPlaying: projection.wasPlaying,
+  });
+  activeUiControl = event;
+  clearManagedTimer(UI_CONTROL_TIMEOUT_TIMER);
+  bus.emit('pro-playback:ui-control-pending', event);
+  setManagedTimer(
+    UI_CONTROL_TIMEOUT_TIMER,
+    () => settleProPlaybackUiControl(event.token, 'failed'),
+    UI_CONTROL_FAIL_OPEN_MS,
+  );
+  return event;
+}
+
+/**
+ * Confirm that a queued local control is still the active projection and give
+ * its actual network/media stage a fresh fail-open window. A superseded or
+ * already-expired command must never be submitted later from the serial tail.
+ */
+export function refreshProPlaybackUiControlTimeout(token: number): boolean {
+  const event = activeUiControl;
+  if (!event || event.token !== token) return false;
+  clearManagedTimer(UI_CONTROL_TIMEOUT_TIMER);
+  setManagedTimer(
+    UI_CONTROL_TIMEOUT_TIMER,
+    () => settleProPlaybackUiControl(event.token, 'failed'),
+    UI_CONTROL_FAIL_OPEN_MS,
+  );
+  return true;
+}
+
+export function settleProPlaybackUiControl(
+  token: number,
+  status: ProPlaybackUiControlSettlementStatus,
+  positionSeconds?: number,
+): boolean {
+  const event = activeUiControl;
+  if (!event || event.token !== token) return false;
+  activeUiControl = null;
+  clearManagedTimer(UI_CONTROL_TIMEOUT_TIMER);
+  emitUiControlSettlement(event, status, positionSeconds);
+  return true;
+}
+
+/**
+ * Route an action whenever a coordinator-free PRO context is active.
+ *
+ * A PRO context without its command sink is an entry/recovery transition, not
+ * permission to fall back to the legacy local-host path. Consume the action in
+ * that short window so only a server-accepted command can move canonical
+ * playback. Returning false is reserved for ordinary rooms.
+ */
+export function routeProPlaybackCommand(
+  intent: RoutedIntent,
+  uiProjection?: Readonly<ProPlaybackUiProjection>,
+): boolean {
+  const context = getState('room.context');
+  const handler = commandHandler;
+  if (context.kind !== 'pro' || !context.roomId) return false;
+  // The UI normally hides room-wide playback controls from an ordinary PRO
+  // listener, but every call path still crosses this authority seam.  Consume
+  // a stale keyboard/media-session/programmatic action here instead of
+  // creating a pending spinner and relying on the Worker to reject it later.
+  // An `ended`/`unavailable` observation can still mutate the canonical queue,
+  // so it follows the same capability boundary as an explicit user control.
+  // The Worker independently enforces this boundary as the security backstop.
+  if (!context.capabilities.includes('playback.control')) {
+    log.warn('[PRO Playback] Ignored action without delegated playback authority');
+    return true;
+  }
+  if (!handler) {
+    log.warn('[PRO Playback] Ignored action while the server command channel is not ready');
+    return true;
+  }
+
+  if (intent.kind !== 'select' && isProPlaybackTrackSelectionPending()) {
+    log.debug('[PRO Playback] Ignored control while a track selection is awaiting admission');
+    return true;
+  }
+
+  const uiControl =
+    uiProjection && (intent.kind === 'play' || intent.kind === 'pause' || intent.kind === 'seek')
+      ? beginUiControl(intent as RoutedUiIntent, uiProjection)
+      : null;
+  const selectionCommand = intent.kind === 'select' ? ++selectionCommandSequence : null;
+  if (selectionCommand !== null) pendingSelectionCommands.add(selectionCommand);
+
+  const command = {
+    ...intent,
+    roomId: context.roomId,
+    roomEpoch: context.epoch,
+    ...(uiControl ? { clientUiControlToken: uiControl.token } : {}),
+    ...(intent.kind === 'ended' ||
+    intent.kind === 'unavailable' ||
+    intent.kind === 'advance-sub-video'
+      ? { observedPlaybackRevision: highestCommittedPlaybackRevision }
+      : {}),
+  } as ProPlaybackUserIntent;
+  try {
+    void Promise.resolve(handler(command))
+      .catch((error) => {
+        log.warn('[PRO Playback] Server command rejected', error);
+        if (uiControl) settleProPlaybackUiControl(uiControl.token, 'failed');
+      })
+      .finally(() => {
+        if (selectionCommand !== null) pendingSelectionCommands.delete(selectionCommand);
+      });
+  } catch (error) {
+    if (selectionCommand !== null) pendingSelectionCommands.delete(selectionCommand);
+    log.warn('[PRO Playback] Server command handler threw', error);
+    if (uiControl) settleProPlaybackUiControl(uiControl.token, 'failed');
+  }
+  return true;
+}
+
+const authorityBrand: unique symbol = Symbol('musixquare.pro-playback-authority');
+
+export interface ProPlaybackAuthorityStamp {
+  roomId: string;
+  roomEpoch: number;
+  /** Revision the server compared atomically before accepting this command. */
+  basePlaybackRevision: number;
+  /** Null only for a direct (non-PREPARE) commit. */
+  transitionId: string | null;
+}
+
+/** Opaque proof that a call originates from a validated server frame. */
+export interface ProPlaybackAuthorityToken extends Readonly<ProPlaybackAuthorityStamp> {
+  readonly [authorityBrand]: true;
+}
+
+function requireSafeCounter(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative safe integer`);
+  }
+}
+
+export function createProPlaybackAuthorityToken(
+  stamp: ProPlaybackAuthorityStamp,
+): ProPlaybackAuthorityToken {
+  const roomId = stamp.roomId.trim();
+  const transitionId = stamp.transitionId === null ? null : stamp.transitionId.trim();
+  if (!roomId || transitionId === '') throw new TypeError('roomId is required');
+  requireSafeCounter(stamp.roomEpoch, 'roomEpoch');
+  requireSafeCounter(stamp.basePlaybackRevision, 'basePlaybackRevision');
+  return Object.freeze({
+    roomId,
+    roomEpoch: stamp.roomEpoch,
+    basePlaybackRevision: stamp.basePlaybackRevision,
+    transitionId,
+    [authorityBrand]: true as const,
+  });
+}
+
+export function isProPlaybackAuthorityToken(value: unknown): value is ProPlaybackAuthorityToken {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as Partial<ProPlaybackAuthorityToken>)[authorityBrand] === true
+  );
+}
+
+/** Stable participant-local key for one exact server authority frame. */
+export function getProPlaybackAuthorityKey(authority: ProPlaybackAuthorityToken): string {
+  if (!isProPlaybackAuthorityToken(authority)) {
+    throw new TypeError('A server authority token is required');
+  }
+  return JSON.stringify([
+    authority.roomId,
+    authority.roomEpoch,
+    authority.basePlaybackRevision,
+    authority.transitionId,
+  ]);
+}
+
+export interface ProPlaybackPrepareRequest {
+  authority: ProPlaybackAuthorityToken;
+  queueItemId: QueueItemId;
+  positionSeconds: number;
+  /** Canonical target phase carried by the server PREPARE/snapshot. */
+  state?: Exclude<ProPlaybackCanonicalState, 'idle'>;
+  /**
+   * Receipt-relative preparation budget already projected from the server
+   * clock by the PRO runtime. Endpoints consume it only with a local monotonic
+   * timer, so client wall-clock skew cannot extend or collapse the deadline.
+   */
+  prepareBudgetMs?: number;
+  youtubeSubIndex?: number | null;
+  youtubeVideoId?: string | null;
+  /** Participant-local fence injected by the authority layer for async media waits. */
+  isCurrent?: () => boolean;
+}
+
+/**
+ * Participant-side scheduling policy for one canonical PRO playback commit.
+ *
+ * `zero-start` may use the measured platform audio-output lead. Ordinary
+ * controls already target a running timeline and must follow the server clock
+ * without that one-time compensation.
+ */
+export type ProPlaybackTimingMode = 'zero-start' | 'scheduled-control';
+
+export type ProPlaybackPrepareFailureReason =
+  | 'inactive-room'
+  | 'stale-authority'
+  | 'missing-endpoint'
+  | 'missing-track'
+  | 'identity-mismatch'
+  | 'media-unavailable'
+  | 'decode-failed'
+  | 'player-unavailable'
+  | 'audio-locked'
+  | 'timeout'
+  | 'superseded'
+  | 'unknown';
+
+export type ProPlaybackPrepareResult =
+  | {
+      status: 'ready';
+      authority: ProPlaybackAuthorityToken;
+      queueItemId: QueueItemId;
+      mediaKind: ProPlaybackMediaKind;
+      durationSeconds: number | null;
+      youtubeSubIndex: number | null;
+      youtubeVideoId: string | null;
+    }
+  | {
+      status: 'failed' | 'superseded';
+      authority: ProPlaybackAuthorityToken;
+      queueItemId: QueueItemId;
+      reason: ProPlaybackPrepareFailureReason;
+    };
+
+export interface ProPlaybackCommitRequest {
+  authority: ProPlaybackAuthorityToken;
+  /** Canonical revision carried by the COMMIT playback snapshot. */
+  committedPlaybackRevision: number;
+  queueItemId: QueueItemId | null;
+  state: ProPlaybackCanonicalState;
+  positionSeconds: number;
+  /** Delay from receipt to the locally compensated execution instant. */
+  scheduleDelayMs: number;
+  timingMode: ProPlaybackTimingMode;
+  youtubeSubIndex?: number | null;
+  youtubeVideoId?: string | null;
+  /** Participant-local fence for a newer canonical COMMIT or room teardown. */
+  isCurrent?: () => boolean;
+}
+
+export interface ProPlaybackCommitResult {
+  status: 'applied' | 'failed' | 'superseded';
+  authority: ProPlaybackAuthorityToken;
+  reason?: ProPlaybackPrepareFailureReason;
+}
+
+export interface ProPlaybackMediaEndpoint {
+  prepare(request: Readonly<ProPlaybackPrepareRequest>): Promise<ProPlaybackPrepareResult>;
+  commit(request: Readonly<ProPlaybackCommitRequest>): Promise<ProPlaybackCommitResult>;
+  /** Abort participant-local work for one server-cancelled transition. */
+  cancel?(authority: ProPlaybackAuthorityToken): void;
+  /**
+   * Silence an older renderer after a newer canonical COMMIT is known but its
+   * media could not be applied locally. Implementations must retire only the
+   * exact stale renderer and must not clear a successor preparation.
+   */
+  invalidateCommitted?(request: Readonly<ProPlaybackCommitRequest>): Promise<void> | void;
+  /** Synchronously revoke the endpoint's room-scoped renderer ownership. */
+  reset?(): void;
+}
+
+let mediaEndpoint: ProPlaybackMediaEndpoint | null = null;
+let prepareGeneration = 0;
+let activePreparation: {
+  generation: number;
+  authority: ProPlaybackAuthorityToken;
+  promise: Promise<ProPlaybackPrepareResult>;
+} | null = null;
+let highestSeen: ProPlaybackAuthorityToken | null = null;
+let latestApplied: ProPlaybackAuthorityToken | null = null;
+let highestCommittedPlaybackRevision = 0;
+
+function cancelPreparationIfStillOwned(
+  pending: NonNullable<typeof activePreparation>,
+  endpoint: ProPlaybackMediaEndpoint,
+): void {
+  if (
+    activePreparation !== pending ||
+    activePreparation.generation !== pending.generation ||
+    prepareGeneration !== pending.generation
+  ) {
+    return;
+  }
+  prepareGeneration += 1;
+  activePreparation = null;
+  endpoint.cancel?.(pending.authority);
+}
+
+export function registerProPlaybackMediaEndpoint(
+  endpoint: ProPlaybackMediaEndpoint | null,
+): () => void {
+  mediaEndpoint = endpoint;
+  return () => {
+    if (mediaEndpoint === endpoint) mediaEndpoint = null;
+  };
+}
+
+function sameAuthority(left: ProPlaybackAuthorityToken, right: ProPlaybackAuthorityToken): boolean {
+  return (
+    left.roomId === right.roomId &&
+    left.roomEpoch === right.roomEpoch &&
+    left.basePlaybackRevision === right.basePlaybackRevision &&
+    left.transitionId === right.transitionId
+  );
+}
+
+function compareAuthority(
+  left: ProPlaybackAuthorityToken,
+  right: ProPlaybackAuthorityToken,
+): number {
+  if (left.roomId !== right.roomId) return 1;
+  if (left.roomEpoch !== right.roomEpoch) return left.roomEpoch - right.roomEpoch;
+  return left.basePlaybackRevision - right.basePlaybackRevision;
+}
+
+function isOlderAuthority(
+  authority: ProPlaybackAuthorityToken,
+  reference: ProPlaybackAuthorityToken | null,
+): boolean {
+  return !!reference && compareAuthority(authority, reference) < 0;
+}
+
+function activeAuthorityRoomMatches(authority: ProPlaybackAuthorityToken): boolean {
+  const context = getState('room.context');
+  return (
+    context.kind === 'pro' &&
+    context.roomId === authority.roomId &&
+    context.epoch === authority.roomEpoch
+  );
+}
+
+function failedPrepare(
+  request: Readonly<ProPlaybackPrepareRequest>,
+  reason: ProPlaybackPrepareFailureReason,
+  status: 'failed' | 'superseded' = 'failed',
+): ProPlaybackPrepareResult {
+  return { status, authority: request.authority, queueItemId: request.queueItemId, reason };
+}
+
+export async function prepareProPlaybackAuthority(
+  request: Readonly<ProPlaybackPrepareRequest>,
+): Promise<ProPlaybackPrepareResult> {
+  if (!isProPlaybackAuthorityToken(request.authority)) {
+    throw new TypeError('A server authority token is required');
+  }
+  if (request.isCurrent?.() === false) {
+    return failedPrepare(request, 'superseded', 'superseded');
+  }
+  if (request.authority.transitionId === null) {
+    return failedPrepare(request, 'stale-authority');
+  }
+  if (!activeAuthorityRoomMatches(request.authority)) {
+    return failedPrepare(request, 'inactive-room');
+  }
+  if (request.authority.basePlaybackRevision < highestCommittedPlaybackRevision) {
+    return failedPrepare(request, 'stale-authority', 'superseded');
+  }
+  if (isOlderAuthority(request.authority, highestSeen)) {
+    return failedPrepare(request, 'stale-authority', 'superseded');
+  }
+  const endpoint = mediaEndpoint;
+  if (!endpoint) return failedPrepare(request, 'missing-endpoint');
+
+  if (activePreparation && sameAuthority(activePreparation.authority, request.authority)) {
+    const result = await activePreparation.promise;
+    return request.isCurrent?.() === false
+      ? failedPrepare(request, 'superseded', 'superseded')
+      : result;
+  }
+
+  if (activePreparation) endpoint.cancel?.(activePreparation.authority);
+
+  // Accepted server work supersedes a local correction even for the same
+  // video. Retire its timers before any canonical iframe command; retain the
+  // participant's requested offset for the authoritative endpoint to apply.
+  resetStandardHostManualOffsetTransaction();
+
+  const generation = ++prepareGeneration;
+  const upstreamIsCurrent = request.isCurrent;
+  const endpointRequest: Readonly<ProPlaybackPrepareRequest> = {
+    ...request,
+    isCurrent: () =>
+      generation === prepareGeneration &&
+      activeAuthorityRoomMatches(request.authority) &&
+      !isOlderAuthority(request.authority, highestSeen) &&
+      upstreamIsCurrent?.() !== false,
+  };
+  const promise = endpoint.prepare(endpointRequest);
+  activePreparation = { generation, authority: request.authority, promise };
+  highestSeen = request.authority;
+  const result = await promise;
+  if (
+    generation !== prepareGeneration ||
+    !activePreparation ||
+    activePreparation.generation !== generation ||
+    !sameAuthority(activePreparation.authority, request.authority) ||
+    upstreamIsCurrent?.() === false
+  ) {
+    return failedPrepare(request, 'superseded', 'superseded');
+  }
+  if (isOlderAuthority(request.authority, highestSeen)) {
+    return failedPrepare(request, 'stale-authority', 'superseded');
+  }
+  return result;
+}
+
+/**
+ * Arm the media endpoint for a participant-local rendezvous of the exact
+ * already-committed revision. Unlike prepareProPlaybackAuthority(), this does
+ * not claim that a newer server revision is being prepared.
+ */
+export async function prepareCurrentProPlaybackRendezvousAuthority(
+  request: Readonly<ProPlaybackPrepareRequest>,
+): Promise<ProPlaybackPrepareResult> {
+  if (!isProPlaybackAuthorityToken(request.authority)) {
+    throw new TypeError('A server authority token is required');
+  }
+  if (request.isCurrent?.() === false) {
+    return failedPrepare(request, 'superseded', 'superseded');
+  }
+  if (
+    request.authority.transitionId === null ||
+    request.authority.basePlaybackRevision + 1 !== highestCommittedPlaybackRevision
+  ) {
+    return failedPrepare(request, 'stale-authority', 'superseded');
+  }
+  if (!activeAuthorityRoomMatches(request.authority)) {
+    return failedPrepare(request, 'inactive-room');
+  }
+  const endpoint = mediaEndpoint;
+  if (!endpoint) return failedPrepare(request, 'missing-endpoint');
+
+  if (activePreparation) {
+    if (sameAuthority(activePreparation.authority, request.authority)) {
+      return activePreparation.promise;
+    }
+    // A participant-local sync never preempts canonical server work. A
+    // cancelled PREPARE may remain in highestSeen as historical fencing, but
+    // an actually active PREPARE still owns the endpoint until it settles.
+    return failedPrepare(request, 'stale-authority', 'superseded');
+  }
+
+  const generation = ++prepareGeneration;
+  const endpointRequest: Readonly<ProPlaybackPrepareRequest> = {
+    ...request,
+    isCurrent: () =>
+      generation === prepareGeneration &&
+      activeAuthorityRoomMatches(request.authority) &&
+      request.authority.basePlaybackRevision + 1 === highestCommittedPlaybackRevision &&
+      request.isCurrent?.() !== false,
+  };
+  resetStandardHostManualOffsetTransaction();
+  const promise = endpoint.prepare(endpointRequest);
+  activePreparation = { generation, authority: request.authority, promise };
+  const result = await promise;
+  if (
+    generation !== prepareGeneration ||
+    !activePreparation ||
+    activePreparation.generation !== generation ||
+    !sameAuthority(activePreparation.authority, request.authority)
+  ) {
+    return failedPrepare(request, 'superseded', 'superseded');
+  }
+  if (
+    request.authority.basePlaybackRevision + 1 !== highestCommittedPlaybackRevision ||
+    request.isCurrent?.() === false
+  ) {
+    return failedPrepare(request, 'stale-authority', 'superseded');
+  }
+  return result;
+}
+
+/**
+ * Cancel the active participant preparation without disturbing an already
+ * applied revision. Server CANCEL frames pass their exact token; teardown may
+ * omit it to release whichever preparation the departing room owns.
+ */
+export function cancelProPlaybackPreparation(authority?: ProPlaybackAuthorityToken): boolean {
+  const pending = activePreparation;
+  if (!pending) return false;
+  if (
+    authority &&
+    (!isProPlaybackAuthorityToken(authority) ||
+      !activeAuthorityRoomMatches(authority) ||
+      !sameAuthority(pending.authority, authority))
+  ) {
+    return false;
+  }
+
+  prepareGeneration += 1;
+  activePreparation = null;
+  mediaEndpoint?.cancel?.(pending.authority);
+  return true;
+}
+
+export async function commitProPlaybackAuthority(
+  request: Readonly<ProPlaybackCommitRequest>,
+): Promise<ProPlaybackCommitResult> {
+  if (!isProPlaybackAuthorityToken(request.authority)) {
+    throw new TypeError('A server authority token is required');
+  }
+  requireSafeCounter(request.committedPlaybackRevision, 'committedPlaybackRevision');
+  if (request.committedPlaybackRevision !== request.authority.basePlaybackRevision + 1) {
+    return { status: 'failed', authority: request.authority, reason: 'stale-authority' };
+  }
+  if (!activeAuthorityRoomMatches(request.authority)) {
+    return { status: 'failed', authority: request.authority, reason: 'inactive-room' };
+  }
+  if (latestApplied && sameAuthority(request.authority, latestApplied)) {
+    return { status: 'applied', authority: request.authority };
+  }
+  if (request.committedPlaybackRevision <= highestCommittedPlaybackRevision) {
+    return { status: 'superseded', authority: request.authority, reason: 'stale-authority' };
+  }
+  if (isOlderAuthority(request.authority, highestSeen)) {
+    return { status: 'superseded', authority: request.authority, reason: 'stale-authority' };
+  }
+  const endpoint = mediaEndpoint;
+  if (!endpoint) {
+    return { status: 'failed', authority: request.authority, reason: 'missing-endpoint' };
+  }
+  if (request.isCurrent?.() === false) {
+    return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+  }
+
+  const pending = activePreparation;
+  if (request.authority.transitionId !== null) {
+    if (!pending || !sameAuthority(pending.authority, request.authority)) {
+      return { status: 'superseded', authority: request.authority, reason: 'stale-authority' };
+    }
+    const prepared = await pending.promise;
+    if (request.isCurrent?.() === false) {
+      cancelPreparationIfStillOwned(pending, endpoint);
+      return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+    }
+    if (prepared.status !== 'ready') {
+      cancelPreparationIfStillOwned(pending, endpoint);
+      return {
+        status: prepared.status === 'superseded' ? 'superseded' : 'failed',
+        authority: request.authority,
+        reason: prepared.reason,
+      };
+    }
+    if (
+      pending.generation !== prepareGeneration ||
+      !activePreparation ||
+      activePreparation.generation !== pending.generation ||
+      !sameAuthority(activePreparation.authority, request.authority)
+    ) {
+      return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+    }
+  } else if (pending && compareAuthority(pending.authority, request.authority) <= 0) {
+    // A direct commit (pause/seek/etc.) is itself canonical and supersedes any
+    // uncommitted media preparation at the same or an older base revision.
+    prepareGeneration += 1;
+    activePreparation = null;
+    endpoint.cancel?.(pending.authority);
+  }
+
+  highestSeen = request.authority;
+  let result: ProPlaybackCommitResult;
+  resetStandardHostManualOffsetTransaction();
+  try {
+    result = await endpoint.commit(request);
+  } catch (error) {
+    if (pending) cancelPreparationIfStillOwned(pending, endpoint);
+    throw error;
+  }
+  if (request.isCurrent?.() === false) {
+    if (pending) cancelPreparationIfStillOwned(pending, endpoint);
+    return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+  }
+  if (result.status === 'applied') {
+    latestApplied = request.authority;
+    highestCommittedPlaybackRevision = request.committedPlaybackRevision;
+    if (activePreparation && sameAuthority(activePreparation.authority, request.authority)) {
+      activePreparation = null;
+    }
+  } else if (pending) {
+    cancelPreparationIfStillOwned(pending, endpoint);
+  }
+  return result;
+}
+
+export async function invalidateCommittedProPlaybackMedia(
+  request: Readonly<ProPlaybackCommitRequest>,
+): Promise<void> {
+  if (
+    !isProPlaybackAuthorityToken(request.authority) ||
+    !activeAuthorityRoomMatches(request.authority) ||
+    request.isCurrent?.() === false
+  ) {
+    return;
+  }
+  await mediaEndpoint?.invalidateCommitted?.(request);
+}
+
+/**
+ * Re-apply the exact currently committed checkpoint to one participant.
+ *
+ * Mobile browsers may suspend an iframe while the server timeline continues.
+ * The canonical revision is therefore still current even though the local
+ * media endpoint is stale.  This seam deliberately accepts only that exact
+ * high-water revision and never advances any authority bookkeeping; it cannot
+ * resurrect an older checkpoint or manufacture a new room command.
+ */
+export async function reconcileCurrentProPlaybackAuthority(
+  request: Readonly<ProPlaybackCommitRequest>,
+): Promise<ProPlaybackCommitResult> {
+  if (!isProPlaybackAuthorityToken(request.authority)) {
+    throw new TypeError('A server authority token is required');
+  }
+  requireSafeCounter(request.committedPlaybackRevision, 'committedPlaybackRevision');
+  if (
+    request.authority.transitionId !== null ||
+    request.committedPlaybackRevision !== request.authority.basePlaybackRevision + 1 ||
+    request.committedPlaybackRevision !== highestCommittedPlaybackRevision
+  ) {
+    return { status: 'superseded', authority: request.authority, reason: 'stale-authority' };
+  }
+  if (!activeAuthorityRoomMatches(request.authority)) {
+    return { status: 'failed', authority: request.authority, reason: 'inactive-room' };
+  }
+  if (request.isCurrent?.() === false) {
+    return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+  }
+  // A server PREPARE/COMMIT owns the endpoint until it settles. Foreground
+  // recovery must never cancel or overtake that newer canonical transition.
+  if (activePreparation) {
+    return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+  }
+  const endpoint = mediaEndpoint;
+  if (!endpoint) {
+    return { status: 'failed', authority: request.authority, reason: 'missing-endpoint' };
+  }
+
+  resetStandardHostManualOffsetTransaction();
+  const result = await endpoint.commit(request);
+  if (request.isCurrent?.() === false) {
+    return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+  }
+  return result;
+}
+
+/**
+ * Re-arm and release the exact currently committed checkpoint on one
+ * participant without creating a new room command or advancing the canonical
+ * revision. This is the participant-local counterpart of the server's
+ * PREPARE/COMMIT rendezvous and is used by the PRO manual-sync button.
+ *
+ * The caller must first prepare this exact non-null authority through
+ * prepareCurrentProPlaybackRendezvousAuthority(). A concurrent server
+ * transition supersedes that preparation through the ordinary
+ * generation/authority fences.
+ */
+export async function rendezvousCurrentProPlaybackAuthority(
+  request: Readonly<ProPlaybackCommitRequest>,
+): Promise<ProPlaybackCommitResult> {
+  if (!isProPlaybackAuthorityToken(request.authority)) {
+    throw new TypeError('A server authority token is required');
+  }
+  requireSafeCounter(request.committedPlaybackRevision, 'committedPlaybackRevision');
+  if (
+    request.authority.transitionId === null ||
+    request.committedPlaybackRevision !== request.authority.basePlaybackRevision + 1 ||
+    request.committedPlaybackRevision !== highestCommittedPlaybackRevision
+  ) {
+    return { status: 'superseded', authority: request.authority, reason: 'stale-authority' };
+  }
+  if (!activeAuthorityRoomMatches(request.authority)) {
+    return { status: 'failed', authority: request.authority, reason: 'inactive-room' };
+  }
+  if (request.isCurrent?.() === false) {
+    return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+  }
+
+  const endpoint = mediaEndpoint;
+  if (!endpoint) {
+    return { status: 'failed', authority: request.authority, reason: 'missing-endpoint' };
+  }
+  const pending = activePreparation;
+  if (!pending || !sameAuthority(pending.authority, request.authority)) {
+    return { status: 'superseded', authority: request.authority, reason: 'stale-authority' };
+  }
+  const prepared = await pending.promise;
+  if (request.isCurrent?.() === false) {
+    cancelPreparationIfStillOwned(pending, endpoint);
+    return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+  }
+  if (prepared.status !== 'ready') {
+    cancelPreparationIfStillOwned(pending, endpoint);
+    return {
+      status: prepared.status === 'superseded' ? 'superseded' : 'failed',
+      authority: request.authority,
+      reason: prepared.reason,
+    };
+  }
+  if (
+    pending.generation !== prepareGeneration ||
+    !activePreparation ||
+    activePreparation.generation !== pending.generation ||
+    !sameAuthority(activePreparation.authority, request.authority)
+  ) {
+    return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+  }
+
+  let result: ProPlaybackCommitResult;
+  try {
+    result = await endpoint.commit(request);
+  } catch (error) {
+    cancelPreparationIfStillOwned(pending, endpoint);
+    throw error;
+  }
+  if (request.isCurrent?.() === false) {
+    cancelPreparationIfStillOwned(pending, endpoint);
+    return { status: 'superseded', authority: request.authority, reason: 'superseded' };
+  }
+  if (result.status === 'applied') {
+    // This was a local re-application of an existing revision. Clear the arm,
+    // but deliberately leave latestApplied/highestCommittedPlaybackRevision
+    // owned by the real server COMMIT.
+    if (activePreparation && sameAuthority(activePreparation.authority, request.authority)) {
+      activePreparation = null;
+    }
+  } else {
+    cancelPreparationIfStillOwned(pending, endpoint);
+  }
+  return result;
+}
+
+/** Reset revision and preparation ownership on PRO leave/rejoin. */
+export function resetProPlaybackAuthorityHooks(): void {
+  if (getState('room.context').kind === 'pro') resetStandardHostManualOffsetTransaction();
+  const pending = activePreparation;
+  prepareGeneration += 1;
+  activePreparation = null;
+  // Room teardown must release participant-local media work as well as the
+  // authority bookkeeping. In particular, YouTube PREPARE owns hard-mute,
+  // warm-up, seek, and scheduled-release timers that could otherwise outlive
+  // the PRO room and mutate the iframe after the user has left.
+  if (pending) mediaEndpoint?.cancel?.(pending.authority);
+  mediaEndpoint?.reset?.();
+  highestSeen = null;
+  latestApplied = null;
+  highestCommittedPlaybackRevision = 0;
+  pendingSelectionCommands.clear();
+  const pendingUiControl = activeUiControl;
+  if (pendingUiControl) {
+    activeUiControl = null;
+    clearManagedTimer(UI_CONTROL_TIMEOUT_TIMER);
+    emitUiControlSettlement(pendingUiControl, 'failed');
+  }
+}

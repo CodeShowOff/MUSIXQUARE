@@ -1,0 +1,35 @@
+name = "musixquare-developer-api-facade"
+main = "developer-api-facade-worker.ts"
+compatibility_date = "2026-07-17"
+workers_dev = false
+preview_urls = false
+upload_source_maps = true
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+[observability]
+enabled = true
+
+# Keep automatic request-URL events disabled across the public Worker fleet;
+# sampled application logs use explicit credential-free fields.
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.1
+invocation_logs = false
+
+[observability.traces]
+enabled = false
+
+# This Worker intentionally has no public route, D1, R2, secrets, or
+# signaling binding. Only the public Developer API Worker may call it through
+# a service binding, and only this facade can reach the PRO room namespace.
+[[durable_objects.bindings]]
+name = "PRO_ROOM_DEVELOPER_ROOMS"
+class_name = "MusixquareProRoom"
+script_name = "musixquare-pro-room"
+
+[[durable_objects.bindings]]
+name = "MUSIXQUARE_SERVICE_CONTROL"
+class_name = "MusixquareServiceControl"
+script_name = "musixquare-pro-room"

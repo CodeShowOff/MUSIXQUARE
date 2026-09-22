@@ -1,0 +1,90 @@
+name = "musixquare-remote-share"
+main = "remote-share-worker.ts"
+compatibility_date = "2026-05-03"
+workers_dev = false
+preview_urls = false
+upload_source_maps = true
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+[observability]
+enabled = true
+
+# Keep automatic request-URL events disabled across the public Worker fleet;
+# sampled application logs use explicit credential-free fields.
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.1
+invocation_logs = false
+
+[observability.traces]
+enabled = false
+
+[[routes]]
+pattern = "share.musixquare.com"
+custom_domain = true
+
+[vars]
+R2_BUCKET_NAME = "musixquare-remote-share"
+OBJECT_TTL_SECONDS = "3600"
+UPLOAD_TOKEN_TTL_SECONDS = "600"
+RATE_LIMIT_WINDOW_SECONDS = "3600"
+IP_UPLOADS_PER_WINDOW = "60"
+ROOM_UPLOADS_PER_WINDOW = "120"
+ROOM_STORAGE_QUOTA_BYTES = "1073741824"
+ROOM_UPLOAD_ASSERTION_MODE = "required"
+ALLOWED_ORIGINS = "https://musixquare.com,https://www.musixquare.com,https://musixquare.apps.tossmini.com,https://musixquare.private-apps.tossmini.com,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173"
+
+# Required secrets, set outside this file:
+# npm run wrangler -- secret put R2_ACCOUNT_ID --config cloudflare/wrangler.remote-share.toml
+# npm run wrangler -- secret put REMOTE_SHARE_SIGNING_SECRET --config cloudflare/wrangler.remote-share.toml
+# npm run wrangler -- secret put R2_ACCESS_KEY_ID --config cloudflare/wrangler.remote-share.toml
+# npm run wrangler -- secret put R2_SECRET_ACCESS_KEY --config cloudflare/wrangler.remote-share.toml
+# REMOTE_SHARE_SIGNING_SECRET must be an independent random value of at least 32 characters.
+# Required for capability gate (set to the same random value of at least 32 characters
+# as the app Worker MXQR_CAPABILITY_SECRET so app-issued tokens verify here):
+# npm run wrangler -- secret put MXQR_CAPABILITY_SECRET --config cloudflare/wrangler.remote-share.toml
+# Shared only with the signaling Worker. Use the same independent random value
+# of at least 32 characters on both Workers. The optional prefixed JSON
+# current/previous rotation form is documented in cloudflare/remote-share-ops.md:
+# npm run wrangler -- secret put MXQR_REMOTE_SHARE_UPLOAD_ASSERTION_SECRET --config cloudflare/wrangler.remote-share.toml
+
+[[r2_buckets]]
+binding = "REMOTE_SHARE_BUCKET"
+bucket_name = "musixquare-remote-share"
+
+[[durable_objects.bindings]]
+name = "REMOTE_SHARE_QUOTA"
+class_name = "RemoteShareQuota"
+
+# Required atomic allocation limiter; Cloudflare production fails closed when
+# this cross-script binding is missing. The
+# admin-announcement-v2+abuse-rate-v2+session-idempotency-v1+maintenance-status-headers-v1+abuse-rate-response-headers-v1 marker rolls out
+# with target all and deploys the PRO owner first.
+[[durable_objects.bindings]]
+name = "MUSIXQUARE_SERVICE_CONTROL"
+class_name = "MusixquareServiceControl"
+script_name = "musixquare-pro-room"
+
+# Aggregate-only assertion rollout telemetry. No room, peer, actor, request,
+# token, IP, or object identifier is written to this database.
+[[d1_databases]]
+binding = "MUSIXQUARE_ADMIN_DB"
+database_name = "musixquare-admin-metrics"
+database_id = "d6cc9ceb-f0b6-40e4-99aa-8f28bec412ed"
+
+# Cloudflare requires this Durable Object migration history to remain
+# append-only. These provider-managed identifiers are immutable infrastructure
+# schema tags; do not edit or reuse deleted class names.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RemoteShareRateLimiter"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["RemoteShareRateLimiter"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["RemoteShareQuota"]

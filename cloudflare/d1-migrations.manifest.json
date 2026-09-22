@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "databases": [
+    {
+      "database": "musixquare-admin-metrics",
+      "baseline": "cloudflare/admin-metrics.schema.sql",
+      "baselineRevision": 7,
+      "baselineSha256": "b27dc79831ce37fd8e43c8d7783d922ce83bb3cac24d24d146c71037c77514fd",
+      "baselineMigration": "admin-pro-room-retirement-cursor-v1",
+      "baselineRecovery": {
+        "strategy": "roll-forward-or-provider-restore",
+        "runbook": "cloudflare/admin-dashboard-ops.md",
+        "note": "The declarative baseline is idempotent, but arbitrary future DDL still requires an explicit recovery decision."
+      },
+      "migrations": []
+    },
+    {
+      "database": "musixquare-auth",
+      "baseline": "cloudflare/auth.schema.sql",
+      "baselineRevision": 6,
+      "baselineSha256": "1fbd37acb416fc562aaedff43f1f25203293f48dc4add5303d1c49b812d86241",
+      "baselineMigration": "auth-translation-community-v1",
+      "baselineRecovery": {
+        "strategy": "matched-worker-floor-and-roll-forward-or-provider-restore",
+        "runbook": "docs/account-auth-operations.md",
+        "note": "Account schema changes use a documented matched Worker floor and must not be treated as automatically reversible."
+      },
+      "migrations": []
+    },
+    {
+      "database": "musixquare-developer-api",
+      "baseline": "cloudflare/developer-api.schema.sql",
+      "baselineRevision": 5,
+      "baselineSha256": "ca752b1951766ab8a39555a154ed80ddf05034844c4b84a3daec5842988e15d2",
+      "baselineMigration": "developer-api-authority-epoch-v1",
+      "baselineRecovery": {
+        "strategy": "roll-forward-or-provider-restore",
+        "runbook": "cloudflare/config-drift-ops.md",
+        "note": "The baseline repairs idempotent objects only; destructive changes require their own manifest entry and recovery contract."
+      },
+      "migrations": []
+    }
+  ]
+}

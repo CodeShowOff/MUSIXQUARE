@@ -1,0 +1,646 @@
+/**
+ * MUSIXQUARE — Setup Guest Flow
+ *
+ * Guest join: code entry -> join session.
+ *
+ * IMPORTANT: This file must NOT import from setup.ts (circular dependency).
+ * It imports shared helpers from setup-shared.ts instead.
+ */
+
+import { log } from '../core/log.ts';
+import { getState, setState } from '../core/state.ts';
+import { PEER_NAME_PREFIX } from '../core/constants.ts';
+import { clearManagedTimer } from '../core/timers.ts';
+import { joinSession } from '../network/peer.ts';
+import {
+  t,
+  bus,
+  showToast,
+  updateRoleBadge,
+  updateInviteCodeUI,
+  selectStandardChannelButton,
+  BACK_SVG,
+  getPendingGuestRoleMode,
+  setPendingGuestRoleMode,
+  getPendingAutoJoinCode,
+  setupSetAutoJoinCode,
+  setOnInviteLinkRoleSelected,
+  setupEl,
+  setupShowCodeArea,
+  setupShowAutoJoinArea,
+  setupShowJoinArea,
+  setupShowWelcome,
+  setupShowRoleArea,
+  setupHighlightJoinRole,
+  setupSetGuestJoinBusy,
+  setupSetGuestJoinError,
+  setupRenderActions,
+  getSetupOverlayAbort,
+} from './setup-shared.ts';
+import { animateTransition } from './dom.ts';
+import { scheduleDocumentReload, scheduleSessionReset } from '../core/session-reset.ts';
+import { showDialog } from './dialog.ts';
+import { precreateYouTubePlayer } from '../youtube/player.ts';
+import { prepareSetupStartFromGesture } from './setup-start.ts';
+import { gateSetupYouTubeGesture } from './setup-youtube-gate.ts';
+import { isProRoomCode } from '../pro-room/room-code.ts';
+import { enterProRoomFromSetup } from '../pro-room/setup-flow.ts';
+import { initGuestQrScanner, stopGuestQrScanner } from './setup-qr-scanner.ts';
+import { isStandardRoomRole } from '../rooms/authority.ts';
+
+// ─── Guest Flow ──────────────────────────────────────────────────
+
+/** goBack callback — set by the orchestrator to avoid circular imports */
+let _goBack: () => void = () => {};
+let _pendingPasswordJoin: { code: string; mode: number; inviteLink: boolean } | null = null;
+let _roomPasswordPromptOpen = false;
+const DEFAULT_SETUP_ROLE = 0;
+let _youtubeGate: ReturnType<typeof gateSetupYouTubeGesture> | null = null;
+let _scannerActivation: Promise<boolean> | null = null;
+let _joinPreparationGeneration = 0;
+let _waitingForActivation = false;
+
+function cancelGuestPreparation(): void {
+  _youtubeGate?.cancel();
+  _youtubeGate = null;
+  _scannerActivation = null;
+  _joinPreparationGeneration++;
+  _waitingForActivation = false;
+}
+
+function prepareGuestStartControls(): void {
+  _youtubeGate?.cancel();
+  precreateYouTubePlayer();
+  _youtubeGate = gateSetupYouTubeGesture({
+    startButton: setupEl('btn-setup-confirm') as HTMLButtonElement | null,
+    scanButton: setupEl('btn-setup-qr-scan') as HTMLButtonElement | null,
+    waitingLabel: t('common.wait'),
+    signal: getSetupOverlayAbort()?.signal,
+  });
+}
+
+function goBackFromGuest(): void {
+  cancelGuestPreparation();
+  _goBack();
+}
+
+async function finishGuestActivation(activation: Promise<boolean>): Promise<boolean> {
+  const generation = ++_joinPreparationGeneration;
+  const signal = getSetupOverlayAbort()?.signal;
+  _waitingForActivation = true;
+  await activation;
+  if (generation !== _joinPreparationGeneration) return false;
+  _waitingForActivation = false;
+  return !signal?.aborted && !getState('setup.sessionStarted') && isStandardRoomRole('guest');
+}
+
+function observeGuestJoin(operation: Promise<void>): void {
+  operation.catch((error) => {
+    log.error('[Setup] Guest join operation escaped its flow boundary', error);
+    bus.emit('setup:guest-join-failure', {
+      error,
+      userMessage: t('error.network_generic'),
+    });
+  });
+}
+
+export function setGuestGoBack(fn: () => void): void {
+  _goBack = fn;
+}
+
+// Register invite-link role-selected callback
+setOnInviteLinkRoleSelected(() => _renderInviteLinkActions());
+
+export function startGuestFlow(): void {
+  cancelGuestPreparation();
+  stopGuestQrScanner();
+  _pendingPasswordJoin = null;
+  _roomPasswordPromptOpen = false;
+  setupSetGuestJoinError(null);
+
+  // Cancel any in-flight join attempt (back button pressed during connecting)
+  if (getState('network.isConnecting')) {
+    clearManagedTimer('join-timeout');
+    clearManagedTimer('join-retry');
+    setState('network.isConnecting', false);
+    setState('network.isIntentionalDisconnect', true);
+    const hostConn = getState('network.hostConn');
+    if (hostConn) {
+      try {
+        hostConn.close();
+      } catch {
+        /* noop */
+      }
+      setState('network.hostConn', null);
+    }
+  }
+
+  setState('network.appRole', 'guest');
+  setState('setup.sessionStarted', false);
+
+  // Eagerly pre-create the hidden iOS YouTube prime player now (async), well
+  // before the join tap, so a ready player exists for the gesture-bound bounce
+  // in the join handlers. No-op off iOS / in C mode.
+  precreateYouTubePlayer();
+  // Role selection is not exposed in the current setup, so default guests to
+  // the center speaker while keeping the existing role-area state coherent.
+  setPendingGuestRoleMode(DEFAULT_SETUP_ROLE);
+
+  updateInviteCodeUI();
+
+  try {
+    selectStandardChannelButton(DEFAULT_SETUP_ROLE);
+    setupHighlightJoinRole(DEFAULT_SETUP_ROLE);
+  } catch (e) {
+    log.warn('[Setup] set default guest role failed', e);
+  }
+
+  animateTransition(() => {
+    setupShowCodeArea(false);
+    setupShowJoinArea(false);
+    setupShowAutoJoinArea(false);
+    setupShowWelcome(false);
+    setupShowRoleArea(false);
+  });
+
+  setupSetGuestJoinBusy(false);
+
+  const sliderArea = setupEl('ob-slider-area');
+  if (sliderArea) {
+    sliderArea.style.display = 'none';
+  }
+
+  setState('network.myDeviceLabel', t('common.guest'));
+  updateRoleBadge();
+
+  const autoCode = getPendingAutoJoinCode();
+  if (autoCode) {
+    setupSetAutoJoinCode(autoCode);
+    animateTransition(() => {
+      setupShowAutoJoinArea(true);
+    });
+    _renderInviteLinkActions();
+  } else {
+    proceedToGuestCode(DEFAULT_SETUP_ROLE);
+  }
+}
+
+/** Render actions for invite-link flow: back icon + primary start.
+ *  The back icon does a hard navigation to '/' so a user who landed here via /CODE
+ *  can start fresh if the host is gone or they want to leave the invite flow. */
+function _renderInviteLinkActions(retry = false, reloadRequired = false): void {
+  _youtubeGate?.cancel();
+  setupRenderActions(
+    [
+      {
+        id: 'btn-setup-back',
+        html: BACK_SVG,
+        ariaLabel: t('dialog.go_back'),
+        kind: 'icon-only',
+        onClick: () => {
+          cancelGuestPreparation();
+          scheduleSessionReset(t('dialog.leaving_session'), () => {
+            window.location.href = '/';
+          });
+        },
+      },
+      {
+        id: 'btn-setup-confirm',
+        text: t(reloadRequired ? 'common.refresh' : retry ? 'common.retry' : 'common.start'),
+        kind: 'primary',
+        onClick: reloadRequired
+          ? () => scheduleDocumentReload(t('dialog.refreshing_session'))
+          : () => observeGuestJoin(_handleInviteLinkJoin(DEFAULT_SETUP_ROLE)),
+      },
+    ],
+    'horizontal-with-back',
+  );
+  if (!reloadRequired) prepareGuestStartControls();
+}
+
+/** Join directly using the invite code from URL (skip code input step) */
+async function _handleInviteLinkJoin(mode: number): Promise<void> {
+  if (_youtubeGate?.pending || _waitingForActivation || getState('network.isConnecting')) return;
+  setupSetGuestJoinError(null);
+  const autoCode = getPendingAutoJoinCode();
+  if (!autoCode || !/^\d{6}$/.test(autoCode)) {
+    setupSetGuestJoinError(t('toast.no_invite_code'), true);
+    _renderInviteLinkActions(true);
+    return;
+  }
+
+  const activation = prepareSetupStartFromGesture();
+
+  setPendingGuestRoleMode(mode);
+  setState('network.lastJoinCode', autoCode);
+  updateInviteCodeUI();
+
+  try {
+    selectStandardChannelButton(mode);
+    bus.emit('audio:set-channel-mode', mode);
+  } catch (e) {
+    log.warn('[Setup] setChannelMode failed', e);
+  }
+
+  setState('network.myDeviceLabel', PEER_NAME_PREFIX);
+  updateRoleBadge();
+
+  setupSetGuestJoinBusy(true);
+
+  setupRenderActions(
+    [
+      {
+        id: 'btn-setup-back',
+        html: BACK_SVG,
+        kind: 'icon-only',
+        onClick: () => {
+          scheduleSessionReset(t('dialog.leaving_session'), () => {
+            window.location.href = '/';
+          });
+        },
+        disabled: true,
+      },
+      { id: 'btn-setup-confirm', text: t('setup.joining'), kind: 'primary', disabled: true },
+    ],
+    'horizontal-with-back',
+  );
+
+  _pendingPasswordJoin = { code: autoCode, mode, inviteLink: true };
+  if (activation && !(await finishGuestActivation(activation))) return;
+  if (isProRoomCode(autoCode)) {
+    await _handleProRoomJoin(autoCode);
+    return;
+  }
+  joinSession(autoCode);
+}
+
+async function _handleProRoomJoin(code: string): Promise<void> {
+  try {
+    const joined = await enterProRoomFromSetup(code);
+    if (joined === 'reload-required') {
+      _renderProRoomReloadRequired();
+      return;
+    }
+    if (!joined) {
+      restoreJoinControlsAfterPasswordCancel();
+      return;
+    }
+    // A PRO member connects through the server control bridge, which does not
+    // emit the ordinary-room guest success event. Synthesize the same one-time
+    // setup UI commit for every equal PRO participant.
+    if (!getState('setup.sessionStarted')) bus.emit('setup:guest-join-success');
+  } catch (error) {
+    log.error('[Setup] PRO room join failed', error);
+    bus.emit('setup:guest-join-failure', {
+      error,
+      userMessage: t('pro.connect_failed'),
+    });
+  }
+}
+
+function _renderProRoomReloadRequired(): void {
+  setupSetGuestJoinBusy(false);
+  setupRenderActions(
+    [
+      {
+        id: 'btn-setup-back',
+        html: BACK_SVG,
+        ariaLabel: t('dialog.go_back'),
+        kind: 'icon-only',
+        onClick: () => undefined,
+        disabled: true,
+      },
+      {
+        id: 'btn-setup-confirm',
+        text: t('common.refresh'),
+        kind: 'primary',
+        onClick: () => scheduleDocumentReload(t('dialog.refreshing_session')),
+      },
+    ],
+    'horizontal-with-back',
+  );
+}
+
+function proceedToGuestCode(mode: number): void {
+  setPendingGuestRoleMode(mode);
+
+  animateTransition(() => {
+    setupShowRoleArea(false);
+    setupShowAutoJoinArea(false);
+    setupShowJoinArea(true);
+  });
+
+  setupRenderActions(
+    [
+      {
+        id: 'btn-setup-back',
+        html: BACK_SVG,
+        ariaLabel: t('dialog.go_back'),
+        kind: 'icon-only',
+        onClick: goBackFromGuest,
+      },
+      {
+        id: 'btn-setup-confirm',
+        text: t('common.start'),
+        kind: 'primary',
+        onClick: () => startSetupJoinWithRole(getPendingGuestRoleMode()),
+      },
+    ],
+    'horizontal-with-back',
+  );
+
+  const input = setupEl('setup-join-code') as HTMLInputElement | null;
+  initGuestQrScanner({
+    isCurrent: () =>
+      isStandardRoomRole('guest') &&
+      !getState('setup.sessionStarted') &&
+      !getState('network.isConnecting') &&
+      !input?.disabled &&
+      setupEl('setup-join-area')?.style.display !== 'none',
+    onStartFromGesture: () => {
+      _scannerActivation = prepareSetupStartFromGesture();
+    },
+    onCode: (code) => {
+      if (!input) return;
+      setupSetGuestJoinError(null);
+      input.value = code;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      startSetupJoinWithRole(getPendingGuestRoleMode(), true);
+    },
+    onError: (reason) => {
+      setupSetGuestJoinError(null);
+      const messageKey =
+        reason === 'permission-denied'
+          ? 'setup.camera_permission_denied'
+          : reason === 'camera-not-found'
+            ? 'setup.camera_not_found'
+            : reason === 'camera-start-stalled'
+              ? 'setup.camera_stream_stalled'
+              : 'setup.camera_unavailable';
+      showToast(t(messageKey), reason === 'camera-start-stalled' ? { durationMs: 6000 } : {});
+    },
+  });
+
+  if (input) {
+    // Restore auto-join code from QR scan (if any), otherwise clear
+    const autoCode = getPendingAutoJoinCode();
+    if (autoCode) {
+      input.value = autoCode;
+    } else {
+      input.value = '';
+    }
+    input.focus();
+  }
+  prepareGuestStartControls();
+}
+
+export async function handleSetupJoinWithRole(
+  mode: number | null,
+  preserveQrScannerSuccess = false,
+): Promise<void> {
+  if (_youtubeGate?.pending || _waitingForActivation || getState('network.isConnecting')) return;
+  setupSetGuestJoinError(null);
+  if (mode === null || mode === undefined) {
+    showToast(t('setup.select_role_alt'));
+    return;
+  }
+
+  const appRole = getState('network.appRole');
+  if (appRole !== 'guest') return;
+
+  const input = setupEl('setup-join-code') as HTMLInputElement | null;
+  const codeRaw = (input ? input.value : '').trim();
+  const code = codeRaw.replace(/\s+/g, '');
+
+  if (!/^\d{6}$/.test(code)) {
+    setupSetGuestJoinError(t('setup.six_digit_enter'));
+    if (input) input.focus();
+    return;
+  }
+
+  if (!preserveQrScannerSuccess) stopGuestQrScanner();
+  // QR recognition is asynchronous. Its real scan-button tap already activated
+  // media; pretending the recognition callback is another gesture loses iOS audio.
+  const activation = preserveQrScannerSuccess ? _scannerActivation : prepareSetupStartFromGesture();
+
+  setState('network.lastJoinCode', code);
+  updateInviteCodeUI();
+
+  try {
+    selectStandardChannelButton(mode);
+    bus.emit('audio:set-channel-mode', mode);
+  } catch (e) {
+    log.warn('[Setup] setChannelMode failed', e);
+  }
+
+  setState('network.myDeviceLabel', PEER_NAME_PREFIX);
+  updateRoleBadge();
+
+  setupSetGuestJoinBusy(true);
+  // Note: isConnecting is set inside joinSession() — do NOT pre-set here
+  // (pre-setting would block joinSession's own guard)
+  updateRoleBadge();
+
+  setupRenderActions(
+    [
+      {
+        id: 'btn-setup-back',
+        html: BACK_SVG,
+        ariaLabel: t('dialog.go_back'),
+        kind: 'icon-only',
+        onClick: () => _goBack(),
+        disabled: true,
+      },
+      { id: 'btn-setup-confirm', text: t('setup.joining'), kind: 'primary', disabled: true },
+    ],
+    'horizontal-with-back',
+  );
+
+  _pendingPasswordJoin = { code, mode, inviteLink: false };
+  if (activation && !(await finishGuestActivation(activation))) return;
+  if (isProRoomCode(code)) {
+    await _handleProRoomJoin(code);
+    return;
+  }
+  joinSession(code);
+}
+
+/** Synchronous adapter for DOM/setup action callbacks that cannot observe a returned Promise. */
+function startSetupJoinWithRole(mode: number | null, preserveQrScannerSuccess = false): void {
+  observeGuestJoin(handleSetupJoinWithRole(mode, preserveQrScannerSuccess));
+}
+
+function restoreJoinControlsAfterPasswordCancel(): void {
+  cancelGuestPreparation();
+  setupSetGuestJoinBusy(false);
+  setupSetGuestJoinError(null);
+
+  if (_pendingPasswordJoin?.inviteLink) {
+    _renderInviteLinkActions();
+    return;
+  }
+
+  setupRenderActions(
+    [
+      {
+        id: 'btn-setup-back',
+        html: BACK_SVG,
+        ariaLabel: t('dialog.go_back'),
+        kind: 'icon-only',
+        onClick: goBackFromGuest,
+      },
+      {
+        id: 'btn-setup-confirm',
+        text: t('common.start'),
+        kind: 'primary',
+        onClick: () => startSetupJoinWithRole(getPendingGuestRoleMode() ?? null),
+      },
+    ],
+    'horizontal-with-back',
+  );
+
+  const input = setupEl('setup-join-code') as HTMLInputElement | null;
+  if (input) {
+    input.disabled = false;
+    if (_pendingPasswordJoin?.code) input.value = _pendingPasswordJoin.code;
+    input.focus();
+  }
+  prepareGuestStartControls();
+}
+
+export function restoreGuestJoinControlsAfterFailure(
+  message: string | null,
+  reloadRequired = false,
+): void {
+  cancelGuestPreparation();
+  setupSetGuestJoinBusy(false);
+  const inviteLink = _pendingPasswordJoin?.inviteLink ?? !!getPendingAutoJoinCode();
+  setupSetGuestJoinError(message, inviteLink);
+  const retry = !!message;
+
+  if (inviteLink) {
+    _renderInviteLinkActions(retry, reloadRequired);
+    return;
+  }
+
+  setupRenderActions(
+    [
+      {
+        id: 'btn-setup-back',
+        html: BACK_SVG,
+        ariaLabel: t('dialog.go_back'),
+        kind: 'icon-only',
+        onClick: goBackFromGuest,
+      },
+      {
+        id: 'btn-setup-confirm',
+        text: t(reloadRequired ? 'common.refresh' : retry ? 'common.retry' : 'common.start'),
+        kind: 'primary',
+        onClick: reloadRequired
+          ? () => scheduleDocumentReload(t('dialog.refreshing_session'))
+          : () => startSetupJoinWithRole(getPendingGuestRoleMode() ?? null),
+      },
+    ],
+    'horizontal-with-back',
+  );
+
+  const input = setupEl('setup-join-code') as HTMLInputElement | null;
+  if (input) {
+    input.disabled = false;
+    if (_pendingPasswordJoin?.code) input.value = _pendingPasswordJoin.code;
+    input.focus();
+  }
+  if (!reloadRequired) prepareGuestStartControls();
+}
+
+function renderPasswordRetryBusy(inviteLink: boolean): void {
+  setupSetGuestJoinError(null);
+  setupSetGuestJoinBusy(true);
+  setupRenderActions(
+    [
+      {
+        id: 'btn-setup-back',
+        html: BACK_SVG,
+        ariaLabel: t('dialog.go_back'),
+        kind: 'icon-only',
+        onClick: inviteLink
+          ? () => {
+              scheduleSessionReset(t('dialog.leaving_session'), () => {
+                window.location.href = '/';
+              });
+            }
+          : () => _goBack(),
+        disabled: true,
+      },
+      { id: 'btn-setup-confirm', text: t('setup.joining'), kind: 'primary', disabled: true },
+    ],
+    'horizontal-with-back',
+  );
+}
+
+export async function promptForRoomPassword(
+  reason: 'required' | 'invalid' | 'timeout' = 'required',
+): Promise<void> {
+  const pending = _pendingPasswordJoin;
+  if (!pending || _roomPasswordPromptOpen) return;
+
+  _roomPasswordPromptOpen = true;
+  setupSetGuestJoinBusy(false);
+
+  const messageKey =
+    reason === 'invalid'
+      ? 'dialog.room_password_retry_msg'
+      : reason === 'timeout'
+        ? 'dialog.room_password_timeout_msg'
+        : 'dialog.room_password_msg';
+
+  let activation: Promise<boolean> | null = null;
+  const result = await showDialog({
+    title: t('dialog.room_password_title'),
+    message: t(messageKey),
+    inputField: {
+      placeholder: t('dialog.room_password_placeholder'),
+      maxLength: 8,
+      inputMode: 'numeric',
+      pattern: '[0-9]*',
+      autocomplete: 'one-time-code',
+      splitEvery: 4,
+      separator: '-',
+      validator: (value) =>
+        /^\d{8}$/.test(value.trim()) ? null : t('connect.room_password_invalid'),
+    },
+    buttonText: t('common.ok'),
+    secondaryText: t('common.cancel'),
+    defaultFocus: 'primary',
+    onPrimaryActivation: () => {
+      activation = prepareSetupStartFromGesture();
+    },
+  });
+
+  _roomPasswordPromptOpen = false;
+
+  if (result.action !== 'ok') {
+    restoreJoinControlsAfterPasswordCancel();
+    return;
+  }
+
+  const password = (result.inputValue || '').replace(/\D+/g, '').slice(0, 8);
+  if (!/^\d{8}$/.test(password)) {
+    restoreJoinControlsAfterPasswordCancel();
+    return;
+  }
+
+  setPendingGuestRoleMode(pending.mode);
+  setState('network.lastJoinCode', pending.code);
+  updateInviteCodeUI();
+  renderPasswordRetryBusy(pending.inviteLink);
+  if (activation && !(await finishGuestActivation(activation))) return;
+  joinSession(pending.code, password);
+}
+
+export function clearPendingRoomPasswordJoin(): void {
+  cancelGuestPreparation();
+  _pendingPasswordJoin = null;
+  _roomPasswordPromptOpen = false;
+  setupSetGuestJoinError(null);
+}

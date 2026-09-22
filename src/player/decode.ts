@@ -1,0 +1,1550 @@
+/**
+ * MUSIXQUARE — File Loading & Decoding
+ *
+ * Manages: loadAndBroadcastFile (host), loadPreloadedTrack (guest),
+ * finalizeGuestFile, clearPreviousTrackState.
+ */
+
+import { log } from '../core/log.ts';
+import { t } from '../i18n/index.ts';
+import { bus } from '../core/events.ts';
+import { batchSetState, getState, setState } from '../core/state.ts';
+import { CHUNK_SIZE, MSG, TRANSFER_STATE } from '../core/constants.ts';
+import { clearManagedTimer, setManagedTimer, delay } from '../core/timers.ts';
+import { initAudio } from '../audio/engine.ts';
+import {
+  getPlaybackModeActivity,
+  isExternalOwner,
+  isPlaybackNonIdleFile,
+  setPlaybackIdle,
+  setPlaybackTransferState,
+  setPlaybackTrackMeta,
+} from './ownership.ts';
+import { setEngineMode } from './video.ts';
+import {
+  cleanupStoredFile,
+  discardResidentStoredFileAdmission,
+  postCommand,
+  promoteStoredFileAdmission,
+  retainStoredFileAdmission,
+} from '../storage/storage.ts';
+import { broadcastFileDebounced } from '../storage/transfer.ts';
+import { shareRemoteFileIfNeeded } from '../share/remote-share.ts';
+import type {
+  AnyProtocolMsg,
+  DataConnection,
+  FileMeta,
+  QueueItemId,
+  ResidentFile,
+  TrackMeta,
+} from '../types/index.ts';
+import { schedulePreload } from '../storage/preload.ts';
+import { broadcast, safeSend, sendToHost } from '../network/peer.ts';
+import { beginFileRequest, sendFileRequest } from '../network/file-request-authority.ts';
+import { announceSystemMessageLocally, broadcastSystemMessage } from '../chat/protocol.ts';
+import { registerHandlers } from '../network/protocol.ts';
+import { sendRecoveryRequest } from '../storage/recovery.ts';
+import { isSystemAudioActive } from '../audio/system-capture.ts';
+import {
+  findQueueItemIndex,
+  getCurrentQueueItemId,
+  getQueueItemById,
+  selectQueueItemById,
+} from './queue-model.ts';
+import { loadPlaylistModule } from './playlist-loader.ts';
+
+import {
+  getCurrentAudioBuffer,
+  setCurrentAudioBuffer,
+  getCurrentLoadEpoch,
+  isCurrentLoadEpoch,
+  getActiveLoadSessionId,
+  incrementLoadSessionId,
+  getPendingPlayTime,
+  setPendingPlayTime,
+  setPendingRecoveryTarget,
+  getPendingPlayTimeSetAt,
+  setPlayPreloadedInProgress,
+  getLastClearedQueueItemId,
+  setLastClearedQueueItemId,
+  markTrackFailed,
+  isTrackFailed,
+  clearFailedTracks,
+  getTrackKeyFromItem,
+  liveAudioBufferPcmBytes,
+  trackDecodedAudioBufferForAdmission,
+} from './_state.ts';
+
+import { isFilePipelineBusyForPlay, play, stopAllMedia, stopPlayerNode } from './transport.ts';
+import { resolveFilePlayTiming } from './file-play-timing.ts';
+
+import { getAudioContext, ensureRunning } from '../audio/context.ts';
+import { showToast, showLoader } from '../ui/toast.ts';
+import { isProRoomPersistentPlaylistFile } from '../pro-room/media-hooks.ts';
+import { transition } from './lifecycle.ts';
+import { hasRoomCapability } from '../rooms/authority.ts';
+import {
+  maybeAnnounceDecodeMemoryRiskWarning,
+  maybeAnnounceLargeLocalTrackWarning,
+} from './large-local-track-warning.ts';
+import {
+  assertBlobCanDecodeToAudioBuffer,
+  assertDecodedAudioBufferWithinBudget,
+  encodedReceiveReservationIdForBlob,
+  isAudioDecodeAdmissionError,
+  reserveDecodeMemoryWithinBudget,
+  resolveDecodeMemoryBudget,
+  waitForInFlightMemoryReservationChange,
+} from './decode-admission.ts';
+
+// ─── Decode Accounting & Ownership ─────────────────────────────────
+// decodeAudioData has no cancellation API. Racing it against a timer only
+// abandons the Promise while native decoder work and its allocation continue,
+// which is especially harmful on iOS. Playback therefore awaits the
+// native decoder without an arbitrary deadline and checks caller ownership at
+// every cancellable boundary. Memory reservations are accounting only under the
+// production unbounded policy; they do not pre-reject normal files.
+
+class DecodeSupersededError extends Error {
+  constructor(readonly label: string) {
+    super(`Decode superseded: ${label}`);
+    this.name = 'DecodeSupersededError';
+  }
+}
+
+function isDecodeSupersededError(error: unknown): error is DecodeSupersededError {
+  return error instanceof DecodeSupersededError;
+}
+
+interface DecodeAdmissionLease {
+  readonly audioBuffer: AudioBuffer;
+  release(): void;
+}
+
+async function waitForMemoryReservationChangeWhileCurrent(
+  isCurrent: () => boolean,
+  excludeEncodedReceiveReservationId?: number,
+): Promise<boolean> {
+  if (!isCurrent()) return false;
+  const abort = new AbortController();
+  const ownerPoll = globalThis.setInterval(() => {
+    if (!isCurrent()) abort.abort();
+  }, 100);
+  try {
+    return await waitForInFlightMemoryReservationChange(abort.signal, {
+      excludeEncodedReceiveReservationId,
+    });
+  } finally {
+    globalThis.clearInterval(ownerPoll);
+  }
+}
+
+async function decodeBlobToAudioBuffer(
+  blob: Blob,
+  label: string,
+  fileName: string,
+  queueItemId: QueueItemId | null,
+  isCurrent: () => boolean,
+): Promise<DecodeAdmissionLease> {
+  if (!isCurrent()) throw new DecodeSupersededError(label);
+
+  const budget = resolveDecodeMemoryBudget();
+  const sourceEncodedReceiveReservationId = encodedReceiveReservationIdForBlob(blob);
+  // Only the iOS tier counts WeakRef survivors. Other tiers still release the
+  // app-owned current buffer before entry, while avoiding nondeterministic GC
+  // accounting on browsers that do not exhibit the long-session WebKit issue.
+  let retainedPcmBytes = budget.tier === 'ios' ? liveAudioBufferPcmBytes() : 0;
+  let admission: Awaited<ReturnType<typeof assertBlobCanDecodeToAudioBuffer>>;
+  let reservation: ReturnType<typeof reserveDecodeMemoryWithinBudget>;
+  for (;;) {
+    try {
+      if (budget.tier === 'ios') retainedPcmBytes = liveAudioBufferPcmBytes();
+      admission = await assertBlobCanDecodeToAudioBuffer(blob, {
+        budget,
+        fileName,
+        retainedPcmBytes,
+        outputSampleRate: getAudioContext().sampleRate,
+      });
+
+      if (!isCurrent()) throw new DecodeSupersededError(label);
+      try {
+        if (queueItemId) {
+          let announcedMemoryRisk = false;
+          if (admission.hasReliableMetadata) {
+            announcedMemoryRisk = maybeAnnounceDecodeMemoryRiskWarning(queueItemId, admission);
+          }
+          if (
+            !announcedMemoryRisk &&
+            (!admission.hasReliableMetadata || admission.probedChannelCount === null)
+          ) {
+            // Metadata/header support is best-effort. Preserve the established
+            // encoded-size warning if the partial estimate was inconclusive.
+            maybeAnnounceLargeLocalTrackWarning(queueItemId, blob.size);
+          }
+        }
+      } catch (warningError) {
+        // Advisory UI must never turn a playable file into a decode failure.
+        log.warn('[DecodeMemoryWarning] Could not announce memory risk', warningError);
+      }
+      // Reserve synchronously after the async accounting boundary so ownership
+      // and diagnostics cannot omit overlapping native decodes. Production
+      // policy does not use this ledger as a finite admission ceiling.
+      reservation = reserveDecodeMemoryWithinBudget(admission.ownDecodeFootprintBytes, {
+        budget: admission.budget,
+        fileName,
+        retainedPcmBytes: budget.tier === 'ios' ? liveAudioBufferPcmBytes() : retainedPcmBytes,
+        excludeEncodedReceiveReservationId: admission.sourceEncodedReceiveReservationId,
+      });
+      break;
+    } catch (error) {
+      if (isAudioDecodeAdmissionError(error) && error.reason === 'working-set') {
+        if (!isCurrent()) throw new DecodeSupersededError(label);
+        const changed = await waitForMemoryReservationChangeWhileCurrent(
+          isCurrent,
+          sourceEncodedReceiveReservationId,
+        );
+        if (changed) {
+          // The file fits by itself but an older uncancellable decode or remote
+          // transport still owns RAM. Retry only after the live ledger changes.
+          continue;
+        }
+        if (!isCurrent()) throw new DecodeSupersededError(label);
+      }
+      throw error;
+    }
+  }
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    if (!isCurrent()) throw new DecodeSupersededError(label);
+
+    // Intentionally no timeout: the browser cannot cancel decodeAudioData, so
+    // a timeout would create an invisible native decode that can overlap
+    // retries. The reservation remains until this native Promise settles even
+    // when a newer load supersedes the caller.
+    const audioBuffer = await getAudioContext().decodeAudioData(arrayBuffer);
+    // WebKit may retain native PCM even when ownership changed. Track it before
+    // the ownership check; publication later deduplicates the same object.
+    trackDecodedAudioBufferForAdmission(audioBuffer);
+    if (!isCurrent()) throw new DecodeSupersededError(label);
+
+    const actualFootprint = assertDecodedAudioBufferWithinBudget(audioBuffer, blob.size, {
+      budget: admission.budget,
+      fileName,
+      retainedPcmBytes:
+        budget.tier === 'ios' ? liveAudioBufferPcmBytes(audioBuffer) : retainedPcmBytes,
+      // Replace this lease's estimate with the browser-reported footprint;
+      // every other live decode lease is read from the global ledger once.
+      excludeDecodeReservationId: reservation.id,
+      excludeEncodedReceiveReservationId: admission.sourceEncodedReceiveReservationId,
+    });
+    reservation.update(actualFootprint);
+    return { audioBuffer, release: reservation.release };
+  } catch (error) {
+    reservation.release();
+    throw error;
+  }
+}
+
+// Preload-activation owner handle (M4 in the playback concurrency design).
+// A superseded activation must not clear the flag owned by its successor, so
+// finish compares handle identity rather than epoch equality. The epoch keeps
+// each owner attributable to its logical run and detects callers that skipped
+// entry-point allocation. stopAllMedia may also clear the flag; finish remains
+// idempotent after that teardown.
+interface PreloadActivation {
+  /** The load epoch (M1) that owned the pipeline when this activation began. */
+  readonly epoch: number;
+  readonly queueItemId: QueueItemId;
+  readonly sessionId: number;
+  readonly blob: Blob;
+}
+
+let _activePreloadActivation: PreloadActivation | null = null;
+
+function beginPreloadActivation(
+  epoch: number,
+  queueItemId: QueueItemId,
+  sessionId: number,
+  blob: Blob,
+): PreloadActivation {
+  if (_activePreloadActivation && _activePreloadActivation.epoch === epoch) {
+    log.warn(
+      '[Preload] Two activations share one load epoch. A caller skipped its entry-point epoch allocation',
+    );
+  }
+  const owner: PreloadActivation = { epoch, queueItemId, sessionId, blob };
+  _activePreloadActivation = owner;
+  setPlayPreloadedInProgress(true);
+  return owner;
+}
+
+function isCurrentPreloadActivation(owner: PreloadActivation): boolean {
+  return _activePreloadActivation === owner;
+}
+
+function finishPreloadActivation(owner: PreloadActivation): void {
+  if (!isCurrentPreloadActivation(owner)) return;
+  _activePreloadActivation = null;
+  setPlayPreloadedInProgress(false);
+}
+
+// ─── Load And Publish File (Local Authority) ───────────────────────
+
+export async function loadAndBroadcastFile(
+  file: File,
+  queueItemId: QueueItemId,
+  sessionId: number,
+  loadEpoch?: number,
+  prepareMsg?: AnyProtocolMsg,
+): Promise<boolean> {
+  const myLoadId = incrementLoadSessionId();
+  const myEpoch = loadEpoch ?? getCurrentLoadEpoch();
+  const isCurrentOwner = (): boolean =>
+    myLoadId === getActiveLoadSessionId() &&
+    getCurrentQueueItemId() === queueItemId &&
+    getQueueItemById(queueItemId)?.file === file &&
+    (loadEpoch === undefined || isCurrentLoadEpoch(myEpoch)) &&
+    !isExternalOwner();
+
+  if (!Number.isSafeInteger(sessionId) || sessionId <= 0 || !isCurrentOwner()) return false;
+
+  showLoader(true, t('toast.preparing', { name: file.name }));
+  stopAllMedia({ silent: true });
+  if (!isCurrentOwner()) return false;
+
+  // Lifecycle: host has the file locally (no download phase). Transition
+  // straight into DECODING so the subsequent transition(DECODE_SUCCESS)
+  // after decode completes lands cleanly on READY rather than being
+  // rejected from IDLE/PLAYING. The `preload-match` variant captures
+  // "blob is ready, promote to decoding" which matches host semantics.
+  transition({
+    type: 'FILE_PREPARE',
+    variant: 'preload-match',
+    queueItemId,
+    name: file.name,
+  });
+
+  try {
+    if (!isSystemAudioActive()) {
+      // Don't let audio initialization block the whole activation if it hangs (e.g. autoplay blocked)
+      await Promise.race([initAudio(), delay(2000)]);
+    }
+    if (!isCurrentOwner()) return false;
+    if (getAudioContext().state !== 'running') await ensureRunning();
+    if (!isCurrentOwner()) return false;
+
+    log.debug('[BufferMode] Decoding audio for high-precision sync...');
+    showToast(t('toast.hprecision_sync'));
+
+    // The previous track is already stopped. Drop the app-owned PCM reference
+    // before admission so the next decode does not guarantee a two-buffer peak.
+    if (getCurrentAudioBuffer()) setCurrentAudioBuffer(null);
+    const decoded = await decodeBlobToAudioBuffer(
+      file,
+      'host-load',
+      file.name,
+      queueItemId,
+      isCurrentOwner,
+    );
+    const audioBuffer = decoded.audioBuffer;
+    try {
+      // Re-verify after async decode. The native decode reservation remains
+      // live until this result is either published or discarded.
+      if (!isCurrentOwner()) {
+        if (myLoadId === getActiveLoadSessionId()) {
+          log.warn('[Load] Queue owner or load epoch changed after decode. Aborting stale load.');
+          showLoader(false);
+        }
+        return false;
+      }
+
+      // Publishing transfers accounting from the in-flight reservation to the
+      // current-buffer state; release immediately afterward in finally.
+      setCurrentAudioBuffer(audioBuffer);
+    } finally {
+      decoded.release();
+    }
+    log.debug(`[BufferMode] Loaded ${audioBuffer.duration.toFixed(2)}s into RAM.`);
+
+    // Lifecycle: host-side decode completed → READY.
+    // Host is also a guest-of-itself for this machine; transition() is a
+    // no-op in non-audio modes (guards inside the helper).
+    transition({ type: 'DECODE_SUCCESS' });
+
+    // Emit duration immediately from decoded buffer (primary source)
+    if (audioBuffer.duration && Number.isFinite(audioBuffer.duration)) {
+      bus.emit('ui:duration-update', audioBuffer.duration);
+    }
+
+    const indexHint = findQueueItemIndex(queueItemId);
+    if (indexHint < 0 || !isCurrentOwner()) return false;
+    // Atomic publish: meta first, then blob — both in the same synchronous
+    // tick so any subscriber (e.g. recovery.ts findMatchingBlob) always
+    // sees them in sync. Order is meta→blob so a reader that checks blob
+    // first and then meta can never observe "blob set, meta still stale".
+    const mime = file.type || 'application/octet-stream';
+    const total = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+    const meta: FileMeta = {
+      name: file.name,
+      type: mime,
+      queueItemId,
+      indexHint,
+      size: file.size,
+      mime,
+      sessionId,
+      total,
+    };
+    const resident: ResidentFile = { ...meta, blob: file };
+    batchSetState({ 'transfer.meta': meta, 'files.current': resident });
+
+    // Enable play button
+    const hostConn = getState('network.hostConn');
+    bus.emit('ui:play-btn-state', !hostConn || hasRoomCapability('playback.control'));
+
+    // Publish bytes only after decode succeeds. Repeat the exact-session
+    // PREPARE for peers that joined or resolved their route during preparation;
+    // guests retain any receive/decode work they already own for this session.
+    const connectedPeers = getState('network.connectedPeers') || [];
+    if (connectedPeers.length > 0) {
+      if (isProRoomPersistentPlaylistFile(queueItemId)) {
+        // Persistent PRO participants fetch the immutable asset from the room
+        // bucket with their own authenticated presign. This compatibility path
+        // sends only timing/identity control and never relays these bytes.
+        broadcast(
+          prepareMsg ?? {
+            type: MSG.FILE_PREPARE,
+            name: file.name,
+            mime: file.type || 'application/octet-stream',
+            size: file.size,
+            queueItemId,
+            sessionId,
+          },
+        );
+      } else {
+        showToast(t('transfer.file_sending'));
+        broadcastFileDebounced(file, queueItemId, sessionId, prepareMsg);
+        // Queue files are user media regardless of filename. Bundled demo audio
+        // has its own DEMO_* protocol and never enters this queue pipeline.
+        shareRemoteFileIfNeeded(file, sessionId, undefined, { queueItemId }).catch((error) => {
+          log.warn('[Load] Remote Share publication failed outside its transfer boundary', error);
+        });
+      }
+    }
+
+    if (!hostConn) {
+      schedulePreload();
+    }
+    return true;
+  } catch (err: unknown) {
+    if (isDecodeSupersededError(err)) {
+      log.debug(`[Load] ${err.message}`);
+      return false;
+    }
+    log.error(err);
+
+    // Failure side effects target shared state for the current track. A stale
+    // load must not clear, fail, or auto-advance its successor.
+    if (!isCurrentOwner()) {
+      log.debug('[Load] Decode failed for a superseded load. Skipping failure side effects.');
+      return false;
+    }
+
+    // Clear corrupt/stale blob so recovery doesn't re-serve it to guests
+    const currentResident = getState('files.current');
+    if (currentResident?.queueItemId === queueItemId && currentResident.blob === file) {
+      setState('files.current', null);
+    }
+
+    const memoryLimited = isAudioDecodeAdmissionError(err);
+    if (memoryLimited) log.warn('[Decode] RAM admission rejected the file', err);
+    // Admission and native decoder failures share the FAILED lifecycle; the
+    // recovery policy below still distinguishes host from guest ownership.
+    transition({ type: 'DECODE_ERROR' });
+    const message = err instanceof Error ? err.message : String(err);
+    showToast(t('error.load_failed', { msg: message }));
+
+    // Auto-advance only on a local-authority path. Standard-room guests receive
+    // the next FILE_START after their host advances and do not skip independently;
+    // a PRO endpoint routes the resulting selection through server authority.
+    const hostConn = getState('network.hostConn');
+    if (!hostConn) {
+      markFailedAndAdvance(queueItemId);
+    }
+    return false;
+  } finally {
+    if (myLoadId === getActiveLoadSessionId()) {
+      showLoader(false);
+      setState('player.pausedAt', 0);
+    }
+
+    // Only the current load owns the play-button state.
+    if (isCurrentOwner()) {
+      const hostConn = getState('network.hostConn');
+      bus.emit('ui:play-btn-state', !hostConn || hasRoomCapability('playback.control'));
+    }
+  }
+}
+
+// ─── Local-Authority Auto-Advance on Decode Failure ────────────────
+//
+// Standard-room guests keep decoder failures device-local. A standard host or
+// PRO endpoint with playback authority may walk to the next playable track via
+// preloaded → shuffle → sequential priority. If no playable track remains,
+// the local player returns to IDLE rather than leaving the UI stuck; PRO row
+// selection still re-enters the server command seam.
+//
+// Caller must already own local playback authority.
+export async function loadDemoFile(file: File, meta: TrackMeta, loadEpoch?: number): Promise<void> {
+  const myLoadId = incrementLoadSessionId();
+  const myEpoch = loadEpoch ?? getCurrentLoadEpoch();
+  const isCurrentOwner = (): boolean =>
+    myLoadId === getActiveLoadSessionId() &&
+    (loadEpoch === undefined || isCurrentLoadEpoch(myEpoch)) &&
+    !isExternalOwner();
+
+  showLoader(true, t('transfer.demo_loading_short'));
+  stopAllMedia({ silent: true });
+  setPlaybackTrackMeta(meta);
+
+  transition({
+    type: 'FILE_PREPARE',
+    variant: 'preload-match',
+    queueItemId: null,
+    name: file.name,
+  });
+
+  try {
+    // Decoding needs a context, not running output. A locked context must leave
+    // the valid demo bytes available for PLAY's trusted-gesture recovery.
+    if (!isSystemAudioActive() && getAudioContext().state === 'running') {
+      await Promise.race([initAudio(), delay(2000)]);
+    }
+    if (!isCurrentOwner()) return;
+
+    if (getCurrentAudioBuffer()) setCurrentAudioBuffer(null);
+    const decoded = await decodeBlobToAudioBuffer(
+      file,
+      'demo-load',
+      file.name,
+      null,
+      isCurrentOwner,
+    );
+    const audioBuffer = decoded.audioBuffer;
+    try {
+      if (loadEpoch !== undefined && !isCurrentLoadEpoch(myEpoch)) {
+        if (myLoadId === getActiveLoadSessionId()) showLoader(false);
+        return;
+      }
+
+      if (isExternalOwner()) {
+        log.debug('[Demo] Aborted - external playback mode took ownership after decode');
+        return;
+      }
+
+      if (myLoadId !== getActiveLoadSessionId()) return;
+
+      setCurrentAudioBuffer(audioBuffer);
+    } finally {
+      decoded.release();
+    }
+    transition({ type: 'DECODE_SUCCESS' });
+    if (audioBuffer.duration && Number.isFinite(audioBuffer.duration)) {
+      bus.emit('ui:duration-update', audioBuffer.duration);
+    }
+
+    // Demo tracks are addressed by demo.currentTrackIndex, never by a fake
+    // queue occurrence. They therefore do not publish a ResidentFile owner.
+    batchSetState({ 'transfer.meta': null, 'files.current': null });
+    setPlaybackTrackMeta(meta);
+    bus.emit('ui:play-btn-state', true);
+  } catch (err: unknown) {
+    if (isDecodeSupersededError(err)) {
+      log.debug(`[Demo] ${err.message}`);
+      return;
+    }
+    log.error('[Demo] Load failed', err);
+    // Same supersession guard as loadAndBroadcastFile's catch: a superseded
+    // demo load's failure must not null the successor's published blob or
+    // knock the successor's FSM to FAILED. Rethrow either way — the caller's
+    // catch owns demo-level recovery.
+    if (
+      (loadEpoch !== undefined && !isCurrentLoadEpoch(myEpoch)) ||
+      myLoadId !== getActiveLoadSessionId()
+    ) {
+      throw err;
+    }
+    setState('files.current', null);
+    transition({ type: 'DECODE_ERROR' });
+    throw err;
+  } finally {
+    if (myLoadId === getActiveLoadSessionId()) {
+      showLoader(false);
+      setState('player.pausedAt', 0);
+    }
+  }
+}
+
+function markFailedAndAdvance(failedQueueItemId: QueueItemId): void {
+  const failedItem = getQueueItemById(failedQueueItemId);
+  if (!failedItem || getCurrentQueueItemId() !== failedQueueItemId) return;
+
+  broadcastSystemMessage('chat.decode_skip_system_message');
+  markTrackFailed(getTrackKeyFromItem(failedItem));
+
+  const playlist = getState('playlist.items') || [];
+  const playableCount = playlist.reduce(
+    (count, item) => count + (isTrackFailed(getTrackKeyFromItem(item)) ? 0 : 1),
+    0,
+  );
+  if (playableCount === 0) {
+    showToast(t('error.all_tracks_failed'));
+    clearFailedTracks();
+    stopAllMedia();
+    setCurrentAudioBuffer(null);
+    setPlaybackTrackMeta(null);
+    selectQueueItemById(null);
+    setState('files.current', null);
+    setState('player.pausedAt', 0);
+    setPlaybackIdle();
+    transition({ type: 'PAUSE', time: 0, queueItemId: null, endOfPlaylist: true });
+    broadcast({
+      type: MSG.PAUSE,
+      time: 0,
+      queueItemId: null,
+      endOfPlaylist: true,
+      reason: 'end-of-playlist',
+    });
+    return;
+  }
+
+  const advanceEpoch = getCurrentLoadEpoch();
+  setManagedTimer(
+    'decode-fail-advance',
+    () => {
+      if (
+        !isCurrentLoadEpoch(advanceEpoch) ||
+        getCurrentQueueItemId() !== failedQueueItemId ||
+        !getQueueItemById(failedQueueItemId)
+      ) {
+        log.debug('[Decode] Skipping auto-advance because queue ownership changed');
+        return;
+      }
+
+      void loadPlaylistModule()
+        .then(({ getShuffleNextPlayableQueueItemId, playNextTrack, playTrack }) => {
+          const livePlaylist = getState('playlist.items') || [];
+          const failedIndex = findQueueItemIndex(failedQueueItemId, livePlaylist);
+          if (failedIndex < 0 || getCurrentQueueItemId() !== failedQueueItemId) return;
+
+          const isGoodCandidate = (queueItemId: QueueItemId): boolean => {
+            const item = getQueueItemById(queueItemId, livePlaylist);
+            return (
+              !!item &&
+              queueItemId !== failedQueueItemId &&
+              !isTrackFailed(getTrackKeyFromItem(item))
+            );
+          };
+
+          let targetQueueItemId: QueueItemId | null = null;
+          const preloadedQueueItemId = getState('preload.nextQueueItemId');
+          if (preloadedQueueItemId && isGoodCandidate(preloadedQueueItemId)) {
+            targetQueueItemId = preloadedQueueItemId;
+          }
+
+          if (!targetQueueItemId && getState('playlist.isShuffle')) {
+            targetQueueItemId = getShuffleNextPlayableQueueItemId((queueItemId) =>
+              isGoodCandidate(queueItemId),
+            );
+          }
+
+          if (!targetQueueItemId && !getState('playlist.isShuffle')) {
+            const repeatMode = getState('playlist.repeatMode');
+            const maxProbe =
+              repeatMode === 1 ? livePlaylist.length : livePlaylist.length - 1 - failedIndex;
+            for (let probe = 1; probe <= maxProbe; probe++) {
+              const candidate = livePlaylist[(failedIndex + probe) % livePlaylist.length];
+              if (candidate && isGoodCandidate(candidate.queueItemId)) {
+                targetQueueItemId = candidate.queueItemId;
+                break;
+              }
+            }
+          }
+
+          if (targetQueueItemId) {
+            return playTrack(targetQueueItemId);
+          } else {
+            playNextTrack();
+          }
+        })
+        .catch((error) => {
+          log.warn('[Decode] Failed to load the playlist for decode-failure recovery:', error);
+          showToast(t('error.network_generic'));
+        });
+    },
+    600,
+  );
+}
+
+function recordGuestDecodeFailure(queueItemId: QueueItemId): number {
+  // Descriptor-only remote delivery can bypass FILE_PREPARE/START. Keep
+  // retries tied to the occurrence even after failed preload cleanup has
+  // cleared transfer.meta, and never charge its failures to the next track.
+  const previousCount =
+    getState('player.decodeFailureQueueItemId') === queueItemId
+      ? getState('player.decodeFailureCount')
+      : 0;
+  const failureCount = previousCount + 1;
+  batchSetState({
+    'player.decodeFailureQueueItemId': queueItemId,
+    'player.decodeFailureCount': failureCount,
+  });
+  return failureCount;
+}
+
+function markDeviceTrackUnavailable(queueItemId: QueueItemId): void {
+  // A terminal device-local rejection owns neither the failed occurrence's
+  // pending position nor its recovery target. Keeping either would let a
+  // PREPARE-lost successor inherit stale playback intent.
+  setPendingPlayTime(undefined);
+  setPendingRecoveryTarget(null);
+  const key = getTrackKeyFromItem(getQueueItemById(queueItemId));
+  if (isTrackFailed(key)) return;
+  markTrackFailed(key);
+  announceSystemMessageLocally('chat.device_track_unavailable_system_message');
+  sendToHost({ type: MSG.GUEST_DECODE_FAILED, queueItemId });
+}
+
+// Guest decoders can reject a track the host can play. That is a device-local
+// capability failure, not room-wide skip authority: reports inform the host and
+// operators, while the affected device waits for the next track. Only a decode
+// failure on the authoritative host itself advances the room.
+const _reportedDecodeFailures = new Map<QueueItemId, Set<string>>();
+
+function getConnectedDecodeReporter(peerId: string) {
+  return getState('network.connectedPeers').find(
+    (peer) => peer.id === peerId && peer.status === 'connected',
+  );
+}
+
+function rememberDecodeFailureReport(peerId: string, queueItemId: QueueItemId): Set<string> {
+  let reports = _reportedDecodeFailures.get(queueItemId);
+  if (!reports) {
+    reports = new Set<string>();
+    _reportedDecodeFailures.set(queueItemId, reports);
+  }
+  reports.add(peerId);
+  return reports;
+}
+
+function notifyOperatorsOfDeviceDecodeFailure(): void {
+  const text = t('toast.remote_decode_device_wait');
+  showToast(text);
+  for (const peer of getState('network.connectedPeers')) {
+    if (peer.status !== 'connected' || !peer.isOp) continue;
+    safeSend(peer.conn, {
+      type: MSG.OPERATOR_TOAST,
+      text,
+      i18nKey: 'toast.remote_decode_device_wait',
+    });
+  }
+}
+
+function handleGuestDecodeFailed(data: Record<string, unknown>, conn: DataConnection): void {
+  if (getState('network.hostConn')) return;
+
+  const peerId = conn?.peer;
+  if (!peerId) return;
+  const peer = getConnectedDecodeReporter(peerId);
+  if (!peer) return;
+
+  const queueItemId = data.queueItemId;
+  if (
+    typeof queueItemId !== 'string' ||
+    queueItemId !== getCurrentQueueItemId() ||
+    !getQueueItemById(queueItemId)
+  ) {
+    log.debug('[Decode] Ignored stale GUEST_DECODE_FAILED queue occurrence');
+    return;
+  }
+
+  const existingReports = _reportedDecodeFailures.get(queueItemId);
+  if (existingReports?.has(peerId)) {
+    log.debug(`[Decode] Duplicate decode-failed from ${peerId} for ${queueItemId}`);
+    return;
+  }
+  const reports = rememberDecodeFailureReport(peerId, queueItemId);
+  log.warn(
+    `[Decode] ${peer.isOp ? 'Operator' : 'Guest'} ${peerId} cannot decode ${queueItemId}; room playback continues`,
+  );
+  if (reports.size === 1) notifyOperatorsOfDeviceDecodeFailure();
+}
+
+export function initDecodeHandlers(): void {
+  registerHandlers({
+    [MSG.GUEST_DECODE_FAILED]: handleGuestDecodeFailed,
+  });
+
+  bus.on('state:playlist.currentQueueItemId', () => {
+    _reportedDecodeFailures.clear();
+  });
+}
+
+// ─── Load Preloaded Track ───────────────────────────────────────────
+
+/** Keep an explicit retry attached to the exact still-pending encoded owner. */
+export function getPreloadActivationResident(
+  queueItemId: QueueItemId,
+): Readonly<ResidentFile> | null {
+  const ready = getState('preload.ready');
+  if (ready?.queueItemId === queueItemId) return ready;
+  const current = getState('files.current');
+  const active = _activePreloadActivation;
+  return current?.queueItemId === queueItemId &&
+    active?.queueItemId === queueItemId &&
+    current.sessionId === active.sessionId &&
+    current.blob === active.blob
+    ? current
+    : null;
+}
+
+function exactPreloadIdentity(
+  ready: Readonly<ResidentFile>,
+  targetQueueItemId: QueueItemId,
+  isAwaitedHandoff = false,
+): boolean {
+  if (
+    ready.queueItemId !== targetQueueItemId ||
+    !Number.isSafeInteger(ready.sessionId) ||
+    ready.sessionId <= 0
+  ) {
+    return false;
+  }
+  if (!isAwaitedHandoff) {
+    if (getState('preload.ready') !== ready) return false;
+    if (getState('preload.nextQueueItemId') !== targetQueueItemId) return false;
+  }
+
+  const activeTarget = getState('preload.activeTarget');
+  if (
+    activeTarget &&
+    (activeTarget.queueItemId === targetQueueItemId
+      ? activeTarget.sessionId !== ready.sessionId
+      : !isAwaitedHandoff)
+  ) {
+    return false;
+  }
+
+  return matchesPreloadQueueItem(ready, targetQueueItemId);
+}
+
+function matchesPreloadQueueItem(
+  ready: Readonly<ResidentFile>,
+  targetQueueItemId: QueueItemId,
+): boolean {
+  const playlistItem = getQueueItemById(targetQueueItemId);
+  if (!playlistItem) return false;
+  if (playlistItem.file && playlistItem.file !== ready.blob) return false;
+  if (playlistItem.name && playlistItem.name !== ready.name) return false;
+  return true;
+}
+
+function rejectMismatchedPreload(
+  ready: Readonly<ResidentFile>,
+  targetQueueItemId: QueueItemId,
+): void {
+  log.warn(
+    `[Preload] Cached blob identity does not match queue item ${targetQueueItemId}; requesting fresh bytes`,
+  );
+
+  if (getState('preload.ready') === ready) {
+    setState('preload.ready', null);
+    const activeTarget = getState('preload.activeTarget');
+    if (
+      activeTarget?.queueItemId === ready.queueItemId &&
+      activeTarget.sessionId === ready.sessionId
+    ) {
+      setState('preload.activeTarget', null);
+    }
+    if (getState('preload.nextQueueItemId') === ready.queueItemId) {
+      setState('preload.nextQueueItemId', null);
+    }
+    discardResidentStoredFileAdmission(ready.blob);
+  }
+
+  const hostConn = getState('network.hostConn');
+  const item = getQueueItemById(targetQueueItemId);
+  const indexHint = findQueueItemIndex(targetQueueItemId);
+  if (!hostConn?.open || !item || indexHint < 0) return;
+
+  setPendingRecoveryTarget({
+    queueItemId: targetQueueItemId,
+    indexHint,
+    name: item.name,
+  });
+  const owner = beginFileRequest(hostConn, targetQueueItemId);
+  sendFileRequest(owner, {
+    type: MSG.REQUEST_CURRENT_FILE,
+    name: item.name,
+    reason: 'preload_identity_mismatch',
+  });
+}
+
+function requestFreshQueueItem(queueItemId: QueueItemId, reason: string): void {
+  const hostConn = getState('network.hostConn');
+  const item = getQueueItemById(queueItemId);
+  const indexHint = findQueueItemIndex(queueItemId);
+  if (!hostConn?.open || !item || indexHint < 0) return;
+  setPendingRecoveryTarget({ queueItemId, indexHint, name: item.name });
+  const owner = beginFileRequest(hostConn, queueItemId);
+  sendFileRequest(owner, {
+    type: MSG.REQUEST_CURRENT_FILE,
+    name: item.name,
+    reason,
+  });
+}
+
+/**
+ * Activate the preloaded blob (decode → swap into the live buffer).
+ *
+ * Returns `true` only when the activation fully succeeded (buffer swapped,
+ * lifecycle at READY). Every abort/supersede/failure path returns `false` so
+ * callers that follow up with play()+broadcast can avoid announcing audio the
+ * host did not load. This mirrors loadAndBroadcastFile's boolean contract.
+ */
+export async function loadPreloadedTrack(
+  queueItemId: QueueItemId,
+  loadEpoch?: number,
+  awaitedResident?: Readonly<ResidentFile>,
+): Promise<boolean> {
+  // An older exact awaited receive can finish behind a future preload. Its
+  // synchronous internal handoff must not replace that speculative cache.
+  const ready = awaitedResident ?? getPreloadActivationResident(queueItemId);
+  const myEpoch = loadEpoch ?? getCurrentLoadEpoch();
+
+  if (!ready || ready.queueItemId !== queueItemId) {
+    log.warn('[Preload] No matching preloaded resident found');
+    if (getCurrentQueueItemId() === queueItemId) {
+      requestFreshQueueItem(queueItemId, 'preload_resident_missing');
+    }
+    return false;
+  }
+  if (getCurrentQueueItemId() !== queueItemId || !getQueueItemById(queueItemId)) {
+    return false;
+  }
+  const alreadyPromoted = getState('files.current') === ready;
+  if (
+    !(alreadyPromoted
+      ? matchesPreloadQueueItem(ready, queueItemId)
+      : exactPreloadIdentity(ready, queueItemId, !!awaitedResident))
+  ) {
+    rejectMismatchedPreload(ready, queueItemId);
+    return false;
+  }
+
+  const localBlob = ready.blob;
+  let promotedResident: ResidentFile | null = null;
+  const ownsPublishedTarget = (): boolean => {
+    const resident = getState('files.current');
+    const activeTarget = getState('preload.activeTarget');
+    return (
+      resident?.queueItemId === queueItemId &&
+      resident.sessionId === ready.sessionId &&
+      resident.blob === localBlob &&
+      getCurrentQueueItemId() === queueItemId &&
+      matchesPreloadQueueItem(ready, queueItemId) &&
+      (activeTarget?.queueItemId !== queueItemId || activeTarget.sessionId === ready.sessionId) &&
+      (loadEpoch === undefined || isCurrentLoadEpoch(myEpoch)) &&
+      !isExternalOwner()
+    );
+  };
+  const activationOwner = beginPreloadActivation(myEpoch, queueItemId, ready.sessionId, localBlob);
+  let published = false;
+  const ownsTarget = (): boolean =>
+    isCurrentPreloadActivation(activationOwner) &&
+    activationOwner.queueItemId === queueItemId &&
+    activationOwner.sessionId === ready.sessionId &&
+    (promotedResident
+      ? ownsPublishedTarget()
+      : getCurrentQueueItemId() === queueItemId &&
+        !!getQueueItemById(queueItemId) &&
+        (loadEpoch === undefined || isCurrentLoadEpoch(myEpoch)) &&
+        exactPreloadIdentity(ready, queueItemId, !!awaitedResident) &&
+        !isExternalOwner());
+
+  try {
+    if (getCurrentAudioBuffer()) setCurrentAudioBuffer(null);
+
+    const priorResident = getState('files.current');
+    if (priorResident && priorResident.blob !== localBlob) {
+      if (getState('files.current') === priorResident) setState('files.current', null);
+      discardResidentStoredFileAdmission(priorResident.blob);
+    }
+
+    const indexHint = findQueueItemIndex(queueItemId);
+    const item = getQueueItemById(queueItemId);
+    if (indexHint < 0 || !item) return false;
+
+    if (
+      priorResident &&
+      (priorResident.queueItemId !== queueItemId || priorResident.sessionId !== ready.sessionId)
+    ) {
+      cleanupStoredFile(
+        priorResident.queueItemId,
+        priorResident.name,
+        false,
+        priorResident.sessionId,
+      );
+    }
+
+    const isAdmissionBoundPreload = encodedReceiveReservationIdForBlob(localBlob) !== undefined;
+    const promoted =
+      alreadyPromoted ||
+      promoteStoredFileAdmission(queueItemId, ready.name, ready.sessionId, localBlob);
+    if (isAdmissionBoundPreload && !promoted) {
+      throw new Error('PRELOAD_RESIDENT_PROMOTION_FAILED');
+    }
+
+    const mime = ready.mime || localBlob.type || 'application/octet-stream';
+    const size = ready.size || localBlob.size;
+    const activeTarget = getState('preload.activeTarget');
+    const total =
+      activeTarget?.queueItemId === queueItemId &&
+      Number.isSafeInteger(activeTarget.total) &&
+      Number(activeTarget.total) > 0
+        ? Number(activeTarget.total)
+        : Math.max(1, Math.ceil(size / CHUNK_SIZE));
+    const resident: ResidentFile = {
+      queueItemId,
+      indexHint,
+      name: ready.name,
+      sessionId: ready.sessionId,
+      blob: localBlob,
+      mime,
+      size,
+      ...(ready.objectId ? { objectId: ready.objectId } : {}),
+    };
+    const meta: FileMeta = {
+      queueItemId,
+      indexHint,
+      name: ready.name,
+      sessionId: ready.sessionId,
+      type: mime,
+      mime,
+      size,
+      total,
+      ...(ready.objectId ? { objectId: ready.objectId } : {}),
+    };
+
+    // Promotion is one state publication: consumers never observe the blob
+    // under preload and current ownership simultaneously.
+    batchSetState({
+      'files.current': resident,
+      'transfer.meta': meta,
+      ...(!alreadyPromoted && !awaitedResident
+        ? {
+            'preload.ready': null,
+            'preload.activeTarget': null,
+            'preload.nextQueueItemId': null,
+            'preload.isPreloading': false,
+          }
+        : {}),
+    });
+    promotedResident = resident;
+
+    // The selected encoded file owns current storage before any native await.
+    // A faster host may already send the next preload while this device decodes.
+    // Decoding does not require audible output. A suspended iPhone context
+    // may need a gesture to resume; treating that as a decode failure throws
+    // away good downloaded bytes and can blacklist the file. Warm the graph
+    // only while running, then let play() own output recovery after decode.
+    if (!isSystemAudioActive() && getAudioContext().state === 'running') {
+      await Promise.race([initAudio(), delay(2000)]);
+    }
+
+    if (!ownsTarget()) {
+      finishPreloadActivation(activationOwner);
+      if (isExternalOwner()) {
+        setPendingPlayTime(undefined);
+        showLoader(false);
+      }
+      return false;
+    }
+
+    log.debug('[Preload] Decoding audio for Buffer Mode...');
+    showToast(t('toast.decoding_audio'));
+
+    const decoded = await decodeBlobToAudioBuffer(
+      localBlob,
+      'preload',
+      ready.name,
+      queueItemId,
+      ownsTarget,
+    );
+    const audioBuffer = decoded.audioBuffer;
+    try {
+      if (!ownsTarget()) {
+        log.debug('[Preload] Queue/session/epoch owner changed during decode');
+        return false;
+      }
+      setCurrentAudioBuffer(audioBuffer);
+      setPlaybackTrackMeta(getQueueItemById(queueItemId)!);
+      published = true;
+    } finally {
+      decoded.release();
+    }
+
+    finishPreloadActivation(activationOwner);
+    transition({ type: 'DECODE_SUCCESS' });
+    setEngineMode('buffer');
+
+    if (Number.isFinite(audioBuffer.duration)) {
+      bus.emit('ui:duration-update', audioBuffer.duration);
+    }
+
+    setPlaybackTransferState(TRANSFER_STATE.READY);
+    clearManagedTimer('prepareWatchdog');
+    clearManagedTimer('chunkWatchdog');
+    clearManagedTimer('preloadRecoveryWatchdog');
+    if (!getState('preload.activeTarget')) clearManagedTimer('preloadUiWatchdog');
+
+    const hostConn = getState('network.hostConn');
+    if (hostConn?.open) {
+      setManagedTimer(
+        'playback-preload-auto-sync',
+        () => {
+          if (!ownsPublishedTarget()) return;
+          log.debug('[Guest] Post-preload auto-sync');
+          // This is a new file on the same live room clock. Keep its low-RTT
+          // samples while the host may already be transferring the successor.
+          bus.emit('sync:force-resync', { preserveClock: true });
+        },
+        500,
+      );
+    }
+
+    const pendingTime = getPendingPlayTime();
+    if (hostConn && pendingTime !== undefined && ownsPublishedTarget()) {
+      const timing = resolveFilePlayTiming(pendingTime, getPendingPlayTimeSetAt());
+      log.info(`[Preload] Activating playback at ${timing.offset.toFixed(1)}s`);
+      let recoveredStartFinalized = false;
+      const finalizeRecoveredStart = (): void => {
+        if (
+          recoveredStartFinalized ||
+          !ownsPublishedTarget() ||
+          getState('playback.activity') !== 'playing'
+        ) {
+          return;
+        }
+        recoveredStartFinalized = true;
+        setPendingPlayTime(undefined);
+        bus.emit('sync:arm-initial');
+        setManagedTimer(
+          'playback-preload-host-sync',
+          () => {
+            if (ownsPublishedTarget()) {
+              bus.emit('sync:request-immediate-ping');
+            }
+          },
+          250,
+        );
+      };
+      const started = await play(
+        timing.offset,
+        timing.scheduleDelay,
+        timing.scheduleDeadlineMs,
+        ownsPublishedTarget,
+        { timing: 'catch-up', onRecoveredStarted: finalizeRecoveredStart },
+      );
+      if (started) finalizeRecoveredStart();
+    } else if (ownsPublishedTarget()) {
+      bus.emit('sync:request-immediate-ping');
+    }
+
+    if (ownsPublishedTarget()) showLoader(false);
+    return true;
+  } catch (error: unknown) {
+    if (published) {
+      log.warn('[Preload] Post-publication side effect failed; resident remains active', error);
+      if (ownsPublishedTarget()) showLoader(false);
+      return true;
+    }
+    if (!isCurrentPreloadActivation(activationOwner)) {
+      log.debug('[Preload] Stale activation failed after supersession; ignoring', error);
+      return false;
+    }
+    if (!ownsTarget()) {
+      finishPreloadActivation(activationOwner);
+      if (isExternalOwner()) {
+        setPendingPlayTime(undefined);
+        showLoader(false);
+      }
+      return false;
+    }
+    if (isDecodeSupersededError(error)) {
+      log.debug(`[Preload] ${error.message}`);
+      finishPreloadActivation(activationOwner);
+      return false;
+    }
+
+    finishPreloadActivation(activationOwner);
+    setPendingPlayTime(undefined);
+    log.error('[Preload] Activation failed:', error);
+    showLoader(false);
+    transition({ type: 'DECODE_ERROR' });
+
+    if (getState('preload.ready') === ready) {
+      batchSetState({
+        'preload.ready': null,
+        'preload.activeTarget': null,
+        'preload.nextQueueItemId': null,
+        'preload.isPreloading': false,
+      });
+      discardResidentStoredFileAdmission(localBlob);
+    }
+    clearManagedTimer('preloadRecoveryWatchdog');
+    if (!getState('preload.activeTarget')) clearManagedTimer('preloadUiWatchdog');
+
+    const hostConn = getState('network.hostConn');
+    if (!hostConn) {
+      showToast(t('transfer.preload_fail'));
+      markFailedAndAdvance(queueItemId);
+      return false;
+    }
+
+    const memoryLimited = isAudioDecodeAdmissionError(error);
+    if (memoryLimited) {
+      markDeviceTrackUnavailable(queueItemId);
+      return false;
+    }
+
+    const failureCount = recordGuestDecodeFailure(queueItemId);
+    if (failureCount >= 2) {
+      log.warn('[Preload] Activation failed twice for the same queue item');
+      markDeviceTrackUnavailable(queueItemId);
+      return false;
+    }
+
+    showToast(t('transfer.preload_fail'));
+    requestFreshQueueItem(queueItemId, 'preload_activation_failed');
+    return false;
+  } finally {
+    finishPreloadActivation(activationOwner);
+    if (!published && promotedResident && getState('files.current') === promotedResident) {
+      batchSetState({ 'files.current': null, 'transfer.meta': null });
+      discardResidentStoredFileAdmission(localBlob);
+    }
+  }
+}
+
+// ─── Clear Previous Track State ─────────────────────────────────────
+
+// ─── Clear Previous Track State ────────────────────────────────────
+
+export function clearPreviousTrackState(reason = ''): void {
+  log.debug(`[State Clear] Clearing previous track state. Reason: ${reason}`);
+
+  const currentResident = getState('files.current');
+  const transferMeta = getState('transfer.meta');
+  const ownedQueueItemId =
+    currentResident?.queueItemId ?? transferMeta?.queueItemId ?? getCurrentQueueItemId();
+  if (
+    reason === 'redundant-sync' &&
+    ownedQueueItemId &&
+    getLastClearedQueueItemId() === ownedQueueItemId
+  ) {
+    log.debug(`[State Clear] Skipping redundant clear for: ${ownedQueueItemId}`);
+    return;
+  }
+  setLastClearedQueueItemId(ownedQueueItemId);
+
+  clearManagedTimer('chunkWatchdog');
+  clearManagedTimer('prepareWatchdog');
+  if (reason === 'redundant-sync') return;
+
+  batchSetState({
+    'transfer.receivedCount': 0,
+    'transfer.meta': null,
+    'files.current': null,
+  });
+
+  if (getCurrentAudioBuffer()) {
+    log.debug('[State Clear] Clearing currentAudioBuffer');
+    setCurrentAudioBuffer(null);
+  }
+  stopPlayerNode();
+
+  if (reason !== 'new-session-start') {
+    setPendingPlayTime(undefined);
+  }
+
+  const playback = getPlaybackModeActivity();
+  if (isPlaybackNonIdleFile(playback) && !isFilePipelineBusyForPlay()) {
+    setPlaybackIdle();
+  }
+
+  setState('preload.ackSent', new Map());
+
+  if (currentResident) {
+    const ready = getState('preload.ready');
+    const residentIsAlsoPreload =
+      ready?.blob === currentResident.blob &&
+      ready.queueItemId === currentResident.queueItemId &&
+      ready.sessionId === currentResident.sessionId;
+    if (!residentIsAlsoPreload) {
+      postCommand({
+        command: 'STORAGE_RESET',
+        queueItemId: currentResident.queueItemId,
+        sessionId: currentResident.sessionId,
+        isPreload: false,
+      });
+      cleanupStoredFile(
+        currentResident.queueItemId,
+        currentResident.name,
+        false,
+        currentResident.sessionId,
+      );
+    }
+  }
+}
+
+// ─── Finalize Guest File (after download) ───────────────────────────
+
+// ─── Finalize Guest File (after download) ─────────────────────────
+
+export async function finalizeGuestFile(
+  file: File | Blob,
+  queueItemId: QueueItemId,
+  sessionId: number,
+): Promise<void> {
+  const itemAtEntry = getQueueItemById(queueItemId);
+  const metaAtEntry = getState('transfer.meta');
+  if (
+    !itemAtEntry ||
+    getCurrentQueueItemId() !== queueItemId ||
+    !Number.isSafeInteger(sessionId) ||
+    sessionId <= 0 ||
+    metaAtEntry?.queueItemId !== queueItemId ||
+    metaAtEntry.sessionId !== sessionId
+  ) {
+    log.debug('[Guest] Ignored finalize for stale queue/session owner');
+    return;
+  }
+
+  if (isExternalOwner()) {
+    log.debug('[Guest] finalizeGuestFile aborted - external playback mode active');
+    setPlaybackTransferState(TRANSFER_STATE.IDLE);
+    postCommand({ command: 'STORAGE_RESET', queueItemId, sessionId, isPreload: false });
+    showLoader(false);
+    return;
+  }
+
+  log.debug('[Guest] Finalizing with Buffer Mode...');
+  const myLoadId = incrementLoadSessionId();
+  const myTransferSid = sessionId;
+  const isAdmissionBoundFile = encodedReceiveReservationIdForBlob(file) !== undefined;
+  const detachedPreviousBuffer = getCurrentAudioBuffer();
+  const detachedPreviousResident = getState('files.current');
+  const ownsTarget = (): boolean => {
+    const liveMeta = getState('transfer.meta');
+    return (
+      getActiveLoadSessionId() === myLoadId &&
+      getState('transfer.localSessionId') === myTransferSid &&
+      getCurrentQueueItemId() === queueItemId &&
+      !!getQueueItemById(queueItemId) &&
+      liveMeta?.queueItemId === queueItemId &&
+      liveMeta.sessionId === myTransferSid &&
+      !isExternalOwner()
+    );
+  };
+
+  showLoader(true, t('error.audio_memory'));
+
+  try {
+    // Keep a valid incoming file when output still needs a user gesture.
+    // play() handles resume failures against the decoded buffer, without
+    // retrying its download or consuming the codec-failure allowance.
+    if (getAudioContext().state === 'running') await initAudio();
+
+    if (!ownsTarget()) {
+      log.debug('[Guest] Stale finalize before decode');
+      return;
+    }
+
+    if (detachedPreviousBuffer) setCurrentAudioBuffer(null);
+    const liveMeta = getState('transfer.meta');
+    const fileName =
+      (typeof File !== 'undefined' && file instanceof File ? file.name : '') ||
+      liveMeta?.name ||
+      itemAtEntry.name;
+
+    const decoded = await decodeBlobToAudioBuffer(
+      file,
+      'guest-finalize',
+      fileName,
+      queueItemId,
+      ownsTarget,
+    );
+    const audioBuffer = decoded.audioBuffer;
+    try {
+      if (!ownsTarget()) {
+        log.debug('[Guest] Stale finalize after decode');
+        return;
+      }
+
+      const indexHint = findQueueItemIndex(queueItemId);
+      const item = getQueueItemById(queueItemId);
+      const meta = getState('transfer.meta');
+      if (
+        indexHint < 0 ||
+        !item ||
+        meta?.queueItemId !== queueItemId ||
+        meta.sessionId !== myTransferSid
+      ) {
+        return;
+      }
+
+      const retained = retainStoredFileAdmission(queueItemId, fileName, false, myTransferSid, file);
+      if (isAdmissionBoundFile && !retained) {
+        throw new Error('CURRENT_RESIDENT_ADMISSION_FAILED');
+      }
+      if (!retained) {
+        log.warn(
+          `[Guest] Finalized file has no matching resident admission: ${queueItemId} (SID ${myTransferSid})`,
+        );
+      }
+
+      const mime = meta.mime || file.type || 'application/octet-stream';
+      const size = file.size;
+      const metaTotal = Number(meta.total);
+      const publishedMeta: FileMeta = {
+        ...meta,
+        queueItemId,
+        indexHint,
+        name: fileName,
+        sessionId: myTransferSid,
+        type: meta.type || mime,
+        mime,
+        size,
+        total:
+          Number.isSafeInteger(metaTotal) && metaTotal > 0
+            ? metaTotal
+            : Math.max(1, Math.ceil(size / CHUNK_SIZE)),
+      };
+      const resident: ResidentFile = {
+        queueItemId,
+        indexHint,
+        name: fileName,
+        sessionId: myTransferSid,
+        blob: file,
+        mime,
+        size,
+        ...(meta.objectId ? { objectId: meta.objectId } : {}),
+      };
+      batchSetState({ 'transfer.meta': publishedMeta, 'files.current': resident });
+      setCurrentAudioBuffer(audioBuffer);
+      setPlaybackTrackMeta(item);
+    } finally {
+      decoded.release();
+    }
+
+    transition({ type: 'DECODE_SUCCESS' });
+    setEngineMode('buffer');
+
+    if (Number.isFinite(audioBuffer.duration)) {
+      bus.emit('ui:duration-update', audioBuffer.duration);
+    }
+    setPlaybackTransferState(TRANSFER_STATE.READY);
+    clearManagedTimer('prepareWatchdog');
+    clearManagedTimer('chunkWatchdog');
+
+    const hostConn = getState('network.hostConn');
+    const pendingTime = getPendingPlayTime();
+    if (hostConn && pendingTime !== undefined && ownsTarget()) {
+      const timing = resolveFilePlayTiming(pendingTime, getPendingPlayTimeSetAt());
+      log.debug(`[Guest] Pending play at ${timing.offset.toFixed(1)}s`);
+      let recoveredStartFinalized = false;
+      const finalizeRecoveredStart = (): void => {
+        if (
+          recoveredStartFinalized ||
+          !ownsTarget() ||
+          getState('playback.activity') !== 'playing'
+        ) {
+          return;
+        }
+        recoveredStartFinalized = true;
+        setPendingPlayTime(undefined);
+        bus.emit('sync:arm-initial');
+        setManagedTimer(
+          'playback-finalize-host-sync',
+          () => {
+            if (ownsTarget()) {
+              bus.emit('sync:request-immediate-ping');
+            }
+          },
+          250,
+        );
+      };
+      const started = await play(
+        timing.offset,
+        timing.scheduleDelay,
+        timing.scheduleDeadlineMs,
+        ownsTarget,
+        { timing: 'catch-up', onRecoveredStarted: finalizeRecoveredStart },
+      );
+      if (started) finalizeRecoveredStart();
+    }
+
+    if (ownsTarget()) {
+      bus.emit('ui:play-btn-state', !hostConn || hasRoomCapability('playback.control'));
+    }
+  } catch (error: unknown) {
+    if (!ownsTarget()) {
+      log.debug('[Guest] Decode failed for a superseded queue/session owner');
+      return;
+    }
+    if (isDecodeSupersededError(error)) {
+      log.debug(`[Guest] ${error.message}`);
+      return;
+    }
+
+    log.error('[Guest] Decoding failed', error);
+    const memoryLimited = isAudioDecodeAdmissionError(error);
+    transition({ type: 'DECODE_ERROR' });
+    setPlaybackTransferState(TRANSFER_STATE.IDLE);
+    setState('transfer.receivedCount', 0);
+
+    const failureCount = recordGuestDecodeFailure(queueItemId);
+
+    if (memoryLimited || failureCount >= 2) {
+      // The Blob and its encoded-byte admission are no longer useful on this
+      // device. Release them before waiting for the next room track so a large
+      // incompatible file does not prolong the same memory pressure.
+      postCommand({ command: 'STORAGE_RESET', isPreload: false });
+      markDeviceTrackUnavailable(queueItemId);
+      return;
+    }
+
+    showToast(t('error.audio_decode_fail'));
+    const indexHint = findQueueItemIndex(queueItemId);
+    const item = getQueueItemById(queueItemId);
+    if (indexHint >= 0 && item) {
+      setPendingRecoveryTarget({ queueItemId, indexHint, name: item.name });
+    }
+    sendRecoveryRequest(0);
+  } finally {
+    if (
+      detachedPreviousBuffer &&
+      !getCurrentAudioBuffer() &&
+      detachedPreviousResident?.queueItemId === queueItemId &&
+      detachedPreviousResident.sessionId === myTransferSid &&
+      ownsTarget()
+    ) {
+      setCurrentAudioBuffer(detachedPreviousBuffer);
+    }
+    // Native decode cannot be cancelled. A replacement PREPARE/START may
+    // already own the default loader before it starts another finalizer (M2),
+    // so fence cleanup by the exact queue/transfer owner as well. ownsTarget
+    // intentionally ignores load-epoch bumps: they do not cancel this pipeline.
+    if (ownsTarget()) showLoader(false);
+  }
+}

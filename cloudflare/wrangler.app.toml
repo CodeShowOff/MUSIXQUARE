@@ -1,0 +1,153 @@
+name = "musixquare-app"
+main = "app-worker.ts"
+compatibility_date = "2026-05-04"
+workers_dev = false
+preview_urls = false
+upload_source_maps = true
+
+[observability]
+enabled = true
+
+# Public routing includes OAuth code/state callbacks. Keep provider-generated
+# request-URL events disabled; sampled application logs are credential-free.
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.1
+invocation_logs = false
+
+[observability.traces]
+enabled = false
+
+[[routes]]
+pattern = "musixquare.com"
+custom_domain = true
+
+[[routes]]
+pattern = "www.musixquare.com"
+custom_domain = true
+
+[assets]
+directory = "../dist"
+binding = "ASSETS"
+html_handling = "none"
+# Keep documents, API routes, the service worker, and stable bootstrap files on
+# the App Worker. Only content-hashed Vite assets with reviewed response-header
+# parity bypass Worker invocation.
+run_worker_first = ["/*", "!/assets/*.js", "!/assets/*.css", "!/assets/*.woff2"]
+
+[triggers]
+# The minute trigger drains large account-deletion jobs after login authority
+# has been revoked. Six-hour maintenance remains isolated in scheduled().
+crons = ["0 */6 * * *", "* * * * *"]
+
+[[r2_buckets]]
+binding = "SORO_IMAGE_BUCKET"
+bucket_name = "musixquare-soro-images"
+
+[[kv_namespaces]]
+binding = "SORO_RSS_BACKUP"
+id = "fd1a24bab0524b5688d168e9bdb6c038"
+
+# Admin dashboard metrics shared with the signaling Worker.
+[[d1_databases]]
+binding = "MUSIXQUARE_ADMIN_DB"
+database_name = "musixquare-admin-metrics"
+database_id = "d6cc9ceb-f0b6-40e4-99aa-8f28bec412ed"
+
+# Access-gated Developer API key management. This is the same dedicated D1
+# database used by the public Developer API Worker; raw keys are never stored.
+[[d1_databases]]
+binding = "DEVELOPER_API_DB"
+database_name = "musixquare-developer-api"
+database_id = "237d63d2-6eea-4b01-b396-7784b5b8b6f0"
+
+# Dedicated optional-account store. It contains pseudonymous account IDs,
+# nickname/profile state, session digests, and bounded room-cleanup indexes.
+[[d1_databases]]
+binding = "MUSIXQUARE_AUTH_DB"
+database_name = "musixquare-auth"
+database_id = "a1284975-2dac-4dbb-b1cb-ff60375833ae"
+
+# Cross-script Durable Object binding for Access + admin-session protected PRO
+# provisioning. The PRO Worker's public router cannot reach these root-level
+# internal endpoints, and activation claims are never persisted in D1.
+[[durable_objects.bindings]]
+name = "PRO_ROOM_ADMIN_ROOMS"
+class_name = "MusixquareProRoom"
+script_name = "musixquare-pro-room"
+
+[[durable_objects.bindings]]
+name = "MUSIXQUARE_SERVICE_CONTROL"
+class_name = "MusixquareServiceControl"
+script_name = "musixquare-pro-room"
+
+# Direct fail-closed signaling fence used after an account deletion has been
+# durably committed but before the PRO room authority purge can yield.
+[[durable_objects.bindings]]
+name = "PRO_SIGNALING_ROOMS"
+class_name = "MusixquareRoom"
+script_name = "musixquare-signaling"
+
+# Same-origin public facade for browser PRO-room requests. Keeping the browser
+# on musixquare.com avoids exposing room entry to a separate custom-domain
+# transport path while the backend Worker remains independently deployable.
+[[services]]
+binding = "PRO_ROOM_PUBLIC_API"
+service = "musixquare-pro-room"
+
+# Adaptive PoW pressure is an edge-local, eventually consistent friction
+# signal, not an authorization or paid-resource quota. Keep these namespaces
+# distinct: bundled browser capabilities include TURN/realtime and use the room
+# allowance, while bespoke non-room scope clients use the general allowance.
+[[ratelimits]]
+name = "MXQR_CAPABILITY_POW_ROOM_PRESSURE"
+namespace_id = "831501601"
+
+[ratelimits.simple]
+limit = 150
+period = 60
+
+[[ratelimits]]
+name = "MXQR_CAPABILITY_POW_GENERAL_PRESSURE"
+namespace_id = "830015601"
+
+[ratelimits.simple]
+limit = 15
+period = 60
+
+[vars]
+YOUTUBE_SEARCH_MAX_RESULTS = "10"
+YOUTUBE_SAFE_SEARCH = "moderate"
+GEMINI_BOT_MODEL = "gemini-3.5-flash-lite"
+CLOUDFLARE_TURN_TTL = "172800"
+# Human verification is disabled. Capability minting instead uses a short-lived,
+# IP/scope-bound proof-of-work challenge plus per-IP rate limits.
+MXQR_TURNSTILE_DISABLED = "true"
+# Keep the ordinary baseline at difficulty 12. Adaptive production challenges
+# stay disabled until the documented device benchmark exists. When explicitly
+# enabled, the location-local Rate Limiting bindings raise only post-threshold
+# challenges to 16 (room 150/minute, general 15/minute); binding failure falls
+# back to 12. Paid-resource atomic caps remain the fail-closed cost boundary.
+MXQR_CAPABILITY_POW_ADAPTIVE_ENABLED = "false"
+MXQR_CAPABILITY_POW_ADAPTIVE_MAX_DIFFICULTY = "16"
+# Optional tuning; defaults are baseline difficulty 12 and challenge TTL 120
+# seconds. Thresholds are fixed by the two Rate Limiting bindings above; an
+# attempted invalid proof consumes one additional event in its scope class.
+# MXQR_CAPABILITY_POW_DIFFICULTY = "12"
+# MXQR_CAPABILITY_POW_TTL = "120"
+# Optional comma/space-separated exact origins for trusted deploy previews.
+# TRUSTED_CORS_ORIGINS = "https://example-preview.pages.dev"
+# Selected production secrets; use cloudflare/config-drift-ops.md and the owning
+# runbooks for the complete current inventory:
+# - MXQR_CAPABILITY_SECRET (shared random value, at least 32 characters)
+# - CLOUDFLARE_REALTIME_APP_SECRET or supported API-token alias (at least 32 characters)
+# - MXQR_DEVELOPER_API_KEY_PEPPER (same >=32-character value as Developer API Worker)
+# - GEMINI_API_KEY (server-only key for the PRO-room BOT beta)
+# - GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET
+# - MXQR_AUTH_SESSION_PEPPER / MXQR_AUTH_SUBJECT_PEPPER / MXQR_OAUTH_STATE_SECRET
+#   (three independent random values, each at least 32 characters)
+# - MXQR_PRO_GRANT_VOUCHER_PEPPER (independent >=32-character HMAC key; App Worker only)
+# - MXQR_PRO_ROOM_ACCOUNT_ASSERTION_SECRET (same independent >=32-character value as PRO Worker)
+# - MXQR_STANDARD_ROOM_ACCOUNT_ASSERTION_SECRET (same independent >=32-character value as Signaling Worker)
+# Local/emergency only; production guards reject these:
+# - MXQR_ALLOW_UNGUARDED_PAID_APIS = "true"

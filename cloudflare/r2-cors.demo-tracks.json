@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "id": "musixquare-demo-track-read",
+      "allowed": {
+        "origins": ["*"],
+        "methods": ["GET", "HEAD"],
+        "headers": ["range", "content-type"]
+      },
+      "exposeHeaders": ["accept-ranges", "cache-control", "content-length", "content-type", "etag"],
+      "maxAgeSeconds": 86400
+    }
+  ]
+}

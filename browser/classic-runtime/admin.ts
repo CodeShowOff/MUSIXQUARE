@@ -1,0 +1,6648 @@
+type AdminTimestamp = string | number | null | undefined;
+
+interface ProGrantPool {
+  readonly firstRoomCode: string;
+  readonly lastRoomCode: string;
+  readonly roomCount: number;
+}
+
+interface ProGrantCounts {
+  readonly available?: number;
+  readonly redeemed?: number;
+  readonly revoked?: number;
+  readonly total?: number;
+}
+
+interface ProGrantCampaign {
+  readonly counts?: ProGrantCounts;
+  readonly endsAt: AdminTimestamp;
+  readonly firstRoomCode?: string;
+  readonly perAccountLimit: number;
+  readonly pool?: ProGrantPool;
+  readonly roomCodes?: readonly string[];
+  readonly roomCount?: number;
+  readonly roomStartCode?: string;
+  readonly slug: string;
+  readonly startsAt: AdminTimestamp;
+  readonly status?: string;
+  readonly title: string;
+}
+
+interface ProGrantCampaignEntry extends Partial<ProGrantCampaign> {
+  readonly campaign?: ProGrantCampaign;
+  readonly counts?: ProGrantCounts;
+  readonly isDraft?: boolean;
+  readonly pool?: ProGrantPool;
+  readonly roomCodes?: readonly string[];
+  readonly roomLabelPrefix?: string;
+  readonly voucherCounts?: ProGrantCounts;
+}
+
+interface NormalizedProGrantCampaignEntry extends ProGrantCampaignEntry {
+  readonly campaign: ProGrantCampaign;
+}
+
+interface ProGrantConfig {
+  readonly campaign: {
+    readonly endsAt: number | null;
+    readonly perAccountLimit: number;
+    readonly roomCount?: number;
+    readonly roomStartCode?: string;
+    readonly slug: string;
+    readonly startsAt: number;
+    readonly title: string;
+  };
+  readonly isDraft: boolean;
+  readonly roomCodes: readonly string[];
+  readonly roomLabelPrefix: string;
+}
+
+interface ProGrantVoucher {
+  readonly code: string;
+  readonly roomCode: string;
+}
+
+interface ProGrantVoucherBatch {
+  applied?: boolean;
+  readonly campaign: {
+    readonly endsAt: number | null;
+    readonly perAccountLimit: 1;
+    readonly slug: string;
+    readonly startsAt: number;
+    readonly title: string;
+  };
+  readonly exportedAt: string;
+  readonly format: 'mxqr-pro-grant-vouchers-v1';
+  readonly pool: ProGrantPool;
+  readonly requestId: string;
+  readonly roomLabelPrefix: string;
+  readonly vouchers: readonly ProGrantVoucher[];
+  readonly warning: string;
+}
+
+interface ProRoomRecord {
+  readonly activationState: string;
+  readonly createdAt?: AdminTimestamp;
+  label: string;
+  readonly ownerAccountLinked?: boolean;
+  readonly ownerTransferPrepared?: boolean;
+  readonly roomCode: string;
+  readonly roomGeneration: number;
+  readonly status: string;
+  readonly suspensionReason?: string | null;
+}
+
+interface ProGrantInventoryGap {
+  readonly reason: 'missing' | 'provisioning';
+  readonly roomCode: string;
+}
+
+interface ProGrantInventory {
+  readonly needsProvisioning: readonly ProGrantInventoryGap[];
+  readonly ready: readonly ProRoomRecord[];
+  readonly unavailable: readonly ProRoomRecord[];
+}
+
+interface VerifiedProGrantPool {
+  readonly fingerprint: string;
+  readonly inventory: ProGrantInventory;
+  readonly verifiedAt: number;
+}
+
+interface PendingAnnouncementMutation {
+  readonly requestId: string;
+  readonly signature: string;
+}
+
+interface ServiceStatusState {
+  readonly activatedAt: AdminTimestamp;
+  readonly enabled: boolean;
+  readonly revision: number;
+  readonly settlesAt: AdminTimestamp;
+  readonly updatedAt: AdminTimestamp;
+}
+
+interface AdminLatestLoad {
+  readonly controller: AbortController;
+  readonly key: string;
+  readonly sessionEpoch: number;
+}
+
+interface AdminRequestFailure extends Error {
+  code: string;
+  payload?: AdminApiPayload;
+  status?: number;
+}
+
+interface AdminFetchOptions extends Omit<RequestInit, 'headers' | 'method' | 'signal'> {
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly maxResponseBytes?: number;
+  readonly method?: string;
+  readonly sessionBound?: boolean;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
+}
+
+interface AdminApiPayload {
+  readonly suggestions?: readonly AdminTranslationSuggestion[];
+  readonly nextCursor?: string | null;
+  readonly kind?: string;
+  readonly version?: number;
+  readonly exportedAt?: string;
+  readonly drafts?: readonly unknown[];
+  readonly accounts?: AdminAccountSummary | null;
+  readonly active?: boolean;
+  readonly activationUrl?: string;
+  readonly announcement?: AdminAnnouncement;
+  readonly apiKey?: string;
+  readonly articles?: readonly AdminArticle[];
+  readonly authenticated?: boolean;
+  readonly campaign?: ProGrantCampaign;
+  readonly campaigns?: readonly ProGrantCampaignEntry[];
+  readonly cards?: readonly AdminMetricCard[];
+  readonly changed?: boolean;
+  readonly configured?: boolean;
+  readonly count?: number;
+  readonly counts?: ProGrantCounts;
+  readonly error?: string;
+  readonly expiresAt?: AdminTimestamp;
+  readonly generatedAt?: AdminTimestamp;
+  readonly history?: readonly AdminAnnouncementHistory[];
+  readonly keys?: readonly DeveloperApiKey[];
+  readonly key?: DeveloperApiKey;
+  readonly label?: string;
+  readonly lifetime?: AdminLifetimeMetrics | null;
+  readonly mappings?: readonly ProGrantVoucherMapping[];
+  readonly message?: string;
+  readonly maxActiveKeys?: number;
+  readonly ok?: boolean;
+  readonly ownerAccountLinked?: boolean;
+  readonly recoveryUrl?: string;
+  readonly replayed?: boolean;
+  readonly retainedRoomCode?: string;
+  readonly requestId?: string;
+  readonly revision?: number;
+  readonly room?: ProRoomRecord;
+  readonly roomCode?: string;
+  readonly roomGeneration?: number;
+  readonly rooms?: readonly ProRoomRecord[];
+  readonly serviceStatus?: ServiceStatusState;
+  readonly slug?: string;
+  readonly status?: string;
+  readonly summary?: AdminMetricsSummary;
+  readonly suspensionReason?: string | null;
+  readonly targetAccountId?: string;
+  readonly targetNickname?: string;
+  readonly transferUrl?: string;
+  readonly truncated?: boolean;
+  readonly voucherCounts?: ProGrantCounts;
+}
+
+interface AdminAnnouncement {
+  readonly enabled?: boolean;
+  readonly expiresAt?: AdminTimestamp;
+  readonly id?: string;
+  readonly message?: string;
+  readonly updatedAt?: AdminTimestamp;
+}
+
+interface AdminAnnouncementHistory extends AdminAnnouncement {
+  readonly action?: string;
+}
+
+interface AdminArticle {
+  readonly hidden?: boolean;
+  readonly href?: string;
+  readonly pubDate?: AdminTimestamp;
+  readonly slug?: string;
+  readonly source?: string;
+  readonly title?: string;
+}
+
+interface AdminTranslationSuggestion {
+  readonly id: string;
+  readonly locale: string;
+  readonly surface: string;
+  readonly key: string;
+  readonly sourceEn: string;
+  readonly sourceKo: string;
+  readonly current: string;
+  readonly proposed: string;
+  readonly reason: string;
+  readonly author: string;
+  readonly createdAt: number;
+  readonly status: 'pending' | 'approved' | 'rejected' | 'withdrawn';
+  readonly revision: number;
+  readonly votes: number;
+  readonly outdated: boolean;
+  readonly applied: boolean;
+}
+
+interface AdminMetricCard {
+  readonly delta?: number;
+  readonly label?: string;
+  readonly value?: number | string;
+}
+
+interface AdminMetricBucket {
+  readonly events: Readonly<Record<string, number>>;
+  readonly start: string;
+}
+
+interface AdminMetricsSummary {
+  readonly daily?: readonly AdminMetricBucket[];
+  readonly daily30?: readonly AdminMetricBucket[];
+  readonly hourly?: readonly AdminMetricBucket[];
+  readonly last24?: Readonly<Record<string, number>>;
+}
+
+interface AdminAccountSummary {
+  readonly inactiveAccounts: number;
+  readonly inactiveDays: number;
+  readonly nicknameCompleteAccounts: number;
+  readonly totalAccounts: number;
+}
+
+interface AdminLifetimeMetricPoint {
+  readonly guestJoins: number;
+  readonly roomsOpened: number;
+  readonly start: string;
+}
+
+interface AdminLifetimeMetrics {
+  readonly points: readonly AdminLifetimeMetricPoint[];
+  readonly startedAt: AdminTimestamp;
+  readonly totals: {
+    readonly guestJoins: number;
+    readonly roomsOpened: number;
+  };
+}
+
+interface DeveloperApiKey {
+  readonly expiresAt?: AdminTimestamp;
+  readonly keyId?: string;
+  readonly label?: string;
+  readonly lastUsedAt?: AdminTimestamp;
+  readonly lastUsedHour?: AdminTimestamp;
+  readonly scopes?: readonly string[];
+  readonly status?: string;
+}
+
+interface DeveloperApiSecret {
+  readonly apiKey: string;
+  readonly keyId: string;
+}
+
+interface ProGrantVoucherMapping {
+  readonly roomCode?: string;
+  readonly roomGeneration?: number;
+  readonly status?: string;
+  readonly voucherId?: string;
+}
+
+interface ProRoomDestroyDialogElements {
+  readonly cancelButton: HTMLButtonElement;
+  readonly confirmButton: HTMLButtonElement;
+  readonly dialog: HTMLDialogElement;
+  readonly error: HTMLElement;
+  readonly fieldLabel: HTMLElement;
+  readonly form: HTMLFormElement;
+  readonly input: HTMLInputElement;
+  readonly title: HTMLElement;
+}
+
+interface ProRoomLegacyOwnerDetachDialogElements {
+  readonly cancelButton: HTMLButtonElement;
+  readonly confirmButton: HTMLButtonElement;
+  readonly dialog: HTMLDialogElement;
+  readonly error: HTMLElement;
+  readonly form: HTMLFormElement;
+  readonly retainedInput: HTMLInputElement;
+  readonly targetInput: HTMLInputElement;
+  readonly targetLabel: HTMLElement;
+  readonly title: HTMLElement;
+}
+
+interface ProRoomTransferDialogElements {
+  readonly cancelButton: HTMLButtonElement;
+  readonly dialog: HTMLDialogElement;
+  readonly error: HTMLElement;
+  readonly form: HTMLFormElement;
+  readonly input: HTMLInputElement;
+  readonly issueButton: HTMLButtonElement;
+  readonly title: HTMLElement;
+}
+
+interface ProRoomDialogTarget {
+  busy: boolean;
+  readonly requestId?: string;
+  restoreFocus: HTMLElement | null;
+  readonly roomCode: string;
+  readonly roomGeneration: number;
+}
+
+type ProRoomApiRefresh = (message?: string, isError?: boolean, reload?: boolean) => Promise<void>;
+
+const ADMIN_SCRIPT_VERSION = '8.6.61';
+Object.assign(window, { __MXQR_ADMIN_SCRIPT_VERSION__: ADMIN_SCRIPT_VERSION });
+
+function reportUnexpectedAdminActionFailure(error: unknown): void {
+  console.error('[admin] Unexpected asynchronous action failure.', error);
+}
+
+function addAsyncAdminEventListener(
+  target: EventTarget | null,
+  type: string,
+  listener: (event: Event) => Promise<void>,
+): void {
+  target?.addEventListener(type, (event) => {
+    listener(event).catch(reportUnexpectedAdminActionFailure);
+  });
+}
+
+const root = document.querySelector<HTMLElement>('.admin-shell');
+const loginPanel = document.querySelector<HTMLElement>('[data-login-panel]');
+const dashboard = document.querySelector<HTMLElement>('[data-dashboard]');
+const dashboardTitle = document.querySelector<HTMLElement>('[data-dashboard-title]');
+const loginForm = document.querySelector<HTMLFormElement>('[data-login-form]');
+const loginStatus = document.querySelector<HTMLElement>('[data-login-status]');
+const cardsEl = document.querySelector<HTMLElement>('[data-metric-cards]');
+const accountMetricsEl = document.querySelector<HTMLElement>('[data-account-metrics]');
+const hourlyEl = document.querySelector<HTMLElement>('[data-hourly-chart]');
+const dailyEl = document.querySelector<HTMLElement>('[data-daily-list]');
+const monthlyEl = document.querySelector<HTMLElement>('[data-monthly-chart]');
+const signalEl = document.querySelector<HTMLElement>('[data-signal-grid]');
+const lifetimeMetricsEl = document.querySelector<HTMLElement>('[data-lifetime-metrics]');
+const lifetimeChartEl = document.querySelector<HTMLElement>('[data-lifetime-chart]');
+const adminTabs = [...document.querySelectorAll<HTMLButtonElement>('[data-admin-tab]')];
+const adminViews = [...document.querySelectorAll<HTMLElement>('[data-admin-view]')];
+const proRoomForm = document.querySelector<HTMLFormElement>('[data-pro-room-form]');
+const proRoomCodeEl = document.querySelector<HTMLInputElement>('[data-pro-room-code]');
+const proRoomLabelEl = document.querySelector<HTMLInputElement>('[data-pro-room-label]');
+const proRoomRegisterBtn = document.querySelector<HTMLButtonElement>('[data-pro-room-register]');
+const proRoomStatusEl = document.querySelector<HTMLElement>('[data-pro-room-status]');
+const proRoomListStatusEl = document.querySelector<HTMLElement>('[data-pro-room-list-status]');
+const proRoomListEl = document.querySelector<HTMLElement>('[data-pro-room-list]');
+const proRoomSearchEl = document.querySelector<HTMLInputElement>('[data-pro-room-search]');
+const proRoomClaimEl = document.querySelector<HTMLElement>('[data-pro-room-claim]');
+const proRoomClaimTitleEl = document.querySelector<HTMLElement>('[data-pro-room-claim-title]');
+const proRoomClaimExpiryEl = document.querySelector<HTMLElement>('[data-pro-room-claim-expiry]');
+const proRoomClaimUrlEl = document.querySelector<HTMLInputElement>('[data-pro-room-claim-url]');
+const proRoomClaimCopyBtn = document.querySelector<HTMLButtonElement>('[data-pro-room-claim-copy]');
+const proRoomClaimDismissBtn = document.querySelector<HTMLButtonElement>(
+  '[data-pro-room-claim-dismiss]',
+);
+const articleListEl = document.querySelector<HTMLElement>('[data-article-list]');
+const articleStatusEl = document.querySelector<HTMLElement>('[data-article-status]');
+const translationListEl = document.querySelector<HTMLElement>('[data-translation-list]');
+const translationStatusEl = document.querySelector<HTMLElement>('[data-translation-status]');
+const translationStatusFilter = document.querySelector<HTMLSelectElement>(
+  '[data-translation-status-filter]',
+);
+const translationLocaleFilter = document.querySelector<HTMLInputElement>(
+  '[data-translation-locale-filter]',
+);
+const translationMoreBtn = document.querySelector<HTMLButtonElement>('[data-translation-more]');
+const translationExportBtn = document.querySelector<HTMLButtonElement>('[data-translation-export]');
+let translationsLoaded = false;
+let translationNextCursor: string | null = null;
+const announcementForm = document.querySelector<HTMLFormElement>('[data-announcement-form]');
+const announcementMessageEl = document.querySelector<HTMLTextAreaElement>(
+  '[data-announcement-message]',
+);
+const announcementEnabledEl = document.querySelector<HTMLInputElement>(
+  '[data-announcement-enabled]',
+);
+const announcementExpiresEl = document.querySelector<HTMLInputElement>(
+  '[data-announcement-expires]',
+);
+const announcementStatusEl = document.querySelector<HTMLElement>('[data-announcement-status]');
+const announcementPreviewEl = document.querySelector<HTMLElement>('[data-announcement-preview]');
+const announcementClearBtn = document.querySelector<HTMLButtonElement>('[data-announcement-clear]');
+const announcementHistoryStatusEl = document.querySelector<HTMLElement>(
+  '[data-announcement-history-status]',
+);
+const announcementHistoryListEl = document.querySelector<HTMLElement>(
+  '[data-announcement-history-list]',
+);
+const announcementTabEl = document.querySelector<HTMLButtonElement>(
+  '[data-admin-tab="announcements"]',
+);
+const serviceStatusTrigger = document.querySelector<HTMLButtonElement>(
+  '[data-service-status-trigger]',
+);
+const serviceStatusDot = document.querySelector<HTMLElement>('[data-service-status-dot]');
+const serviceStatusLabel = document.querySelector<HTMLElement>('[data-service-status-label]');
+const serviceStatusPanel = document.querySelector<HTMLElement>('[data-service-status-panel]');
+const serviceStatusConfirmation = document.querySelector<HTMLElement>(
+  '[data-service-status-confirmation]',
+);
+const serviceStatusConfirmationCopy = document.querySelector<HTMLElement>(
+  '[data-service-status-confirmation-copy]',
+);
+const serviceStatusChangeBtn = document.querySelector<HTMLButtonElement>(
+  '[data-service-status-change]',
+);
+const serviceStatusStateEl = document.querySelector<HTMLElement>('[data-service-status-state]');
+const serviceStatusDescriptionEl = document.querySelector<HTMLElement>(
+  '[data-service-status-description]',
+);
+const serviceStatusUpdatedAtEl = document.querySelector<HTMLElement>(
+  '[data-service-status-updated]',
+);
+const serviceStatusErrorEl = document.querySelector<HTMLElement>('[data-service-status-error]');
+const serviceStatusConfirmBtn = document.querySelector<HTMLButtonElement>(
+  '[data-service-status-confirm]',
+);
+const serviceStatusPreviewBtn = document.querySelector<HTMLButtonElement>(
+  '[data-service-status-preview]',
+);
+const serviceStatusCancelBtns = [
+  ...document.querySelectorAll<HTMLButtonElement>('[data-service-status-cancel]'),
+];
+const serviceHistoryStatusEl = document.querySelector<HTMLElement>('[data-service-history-status]');
+const serviceHistoryListEl = document.querySelector<HTMLElement>('[data-service-history-list]');
+const serviceHistoryRefreshBtn = document.querySelector<HTMLButtonElement>(
+  '[data-service-history-refresh]',
+);
+const updatedAtEl = document.querySelector<HTMLElement>('[data-updated-at]');
+const refreshBtn = document.querySelector<HTMLButtonElement>('[data-refresh]');
+const logoutBtn = document.querySelector<HTMLButtonElement>('[data-logout]');
+
+const formatter = new Intl.NumberFormat();
+const ADMIN_REQUEST_TIMEOUT_MS = 20_000;
+const ADMIN_RESPONSE_MAX_BYTES = 1_048_576;
+let proRoomsLoaded = false;
+let proRoomsSnapshot: readonly ProRoomRecord[] = [];
+let proRoomSearchTimer: number | null = null;
+let articlesLoaded = false;
+let announcementLoaded = false;
+let currentAnnouncementRevision: number | null = null;
+let pendingAnnouncementMutation: PendingAnnouncementMutation | null = null;
+let announcementMutationBusy = false;
+let serviceStatusLoaded = false;
+let currentServiceStatus: ServiceStatusState | null = null;
+let serviceStatusBusy = false;
+let serviceStatusConfirmationRevision: number | null = null;
+let serviceStatusRestoreConfirmationFocus = false;
+let serviceStatusRequestId: string | null = null;
+let serviceStatusSettleTimer: number | null = null;
+let announcementExpiryTimer: number | null = null;
+let adminSessionEpoch = 0;
+let adminLogoutInFlight: Promise<AdminApiPayload | void> | null = null;
+const adminRequestControllers = new Set<AbortController>();
+const adminLatestLoads = new Map<string, AbortController>();
+const issuedActivationLinks = new Set<string>();
+const issuedOwnerRecoveryLinks = new Set<string>();
+const issuedOwnerTransferLinks = new Set<string>();
+const expandedProRooms = new Set<string>();
+const proRoomApiCache = new Map<string, AdminApiPayload>();
+const proRoomApiSecrets = new Map<string, DeveloperApiSecret>();
+const proRoomApiIssuanceOwners = new Map<string, symbol>();
+const proRoomApiRequestGenerations = new Map<string, number>();
+let proRoomDestroyDialogElements: ProRoomDestroyDialogElements | null = null;
+let proRoomDestroyTarget: ProRoomDialogTarget | null = null;
+let proRoomLegacyOwnerDetachDialogElements: ProRoomLegacyOwnerDetachDialogElements | null = null;
+let proRoomLegacyOwnerDetachTarget: ProRoomDialogTarget | null = null;
+let proRoomTransferDialogElements: ProRoomTransferDialogElements | null = null;
+let proRoomTransferTarget: ProRoomDialogTarget | null = null;
+let visibleProRoomClaimIncarnation: string | null = null;
+let proGrantCampaignLoaded = false;
+let proGrantCampaignState: NormalizedProGrantCampaignEntry | null = null;
+let proGrantCampaigns: NormalizedProGrantCampaignEntry[] = [];
+let selectedProGrantCampaignSlug: string | null = null;
+let proGrantCampaignDraft: NormalizedProGrantCampaignEntry | null = null;
+let verifiedProGrantPool: VerifiedProGrantPool | null = null;
+let proGrantCampaignBusy = false;
+let pendingProGrantVoucherExport: ProGrantVoucherBatch | null = null;
+let proGrantCampaignPanelEl: HTMLElement | null = null;
+let proGrantCampaignListEl: HTMLElement | null = null;
+let proGrantCampaignDetailEl: HTMLElement | null = null;
+let proGrantCampaignTitleEl: HTMLElement | null = null;
+let proGrantCampaignMetaEl: HTMLElement | null = null;
+let proGrantCampaignEventLinkEl: HTMLElement | null = null;
+let proGrantCampaignStateEl: HTMLElement | null = null;
+let proGrantCampaignStatusEl: HTMLElement | null = null;
+let proGrantCampaignCountsEl: HTMLElement | null = null;
+let proGrantCampaignNewBtn: HTMLButtonElement | null = null;
+let proGrantCampaignImportBtn: HTMLButtonElement | null = null;
+let proGrantCampaignImportInput: HTMLInputElement | null = null;
+let proGrantCampaignFormEl: HTMLFormElement | null = null;
+let proGrantCampaignFormCancelBtn: HTMLButtonElement | null = null;
+let proGrantCampaignVerifyBtn: HTMLButtonElement | null = null;
+let proGrantCampaignCreateBtn: HTMLButtonElement | null = null;
+let proGrantCampaignApplyBtn: HTMLButtonElement | null = null;
+let proGrantCampaignPauseBtn: HTMLButtonElement | null = null;
+let proGrantCampaignEndBtn: HTMLButtonElement | null = null;
+let proGrantCampaignRevokeBtn: HTMLButtonElement | null = null;
+let proGrantCampaignExportEl: HTMLElement | null = null;
+let proGrantCampaignDownloadBtn: HTMLButtonElement | null = null;
+let proGrantCampaignCopyBtn: HTMLButtonElement | null = null;
+let proGrantCampaignLinkCopyBtn: HTMLButtonElement | null = null;
+const PRO_GRANT_ASAMO_SLUG = 'asamo-0';
+const PRO_GRANT_ASAMO_TITLE = 'MUSIXQUARE ASAMO Event';
+const PRO_GRANT_ASAMO_ROOM_CODES = Object.freeze(
+  Array.from({ length: 50 }, (_, index) => String(100 + index).padStart(6, '0')),
+);
+const PRO_GRANT_MAX_CAMPAIGN_ROOMS = 100;
+const PRO_GRANT_BUILTIN_CAMPAIGNS = Object.freeze({
+  [PRO_GRANT_ASAMO_SLUG]: Object.freeze({
+    slug: PRO_GRANT_ASAMO_SLUG,
+    title: PRO_GRANT_ASAMO_TITLE,
+    roomCodes: PRO_GRANT_ASAMO_ROOM_CODES,
+    roomLabelPrefix: 'ASAMO 0',
+  }),
+});
+
+function proGrantBuiltinCampaign(slug: unknown) {
+  return slug === PRO_GRANT_ASAMO_SLUG ? PRO_GRANT_BUILTIN_CAMPAIGNS[PRO_GRANT_ASAMO_SLUG] : null;
+}
+
+function proGrantCampaignDisplayTitle(
+  campaign: { slug?: unknown; title?: unknown } | null | undefined,
+): string {
+  if (campaign?.slug === PRO_GRANT_ASAMO_SLUG) return PRO_GRANT_ASAMO_TITLE;
+  return typeof campaign?.title === 'string' ? campaign.title : '';
+}
+const PRO_GRANT_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+const PRO_GRANT_VOUCHER_CODE_RE = /^MXQ(?:-[0-9A-HJKMNP-TV-Z]{5}){4}$/;
+const PRO_GRANT_BATCH_REQUEST_ID_RE = /^batch_[A-Za-z0-9_-]{22}$/;
+const PRO_GRANT_VOUCHER_FILE_MAX_BYTES = 256 * 1024;
+const PRO_GRANT_ROOM_PROVISION_CONCURRENCY = 4;
+const developerApiScopeLabels: Readonly<Record<string, string>> = Object.freeze({
+  'room:read': 'Room',
+  'playback:read': 'Playback read',
+  'playback:control': 'Playback control',
+  'queue:read': 'Playlist read',
+  'queue:write': 'Playlist write',
+  'media:upload': 'File upload',
+  'effects:read': 'Effects read',
+  'effects:control': 'Effects control',
+});
+const developerApiPresets: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  read: ['room:read', 'playback:read', 'queue:read', 'effects:read'],
+  playlist: [
+    'room:read',
+    'playback:read',
+    'playback:control',
+    'queue:read',
+    'queue:write',
+    'media:upload',
+    'effects:read',
+  ],
+  full: Object.keys(developerApiScopeLabels),
+});
+
+function createAdminRequestId(): string {
+  if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function bytesToAdminBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '');
+}
+
+function createProGrantBatchRequestId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return `batch_${bytesToAdminBase64Url(bytes)}`;
+}
+
+function createProGrantVoucherCode(): string {
+  const entropy = new Uint8Array(13);
+  crypto.getRandomValues(entropy);
+  let bits = 0;
+  let bitCount = 0;
+  let encoded = '';
+  for (const byte of entropy) {
+    bits = (bits << 8) | byte;
+    bitCount += 8;
+    while (bitCount >= 5 && encoded.length < 20) {
+      bitCount -= 5;
+      encoded += PRO_GRANT_CODE_ALPHABET[(bits >>> bitCount) & 31] ?? '';
+      bits &= (1 << bitCount) - 1;
+    }
+  }
+  if (encoded.length !== 20) throw new Error('Secure voucher generation failed.');
+  return `MXQ-${encoded.slice(0, 5)}-${encoded.slice(5, 10)}-${encoded.slice(10, 15)}-${encoded.slice(15)}`;
+}
+
+function campaignRoomCodesFromRange(startCode: unknown, roomCount: unknown): readonly string[] {
+  const normalizedStart = normalizeProRoomCode(startCode);
+  const normalizedCount = Number(roomCount);
+  if (
+    !normalizedStart ||
+    !Number.isSafeInteger(normalizedCount) ||
+    normalizedCount < 1 ||
+    normalizedCount > PRO_GRANT_MAX_CAMPAIGN_ROOMS
+  ) {
+    throw new Error(
+      `Check the first room code and room count (max ${PRO_GRANT_MAX_CAMPAIGN_ROOMS}).`,
+    );
+  }
+  const first = Number(normalizedStart);
+  const last = first + normalizedCount - 1;
+  if (last > 99_999)
+    throw new Error('The range exceeds six-digit PRO room codes beginning with 0.');
+  return Object.freeze(
+    Array.from({ length: normalizedCount }, (_, index) => String(first + index).padStart(6, '0')),
+  );
+}
+
+function normalizeCampaignTimestamp(
+  value: AdminTimestamp,
+  fallback: number | null = null,
+): number | null {
+  if (value === null || value === undefined || value === '') return fallback;
+  const number = typeof value === 'number' ? value : new Date(value).getTime();
+  return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+}
+
+function formatCampaignLocalDateTime(value: AdminTimestamp): string {
+  const timestamp = normalizeCampaignTimestamp(value);
+  if (timestamp === null) return '';
+  const date = new Date(timestamp);
+  const offset = date.getTimezoneOffset() * 60_000;
+  return new Date(timestamp - offset).toISOString().slice(0, 16);
+}
+
+function parseCampaignLocalDateTime(
+  value: unknown,
+  { required = false }: { readonly required?: boolean } = {},
+): number | null {
+  const normalized = String(value || '').trim();
+  if (!normalized && !required) return null;
+  const timestamp = new Date(normalized).getTime();
+  if (!Number.isSafeInteger(timestamp) || timestamp < 0) {
+    throw new Error(required ? 'Enter a start time.' : 'Check the end time.');
+  }
+  return timestamp;
+}
+
+function proGrantCampaignRoomCodes(
+  entry: ProGrantCampaignEntry | null | undefined,
+): readonly string[] {
+  const campaign = entry?.campaign || entry;
+  const explicit = entry?.roomCodes || campaign?.roomCodes;
+  if (Array.isArray(explicit) && explicit.length > 0) {
+    const normalized = explicit.map(normalizeProRoomCode);
+    const valid = normalized.filter((roomCode): roomCode is string => roomCode !== null);
+    if (valid.length === normalized.length && new Set(valid).size === normalized.length) {
+      return Object.freeze(valid);
+    }
+  }
+  const builtin = proGrantBuiltinCampaign(campaign?.slug);
+  if (builtin) return builtin.roomCodes;
+  const pool = entry?.pool || campaign?.pool;
+  if (pool && typeof pool === 'object') {
+    const firstRoomCode = normalizeProRoomCode(pool.firstRoomCode);
+    const lastRoomCode = normalizeProRoomCode(pool.lastRoomCode);
+    const roomCount = Number(pool.roomCount);
+    if (
+      firstRoomCode &&
+      lastRoomCode &&
+      Number.isSafeInteger(roomCount) &&
+      roomCount > 0 &&
+      Number(lastRoomCode) - Number(firstRoomCode) + 1 === roomCount
+    ) {
+      try {
+        return campaignRoomCodesFromRange(firstRoomCode, roomCount);
+      } catch {
+        return Object.freeze([]);
+      }
+    }
+    return Object.freeze([]);
+  }
+  const startCode =
+    entry?.roomStartCode ||
+    campaign?.roomStartCode ||
+    entry?.firstRoomCode ||
+    campaign?.firstRoomCode;
+  const roomCount = Number(entry?.roomCount || campaign?.roomCount);
+  try {
+    return campaignRoomCodesFromRange(startCode, roomCount);
+  } catch {
+    return Object.freeze([]);
+  }
+}
+
+function proGrantCampaignConfig(
+  entry: ProGrantCampaignEntry | null = selectedProGrantCampaign(),
+): ProGrantConfig | null {
+  if (!entry) return null;
+  const campaign = entry.campaign || entry;
+  const roomCodes = proGrantCampaignRoomCodes(entry);
+  const builtin = proGrantBuiltinCampaign(campaign.slug);
+  const startsAt = normalizeCampaignTimestamp(campaign.startsAt, Date.now());
+  if (
+    startsAt === null ||
+    typeof campaign.slug !== 'string' ||
+    typeof campaign.title !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    campaign: {
+      slug: campaign.slug,
+      title: campaign.title,
+      startsAt,
+      endsAt: normalizeCampaignTimestamp(campaign.endsAt),
+      perAccountLimit: Number(campaign.perAccountLimit) || 1,
+      ...(roomCodes.length > 0 ? { roomStartCode: roomCodes[0], roomCount: roomCodes.length } : {}),
+    },
+    roomCodes,
+    roomLabelPrefix:
+      entry.roomLabelPrefix || builtin?.roomLabelPrefix || String(campaign.title || campaign.slug),
+    isDraft: entry.isDraft === true,
+  };
+}
+
+function selectedProGrantCampaign(): NormalizedProGrantCampaignEntry | null {
+  if (
+    proGrantCampaignDraft?.campaign?.slug &&
+    proGrantCampaignDraft.campaign.slug === selectedProGrantCampaignSlug
+  ) {
+    return proGrantCampaignDraft;
+  }
+  return (
+    proGrantCampaigns.find(
+      (entry) => (entry?.campaign?.slug || entry?.slug) === selectedProGrantCampaignSlug,
+    ) || null
+  );
+}
+
+function createProGrantVoucherExport(
+  config: ProGrantConfig | null = proGrantCampaignConfig(),
+): ProGrantVoucherBatch {
+  if (!config?.campaign?.slug || config.roomCodes.length === 0) {
+    throw new Error('Review the event and room range first.');
+  }
+  const requestId = createProGrantBatchRequestId();
+  const seen = new Set<string>();
+  const vouchers = config.roomCodes.map((roomCode) => {
+    let code: string;
+    do code = createProGrantVoucherCode();
+    while (seen.has(code));
+    seen.add(code);
+    return { roomCode, code };
+  });
+  const firstRoomCode = config.roomCodes[0];
+  const lastRoomCode = config.roomCodes.at(-1);
+  if (!firstRoomCode || !lastRoomCode) throw new Error('Voucher room range is empty.');
+  return {
+    format: 'mxqr-pro-grant-vouchers-v1',
+    warning: 'PLAINTEXT VOUCHER CODES. Store and distribute securely.',
+    exportedAt: new Date().toISOString(),
+    requestId,
+    campaign: {
+      slug: config.campaign.slug,
+      title: config.campaign.title,
+      startsAt: config.campaign.startsAt,
+      endsAt: config.campaign.endsAt,
+      perAccountLimit: 1,
+    },
+    pool: {
+      firstRoomCode,
+      lastRoomCode,
+      roomCount: config.roomCodes.length,
+    },
+    roomLabelPrefix: config.roomLabelPrefix,
+    vouchers,
+  };
+}
+
+function proGrantVoucherFilename(batch: ProGrantVoucherBatch | null): string {
+  const suffix = String(batch?.requestId || '').replace(/^batch_/u, '');
+  const slug = String(batch?.campaign?.slug || 'pro-event');
+  return `${slug}-${suffix || 'vouchers'}.json`;
+}
+
+function objectHasOnlyKeys(
+  value: unknown,
+  allowed: readonly string[],
+): value is Record<string, unknown> {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).every((key) => allowed.includes(key))
+  );
+}
+
+function parseProGrantVoucherExport(value: unknown): ProGrantVoucherBatch {
+  if (
+    !objectHasOnlyKeys(value, [
+      'format',
+      'warning',
+      'exportedAt',
+      'requestId',
+      'campaign',
+      'pool',
+      'roomLabelPrefix',
+      'vouchers',
+    ]) ||
+    value.format !== 'mxqr-pro-grant-vouchers-v1' ||
+    typeof value.warning !== 'string' ||
+    typeof value.exportedAt !== 'string' ||
+    !Number.isFinite(Date.parse(value.exportedAt)) ||
+    typeof value.requestId !== 'string' ||
+    !PRO_GRANT_BATCH_REQUEST_ID_RE.test(value.requestId)
+  ) {
+    throw new Error('The code file is unsupported or corrupted.');
+  }
+  const campaign = value.campaign;
+  if (
+    !objectHasOnlyKeys(campaign, ['slug', 'title', 'startsAt', 'endsAt', 'perAccountLimit']) ||
+    typeof campaign.slug !== 'string' ||
+    !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(campaign.slug || '') ||
+    campaign.slug.length > 63 ||
+    typeof campaign.title !== 'string' ||
+    campaign.title.trim() !== campaign.title ||
+    campaign.title.length < 1 ||
+    campaign.title.length > 100 ||
+    !Number.isSafeInteger(campaign.startsAt) ||
+    typeof campaign.startsAt !== 'number' ||
+    campaign.startsAt < 0 ||
+    (campaign.endsAt !== null &&
+      (typeof campaign.endsAt !== 'number' ||
+        !Number.isSafeInteger(campaign.endsAt) ||
+        campaign.endsAt <= campaign.startsAt)) ||
+    campaign.perAccountLimit !== 1
+  ) {
+    throw new Error('The event details in the code file are invalid.');
+  }
+  if (
+    !Array.isArray(value.vouchers) ||
+    value.vouchers.length < 1 ||
+    value.vouchers.length > PRO_GRANT_MAX_CAMPAIGN_ROOMS
+  ) {
+    throw new Error('The redemption-code count in the code file is invalid.');
+  }
+  const seenCodes = new Set<string>();
+  const seenRooms = new Set<string>();
+  const vouchers = value.vouchers.map((voucher) => {
+    if (
+      !objectHasOnlyKeys(voucher, ['roomCode', 'code']) ||
+      typeof voucher.roomCode !== 'string' ||
+      !/^0\d{5}$/u.test(voucher.roomCode) ||
+      seenRooms.has(voucher.roomCode) ||
+      typeof voucher.code !== 'string' ||
+      !PRO_GRANT_VOUCHER_CODE_RE.test(voucher.code) ||
+      seenCodes.has(voucher.code)
+    ) {
+      throw new Error('A room code or redemption code in the file is invalid.');
+    }
+    seenRooms.add(voucher.roomCode);
+    seenCodes.add(voucher.code);
+    return { roomCode: voucher.roomCode, code: voucher.code };
+  });
+  const firstVoucher = vouchers[0];
+  if (!firstVoucher) throw new Error('Voucher file contains no vouchers.');
+  const roomCodes = campaignRoomCodesFromRange(firstVoucher.roomCode, vouchers.length);
+  if (vouchers.some((voucher, index) => voucher.roomCode !== roomCodes[index])) {
+    throw new Error('Room codes in the file must form a contiguous ascending range.');
+  }
+  if (value.pool !== undefined) {
+    const pool = value.pool;
+    if (
+      !objectHasOnlyKeys(pool, ['firstRoomCode', 'lastRoomCode', 'roomCount']) ||
+      pool.firstRoomCode !== roomCodes[0] ||
+      pool.lastRoomCode !== roomCodes.at(-1) ||
+      pool.roomCount !== roomCodes.length
+    ) {
+      throw new Error('The room ranges in the code file do not match.');
+    }
+  }
+  const roomLabelPrefix =
+    value.roomLabelPrefix === undefined ? campaign.title : String(value.roomLabelPrefix);
+  if (
+    !roomLabelPrefix ||
+    roomLabelPrefix.length > 100 ||
+    roomLabelPrefix.trim() !== roomLabelPrefix
+  ) {
+    throw new Error('The room label in the code file is invalid.');
+  }
+  return {
+    format: value.format,
+    warning: value.warning,
+    exportedAt: value.exportedAt,
+    requestId: value.requestId,
+    campaign: {
+      slug: campaign.slug,
+      title: campaign.title,
+      startsAt: campaign.startsAt,
+      endsAt: campaign.endsAt,
+      perAccountLimit: campaign.perAccountLimit,
+    },
+    pool: {
+      firstRoomCode: firstVoucher.roomCode,
+      lastRoomCode: vouchers.at(-1)?.roomCode ?? firstVoucher.roomCode,
+      roomCount: roomCodes.length,
+    },
+    roomLabelPrefix,
+    vouchers,
+  };
+}
+
+function sameImportedCampaign(
+  existing: ProGrantCampaignEntry | null | undefined,
+  imported: ProGrantVoucherBatch['campaign'],
+): boolean {
+  if (!existing) return true;
+  const campaign = existing.campaign || existing;
+  return (
+    campaign.slug === imported.slug &&
+    campaign.title === imported.title &&
+    normalizeCampaignTimestamp(campaign.startsAt) === imported.startsAt &&
+    normalizeCampaignTimestamp(campaign.endsAt) === imported.endsAt &&
+    Number(campaign.perAccountLimit) === imported.perAccountLimit
+  );
+}
+
+async function importProGrantVoucherExport(file: File | null | undefined): Promise<void> {
+  if (!file || proGrantCampaignBusy) return;
+  const sessionEpoch = adminSessionEpoch;
+  setProGrantCampaignBusy(true);
+  try {
+    if (
+      !Number.isSafeInteger(file.size) ||
+      file.size < 1 ||
+      file.size > PRO_GRANT_VOUCHER_FILE_MAX_BYTES
+    ) {
+      throw new Error('The code file must be a JSON file no larger than 256 KB.');
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch {
+      throw new Error('The code file could not be read. Check that it is valid JSON.');
+    }
+    if (sessionEpoch !== adminSessionEpoch) return;
+    const batch = parseProGrantVoucherExport(parsed);
+    if (pendingProGrantVoucherExport && pendingProGrantVoucherExport.applied !== true) {
+      const { applied: _applied, ...pendingBatch } = pendingProGrantVoucherExport;
+      if (
+        pendingBatch.requestId !== batch.requestId ||
+        JSON.stringify(pendingBatch) !== JSON.stringify(batch)
+      ) {
+        throw new Error(
+          `A code file for “${proGrantCampaignDisplayTitle(pendingProGrantVoucherExport.campaign)}” is already waiting to be applied.`,
+        );
+      }
+    }
+    await loadProGrantCampaignStatus();
+    if (sessionEpoch !== adminSessionEpoch) return;
+    const existing = proGrantCampaigns.find(
+      (entry) => (entry.campaign || entry).slug === batch.campaign.slug,
+    );
+    const existingCampaign = existing?.campaign || existing;
+    if (existingCampaign?.status && ['ended', 'revoked'].includes(existingCampaign.status)) {
+      throw new Error('A code file cannot be imported into an event that has ended.');
+    }
+    if (!sameImportedCampaign(existing, batch.campaign)) {
+      throw new Error('The event details stored on the server do not match the code file.');
+    }
+    const existingRoomCodes = proGrantCampaignRoomCodes(existing);
+    if (
+      existingRoomCodes.length > 0 &&
+      (existingRoomCodes.length !== batch.vouchers.length ||
+        existingRoomCodes.some((roomCode, index) => roomCode !== batch.vouchers[index]?.roomCode))
+    ) {
+      throw new Error('The room range stored on the server does not match the code file.');
+    }
+    pendingProGrantVoucherExport = batch;
+    proGrantCampaignDraft = {
+      campaign: {
+        ...batch.campaign,
+        status: existingCampaign?.status || 'not-created',
+        roomStartCode: batch.pool.firstRoomCode,
+        roomCount: batch.pool.roomCount,
+      },
+      counts: existing?.counts || {},
+      pool: { ...batch.pool },
+      roomCodes: batch.vouchers.map((voucher) => voucher.roomCode),
+      roomLabelPrefix: batch.roomLabelPrefix,
+      isDraft: true,
+    };
+    selectedProGrantCampaignSlug = batch.campaign.slug;
+    proGrantCampaignState = proGrantCampaignDraft;
+    verifiedProGrantPool = null;
+    closeProGrantCampaignForm();
+    renderProGrantCampaignState(proGrantCampaignDraft);
+    setProGrantCampaignMessage(
+      `Loaded ${formatter.format(batch.vouchers.length)} codes for “${proGrantCampaignDisplayTitle(batch.campaign)}” into memory. You can safely continue the same batch at step 3.`,
+    );
+  } finally {
+    setProGrantCampaignBusy(false);
+  }
+}
+
+function downloadProGrantVoucherExport(
+  batch: ProGrantVoucherBatch | null = pendingProGrantVoucherExport,
+): boolean {
+  if (!batch) return false;
+  const { applied: _applied, ...exportedBatch } = batch;
+  const blob = new Blob([`${JSON.stringify(exportedBatch, null, 2)}\n`], {
+    type: 'application/json;charset=utf-8',
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = proGrantVoucherFilename(batch);
+  link.rel = 'noopener';
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  return true;
+}
+
+async function copyProGrantVoucherExport(
+  batch: ProGrantVoucherBatch | null = pendingProGrantVoucherExport,
+): Promise<boolean> {
+  if (!batch || !navigator.clipboard?.writeText) return false;
+  const text = batch.vouchers.map((voucher) => `${voucher.roomCode}\t${voucher.code}`).join('\n');
+  await navigator.clipboard.writeText(text);
+  return true;
+}
+
+function classifyProGrantRoomInventory(
+  payload: AdminApiPayload,
+  roomCodes: readonly string[],
+): ProGrantInventory {
+  if (!payload || !Array.isArray(payload.rooms)) {
+    throw new Error('PRO room inventory response is invalid.');
+  }
+  const requested = new Set(roomCodes);
+  const found = new Map<string, ProRoomRecord>();
+  for (const room of payload.rooms) {
+    if (!requested.has(room?.roomCode)) continue;
+    if (
+      found.has(room.roomCode) ||
+      !Number.isSafeInteger(room.roomGeneration) ||
+      room.roomGeneration < 0 ||
+      typeof room.status !== 'string' ||
+      !['unactivated', 'active'].includes(room.activationState)
+    ) {
+      throw new Error('PRO room inventory contains an invalid room record.');
+    }
+    found.set(room.roomCode, room);
+  }
+  const ready: ProRoomRecord[] = [];
+  const needsProvisioning: ProGrantInventoryGap[] = [];
+  const unavailable: ProRoomRecord[] = [];
+  for (const roomCode of roomCodes) {
+    const room = found.get(roomCode);
+    if (!room) {
+      needsProvisioning.push({ roomCode, reason: 'missing' });
+    } else if (room.status === 'registered' && room.activationState === 'unactivated') {
+      ready.push(room);
+    } else if (room.status === 'provisioning' && room.activationState === 'unactivated') {
+      needsProvisioning.push({ roomCode, reason: 'provisioning' });
+    } else {
+      unavailable.push(room);
+    }
+  }
+  return { ready, needsProvisioning, unavailable };
+}
+
+async function loadProGrantRoomInventory(roomCodes: readonly string[]): Promise<ProGrantInventory> {
+  return classifyProGrantRoomInventory(await fetchJson('/api/admin/pro-rooms'), roomCodes);
+}
+
+function validateAsamoProvisionedRoom(
+  payload: AdminApiPayload,
+  roomCode: string,
+  label: string,
+): ProRoomRecord {
+  const room = payload?.room;
+  if (
+    room?.roomCode !== roomCode ||
+    room?.label !== label ||
+    !Number.isSafeInteger(room?.roomGeneration) ||
+    room.roomGeneration < 0 ||
+    room.status !== 'registered' ||
+    room.activationState !== 'unactivated'
+  ) {
+    throw new Error(`PRO room ${roomCode} provisioning response is invalid.`);
+  }
+  return room;
+}
+
+async function mapProGrantRoomPool<Item, Result>(
+  items: readonly Item[],
+  operation: (item: Item, index: number) => Promise<Result>,
+): Promise<Result[]> {
+  const results: Result[] = [];
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(PRO_GRANT_ROOM_PROVISION_CONCURRENCY, items.length) },
+    async () => {
+      while (cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        const item = items[index];
+        if (item === undefined) break;
+        results[index] = await operation(item, index);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+async function provisionProGrantRoomPool(config: ProGrantConfig) {
+  const before = await loadProGrantRoomInventory(config.roomCodes);
+  if (before.unavailable.length > 0) {
+    return { replayOnly: true, inventory: before, rooms: [] };
+  }
+  const rooms = await mapProGrantRoomPool(config.roomCodes, async (roomCode) => {
+    const label = `${String(config.roomLabelPrefix).slice(0, 55)} · ${roomCode}`;
+    return validateAsamoProvisionedRoom(
+      await fetchJson('/api/admin/pro-rooms', {
+        method: 'POST',
+        body: JSON.stringify({ roomCode, label }),
+      }),
+      roomCode,
+      label,
+    );
+  });
+  const after = await loadProGrantRoomInventory(config.roomCodes);
+  if (
+    after.ready.length !== config.roomCodes.length ||
+    after.needsProvisioning.length > 0 ||
+    after.unavailable.length > 0
+  ) {
+    throw new Error('Not every event room is safely prepared in an inactive state.');
+  }
+  return { replayOnly: false, inventory: after, rooms };
+}
+
+function mountProGrantCampaignPanel(): void {
+  const registerPanel = document.querySelector<HTMLElement>('.pro-room-register-panel');
+  if (!registerPanel || document.querySelector('[data-pro-grant-campaign]')) return;
+  const panel = document.createElement('section');
+  panel.className = 'panel pro-grant-campaign-panel';
+  panel.dataset.proGrantCampaign = '';
+  panel.innerHTML = `
+    <div class="panel-head pro-grant-campaign-head">
+      <div>
+        <h2>PRO Events</h2>
+        <p>Create events and manage redemption progress and publication status in one place.</p>
+      </div>
+      <div class="pro-grant-head-actions">
+        <button class="is-secondary" type="button" data-pro-grant-import>Import code file</button>
+        <button class="is-secondary" type="button" data-pro-grant-new>New event</button>
+        <input data-pro-grant-import-input type="file" accept="application/json,.json" hidden>
+      </div>
+    </div>
+    <form class="pro-grant-campaign-form" data-pro-grant-create-form hidden>
+      <div class="pro-grant-form-heading">
+        <div>
+          <h3>New event</h3>
+          <p>Room ranges are checked for conflicts before anything is saved.</p>
+        </div>
+        <button class="is-quiet" type="button" data-pro-grant-form-cancel>Close</button>
+      </div>
+      <div class="pro-grant-form-grid">
+        <label class="pro-room-field pro-grant-form-wide">
+          <span>Event name</span>
+          <input name="title" maxlength="80" autocomplete="off" placeholder="MUSIXQUARE ASAMO Event" required>
+        </label>
+        <label class="pro-room-field">
+          <span>URL slug</span>
+          <input name="slug" maxlength="48" inputmode="url" autocomplete="off" placeholder="asamo-1" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" required>
+          <small>musixquare.com/events/<b data-pro-grant-slug-preview>event</b>/</small>
+        </label>
+        <label class="pro-room-field">
+          <span>First room code</span>
+          <input name="roomStartCode" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="000200" pattern="0[0-9]{5}" required>
+        </label>
+        <label class="pro-room-field">
+          <span>Room count</span>
+          <input name="roomCount" type="number" min="1" max="${PRO_GRANT_MAX_CAMPAIGN_ROOMS}" value="50" required>
+        </label>
+        <label class="pro-room-field">
+          <span>Starts</span>
+          <input name="startsAt" type="datetime-local" required>
+        </label>
+        <label class="pro-room-field">
+          <span>Automatic end (optional)</span>
+          <input name="endsAt" type="datetime-local">
+        </label>
+      </div>
+      <p class="pro-grant-range-preview" data-pro-grant-range-preview>Enter a first room code and room count.</p>
+      <button type="submit">Review event</button>
+    </form>
+    <div class="pro-grant-campaign-layout">
+      <div class="pro-grant-campaign-list" data-pro-grant-list aria-label="Event list"></div>
+      <section class="pro-grant-campaign-detail" data-pro-grant-detail>
+        <div class="pro-grant-detail-head">
+          <div>
+            <h3 data-pro-grant-title>Select an event</h3>
+            <p data-pro-grant-meta>Select an event from the list or create a new one.</p>
+          </div>
+          <span class="pro-grant-campaign-state" data-pro-grant-state>Loading</span>
+        </div>
+        <div class="pro-grant-event-link" data-pro-grant-event-link hidden>
+          <a target="_blank" rel="noopener"></a>
+          <button class="is-secondary" type="button" data-pro-grant-link-copy>Copy link</button>
+        </div>
+        <div class="pro-grant-campaign-summary" data-pro-grant-counts>Loading event status.</div>
+        <ol class="pro-grant-workflow" aria-label="Event creation steps">
+          <li><strong>Verify room codes</strong><span>Check for conflicts with other events or active rooms.</span></li>
+          <li><strong>Save the codes</strong><span>Store the plaintext code file somewhere secure first.</span></li>
+          <li><strong>Start the event</strong><span>Apply the exact saved batch to the server once.</span></li>
+        </ol>
+        <div class="pro-grant-campaign-actions pro-grant-workflow-actions">
+          <button class="is-secondary" type="button" data-pro-grant-verify>1. Verify room codes</button>
+          <button type="button" data-pro-grant-create disabled>2. Create code file</button>
+          <button type="button" data-pro-grant-apply disabled>3. Start event</button>
+        </div>
+        <div class="pro-grant-campaign-export" data-pro-grant-export hidden>
+          <strong>Plaintext codes are held in this browser's memory.</strong>
+          <p>The server cannot reveal them again. Store the downloaded file securely before leaving this page.</p>
+          <div>
+            <button class="is-secondary" type="button" data-pro-grant-download>Download again</button>
+            <button class="is-secondary" type="button" data-pro-grant-copy>Copy room codes + codes</button>
+          </div>
+        </div>
+        <div class="pro-grant-lifecycle">
+          <div class="pro-grant-lifecycle-section">
+            <div><strong>Publication</strong><p>A paused event can be resumed later.</p></div>
+            <button class="is-secondary" type="button" data-pro-grant-pause disabled>Pause</button>
+          </div>
+          <div class="pro-grant-lifecycle-section is-danger-zone">
+            <div><strong>End event</strong><p>Ending preserves unused codes; revoking permanently invalidates them. Already granted PRO rooms are unchanged.</p></div>
+            <div>
+              <button class="is-secondary" type="button" data-pro-grant-end disabled>End event</button>
+              <button class="is-danger" type="button" data-pro-grant-revoke disabled>Revoke unused codes</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+    <p class="pro-room-status" role="status" aria-live="polite" data-pro-grant-status></p>
+  `;
+  registerPanel.insertAdjacentElement('afterend', panel);
+  proGrantCampaignPanelEl = panel;
+  proGrantCampaignListEl = panel.querySelector<HTMLElement>('[data-pro-grant-list]');
+  proGrantCampaignDetailEl = panel.querySelector<HTMLElement>('[data-pro-grant-detail]');
+  proGrantCampaignTitleEl = panel.querySelector<HTMLElement>('[data-pro-grant-title]');
+  proGrantCampaignMetaEl = panel.querySelector<HTMLElement>('[data-pro-grant-meta]');
+  proGrantCampaignEventLinkEl = panel.querySelector<HTMLElement>('[data-pro-grant-event-link]');
+  proGrantCampaignStateEl = panel.querySelector<HTMLElement>('[data-pro-grant-state]');
+  proGrantCampaignStatusEl = panel.querySelector<HTMLElement>('[data-pro-grant-status]');
+  proGrantCampaignCountsEl = panel.querySelector<HTMLElement>('[data-pro-grant-counts]');
+  proGrantCampaignNewBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-new]');
+  proGrantCampaignImportBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-import]');
+  proGrantCampaignImportInput = panel.querySelector<HTMLInputElement>(
+    '[data-pro-grant-import-input]',
+  );
+  proGrantCampaignFormEl = panel.querySelector<HTMLFormElement>('[data-pro-grant-create-form]');
+  proGrantCampaignFormCancelBtn = panel.querySelector<HTMLButtonElement>(
+    '[data-pro-grant-form-cancel]',
+  );
+  proGrantCampaignVerifyBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-verify]');
+  proGrantCampaignCreateBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-create]');
+  proGrantCampaignApplyBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-apply]');
+  proGrantCampaignPauseBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-pause]');
+  proGrantCampaignEndBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-end]');
+  proGrantCampaignRevokeBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-revoke]');
+  proGrantCampaignExportEl = panel.querySelector<HTMLElement>('[data-pro-grant-export]');
+  proGrantCampaignDownloadBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-download]');
+  proGrantCampaignCopyBtn = panel.querySelector<HTMLButtonElement>('[data-pro-grant-copy]');
+  proGrantCampaignLinkCopyBtn = panel.querySelector<HTMLButtonElement>(
+    '[data-pro-grant-link-copy]',
+  );
+}
+
+function setStatus(message: string, isError = false): void {
+  if (!loginStatus) return;
+  loginStatus.textContent = message || '';
+  loginStatus.classList.toggle('is-error', isError);
+}
+
+function setLoginFormDisabled(disabled: boolean): void {
+  if (!loginForm) return;
+  for (const control of loginForm.elements) {
+    if (
+      control instanceof HTMLButtonElement ||
+      control instanceof HTMLInputElement ||
+      control instanceof HTMLSelectElement ||
+      control instanceof HTMLTextAreaElement ||
+      control instanceof HTMLFieldSetElement
+    ) {
+      control.disabled = disabled;
+    }
+  }
+  if (disabled) loginForm.setAttribute('aria-busy', 'true');
+  else loginForm.removeAttribute('aria-busy');
+}
+
+function adminRequestError(code: string, message: string, cause?: unknown): AdminRequestFailure {
+  const error: AdminRequestFailure = Object.assign(new Error(message), { code });
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
+function isAdminRequestFailure(value: unknown): value is AdminRequestFailure {
+  return value instanceof Error && 'code' in value && typeof value.code === 'string';
+}
+
+function isAdminApiPayload(value: unknown): value is AdminApiPayload {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function invalidateAdminSession(): void {
+  adminSessionEpoch += 1;
+  for (const controller of adminRequestControllers) controller.abort();
+  adminRequestControllers.clear();
+  for (const controller of adminLatestLoads.values()) controller.abort();
+  adminLatestLoads.clear();
+  closeServiceStatusConfirmation({ restoreFocus: false });
+  setServiceStatusBusy(false);
+}
+
+function beginAdminSession(): number {
+  invalidateAdminSession();
+  return adminSessionEpoch;
+}
+
+function beginLatestAdminLoad(key: string): AdminLatestLoad {
+  adminLatestLoads.get(key)?.abort();
+  const controller = new AbortController();
+  adminLatestLoads.set(key, controller);
+  return {
+    key,
+    controller,
+    sessionEpoch: adminSessionEpoch,
+  };
+}
+
+function isLatestAdminLoad(load: AdminLatestLoad): boolean {
+  return (
+    load?.sessionEpoch === adminSessionEpoch &&
+    adminLatestLoads.get(load.key) === load.controller &&
+    !load.controller.signal.aborted
+  );
+}
+
+function finishLatestAdminLoad(load: AdminLatestLoad): void {
+  if (adminLatestLoads.get(load.key) === load.controller) {
+    adminLatestLoads.delete(load.key);
+  }
+}
+
+function throwIfAdminLoadStale(load: AdminLatestLoad): void {
+  if (!isLatestAdminLoad(load)) {
+    throw adminRequestError('ADMIN_REQUEST_CANCELLED', 'Request cancelled.');
+  }
+}
+
+async function readAdminResponseText(
+  response: Response,
+  maxBytes = ADMIN_RESPONSE_MAX_BYTES,
+): Promise<string> {
+  const contentLength = response.headers.get('Content-Length');
+  if (contentLength !== null) {
+    const parsedLength = Number(contentLength);
+    if (Number.isFinite(parsedLength) && parsedLength > maxBytes) {
+      await response.body?.cancel().catch(() => {});
+      throw adminRequestError(
+        'ADMIN_RESPONSE_TOO_LARGE',
+        'The server returned an unexpectedly large response.',
+      );
+    }
+  }
+  if (!response.body?.getReader) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > maxBytes) {
+      throw adminRequestError(
+        'ADMIN_RESPONSE_TOO_LARGE',
+        'The server returned an unexpectedly large response.',
+      );
+    }
+    return text;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let text = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw adminRequestError(
+          'ADMIN_RESPONSE_TOO_LARGE',
+          'The server returned an unexpectedly large response.',
+        );
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function fetchJson(url: string, options: AdminFetchOptions = {}): Promise<AdminApiPayload> {
+  const {
+    method: optionMethod = 'GET',
+    headers: optionHeaders = {},
+    signal: callerSignal,
+    timeoutMs = ADMIN_REQUEST_TIMEOUT_MS,
+    maxResponseBytes = ADMIN_RESPONSE_MAX_BYTES,
+    sessionBound = url !== '/api/admin/login' && url !== '/api/admin/session',
+    ...requestOptions
+  } = options;
+  const method = String(optionMethod).toUpperCase();
+  const requestEpoch = adminSessionEpoch;
+  const controller = new AbortController();
+  adminRequestControllers.add(controller);
+  const onCallerAbort = () => controller.abort();
+  if (callerSignal?.aborted) controller.abort();
+  else callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
+  let timedOut = false;
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    const response = await fetch(url, {
+      credentials: 'same-origin',
+      ...requestOptions,
+      method,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(!['GET', 'HEAD'].includes(method) ? { 'X-MXQR-Admin-CSRF': '1' } : {}),
+        ...optionHeaders,
+      },
+    });
+    const text = await readAdminResponseText(response, maxResponseBytes);
+    let body: unknown = {};
+    if (text) {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        throw adminRequestError('ADMIN_RESPONSE_INVALID', 'The server returned invalid JSON.');
+      }
+    }
+    if (!isAdminApiPayload(body)) {
+      throw adminRequestError('ADMIN_RESPONSE_INVALID', 'The server returned invalid JSON.');
+    }
+    if (sessionBound && requestEpoch !== adminSessionEpoch) {
+      throw adminRequestError('ADMIN_REQUEST_CANCELLED', 'Request cancelled.');
+    }
+    if (!response.ok) {
+      if (response.status === 401 && url !== '/api/admin/login') {
+        showLogin('Admin session expired.');
+      }
+      const error: AdminRequestFailure = Object.assign(
+        new Error(body.error || `Request failed: ${response.status}`),
+        { code: 'ADMIN_REQUEST_FAILED' },
+      );
+      error.status = response.status;
+      error.payload = body;
+      throw error;
+    }
+    return body;
+  } catch (error) {
+    if (isAdminRequestFailure(error) && Number.isInteger(error.status)) throw error;
+    if (
+      controller.signal.aborted ||
+      (error instanceof DOMException && error.name === 'AbortError')
+    ) {
+      if (timedOut) {
+        const isMutation = !['GET', 'HEAD'].includes(method);
+        throw adminRequestError(
+          isMutation ? 'ADMIN_MUTATION_OUTCOME_UNKNOWN' : 'ADMIN_REQUEST_TIMEOUT',
+          isMutation
+            ? 'Request timed out. The change may have completed; refresh before retrying.'
+            : 'Request timed out. Refresh and try again.',
+          error,
+        );
+      }
+      throw adminRequestError('ADMIN_REQUEST_CANCELLED', 'Request cancelled.', error);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+    callerSignal?.removeEventListener('abort', onCallerAbort);
+    adminRequestControllers.delete(controller);
+  }
+}
+
+function showLogin(
+  message = '',
+  { invalidateSession = true }: { readonly invalidateSession?: boolean } = {},
+): void {
+  if (invalidateSession) invalidateAdminSession();
+  closeProRoomDestroyDialog({ restoreFocus: false });
+  closeProRoomLegacyOwnerDetachDialog({ restoreFocus: false });
+  closeProRoomTransferDialog({ restoreFocus: false });
+  clearProRoomClaimState();
+  clearAllProRoomApiSecrets();
+  expandedProRooms.clear();
+  proRoomApiCache.clear();
+  proRoomApiRequestGenerations.clear();
+  proRoomsLoaded = false;
+  proRoomsSnapshot = [];
+  if (proRoomSearchEl) proRoomSearchEl.value = '';
+  proGrantCampaignLoaded = false;
+  proGrantCampaignState = null;
+  proGrantCampaigns = [];
+  selectedProGrantCampaignSlug = null;
+  proGrantCampaignDraft = null;
+  verifiedProGrantPool = null;
+  pendingProGrantVoucherExport = null;
+  renderProGrantCampaignState(null);
+  articlesLoaded = false;
+  translationsLoaded = false;
+  translationNextCursor = null;
+  translationListEl?.replaceChildren();
+  const translationCopy = document.querySelector<HTMLTextAreaElement>(
+    '[data-translation-export-json]',
+  );
+  if (translationCopy) translationCopy.value = '';
+  document.querySelector<HTMLElement>('[data-translation-export-copy]')?.setAttribute('hidden', '');
+  announcementLoaded = false;
+  currentAnnouncementRevision = null;
+  pendingAnnouncementMutation = null;
+  setAnnouncementMutationBusy(false);
+  serviceStatusLoaded = false;
+  currentServiceStatus = null;
+  serviceStatusRequestId = null;
+  serviceHistoryListEl?.replaceChildren();
+  if (serviceHistoryStatusEl) {
+    serviceHistoryStatusEl.textContent = '';
+    delete serviceHistoryStatusEl.dataset.state;
+  }
+  if (serviceHistoryRefreshBtn) serviceHistoryRefreshBtn.disabled = false;
+  setAnnouncementActiveIndicator(false);
+  renderServiceStatusUnavailable('');
+  root?.classList.add('is-login');
+  root?.classList.remove('is-dashboard');
+  if (loginPanel) loginPanel.hidden = false;
+  if (dashboard) dashboard.hidden = true;
+  setStatus(message);
+}
+
+function showDashboard(): void {
+  root?.classList.remove('is-login');
+  root?.classList.add('is-dashboard');
+  if (loginPanel) loginPanel.hidden = true;
+  if (dashboard) dashboard.hidden = false;
+}
+
+function normalizeServiceStatusPayload(payload: AdminApiPayload): ServiceStatusState {
+  const value = payload?.serviceStatus;
+  const revision = Number(value?.revision);
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    typeof value.enabled !== 'boolean' ||
+    !Number.isSafeInteger(revision) ||
+    revision < 0
+  ) {
+    throw adminRequestError(
+      'ADMIN_SERVICE_STATUS_INVALID',
+      'The server returned an invalid service status.',
+    );
+  }
+  const normalizeTimestamp = (timestamp: AdminTimestamp): string | null => {
+    if (typeof timestamp !== 'string' || !timestamp) return null;
+    return Number.isNaN(new Date(timestamp).getTime()) ? null : timestamp;
+  };
+  return {
+    enabled: value.enabled,
+    revision,
+    updatedAt: normalizeTimestamp(value.updatedAt),
+    activatedAt: normalizeTimestamp(value.activatedAt),
+    settlesAt: normalizeTimestamp(value.settlesAt),
+  };
+}
+
+function clearServiceStatusSettleTimer(): void {
+  if (serviceStatusSettleTimer !== null) {
+    window.clearTimeout(serviceStatusSettleTimer);
+    serviceStatusSettleTimer = null;
+  }
+}
+
+function isServiceStatusSettling(
+  status: ServiceStatusState | null = currentServiceStatus,
+): boolean {
+  if (!status?.settlesAt) return false;
+  const settlesAtMs = new Date(status.settlesAt).getTime();
+  return Number.isFinite(settlesAtMs) && settlesAtMs > Date.now();
+}
+
+function serviceStatusStateName(status: ServiceStatusState | null = currentServiceStatus): string {
+  if (!status) return 'unknown';
+  if (isServiceStatusSettling(status)) return status.enabled ? 'activating' : 'resuming';
+  return status.enabled ? 'maintenance' : 'operational';
+}
+
+function scheduleServiceStatusSettlement(status: ServiceStatusState): void {
+  clearServiceStatusSettleTimer();
+  const settlesAt = status.settlesAt;
+  if (!settlesAt || !isServiceStatusSettling(status)) return;
+  const settlesAtMs = new Date(settlesAt).getTime();
+  const checkSettlement = () => {
+    const remainingMs = settlesAtMs - Date.now();
+    if (remainingMs > 0) {
+      serviceStatusSettleTimer = window.setTimeout(
+        checkSettlement,
+        Math.min(remainingMs + 50, 2_147_000_000),
+      );
+      return;
+    }
+    serviceStatusSettleTimer = null;
+    if (currentServiceStatus?.revision !== status.revision) return;
+    renderServiceStatus(currentServiceStatus);
+    if (currentServiceStatus.enabled) {
+      if (updatedAtEl) {
+        const statusTime = currentServiceStatus.activatedAt || currentServiceStatus.updatedAt;
+        updatedAtEl.textContent = `Maintenance active${
+          statusTime ? ` since ${formatAdminDateTime(statusTime)}` : ''
+        }`;
+      }
+    } else if (!dashboard?.hidden) {
+      refreshAllDashboardData().catch((error) => {
+        if (updatedAtEl) updatedAtEl.textContent = adminErrorMessage(error, 'Refresh failed.');
+      });
+    }
+  };
+  checkSettlement();
+}
+
+function renderServiceStatusUnavailable(message = 'Service status unavailable.'): void {
+  clearServiceStatusSettleTimer();
+  closeServiceStatusConfirmation();
+  serviceStatusLoaded = false;
+  currentServiceStatus = null;
+  const state = 'unknown';
+  for (const element of [serviceStatusTrigger, serviceStatusDot, serviceStatusPanel]) {
+    if (element) element.dataset.state = state;
+  }
+  if (serviceStatusLabel) serviceStatusLabel.textContent = 'Maintenance';
+  if (serviceStatusTrigger)
+    serviceStatusTrigger.setAttribute('aria-label', 'Maintenance, service status unavailable');
+  if (serviceStatusStateEl) serviceStatusStateEl.textContent = 'Status unavailable';
+  if (serviceStatusDescriptionEl) {
+    serviceStatusDescriptionEl.textContent =
+      'The current service state could not be verified. Refresh before making a change.';
+  }
+  if (serviceStatusUpdatedAtEl) serviceStatusUpdatedAtEl.textContent = '';
+  if (serviceStatusErrorEl) {
+    serviceStatusErrorEl.textContent = message;
+    serviceStatusErrorEl.hidden = !message;
+  }
+  if (serviceStatusConfirmBtn) serviceStatusConfirmBtn.disabled = true;
+  if (serviceStatusChangeBtn) serviceStatusChangeBtn.disabled = true;
+  restoreServiceStatusConfirmationFocus();
+}
+
+function renderServiceStatus(status: ServiceStatusState): void {
+  if (serviceStatusConfirmationRevision !== status.revision) closeServiceStatusConfirmation();
+  currentServiceStatus = status;
+  serviceStatusLoaded = true;
+  serviceStatusRequestId = null;
+  const state = serviceStatusStateName(status);
+  const settling = isServiceStatusSettling(status);
+  for (const element of [serviceStatusTrigger, serviceStatusDot, serviceStatusPanel]) {
+    if (element) element.dataset.state = state;
+  }
+  if (serviceStatusLabel) serviceStatusLabel.textContent = 'Maintenance';
+  if (serviceStatusTrigger) {
+    serviceStatusTrigger.setAttribute(
+      'aria-label',
+      state === 'activating'
+        ? 'Maintenance, activating maintenance mode'
+        : state === 'resuming'
+          ? 'Maintenance, resuming service'
+          : status.enabled
+            ? 'Maintenance, maintenance active'
+            : 'Maintenance, service operational',
+    );
+  }
+  if (serviceStatusStateEl) {
+    serviceStatusStateEl.textContent =
+      state === 'activating'
+        ? 'Activating maintenance...'
+        : state === 'resuming'
+          ? 'Resuming service...'
+          : status.enabled
+            ? 'Maintenance active'
+            : 'Operational';
+  }
+  if (serviceStatusDescriptionEl) {
+    serviceStatusDescriptionEl.textContent =
+      state === 'activating'
+        ? 'Maintenance mode is being applied across services.'
+        : state === 'resuming'
+          ? 'Service is resuming. Some requests may remain unavailable briefly.'
+          : status.enabled
+            ? 'Maintenance mode is enabled. New public traffic is restricted.'
+            : 'MUSIXQUARE is available.';
+  }
+  const statusTime = status.enabled ? status.activatedAt || status.updatedAt : status.updatedAt;
+  if (serviceStatusUpdatedAtEl) {
+    serviceStatusUpdatedAtEl.textContent = settling
+      ? `${status.enabled ? 'Maintenance refresh' : 'Service resume'} in progress`
+      : statusTime
+        ? `${status.enabled ? 'Active since' : 'Last changed'} ${formatAdminDateTime(statusTime)}`
+        : '';
+  }
+  if (serviceStatusErrorEl) {
+    serviceStatusErrorEl.textContent = '';
+    serviceStatusErrorEl.hidden = true;
+  }
+  if (serviceStatusConfirmBtn) {
+    serviceStatusConfirmBtn.textContent = status.enabled ? 'Resume service' : 'Enter maintenance';
+    serviceStatusConfirmBtn.dataset.action = status.enabled ? 'end' : 'enter';
+    serviceStatusConfirmBtn.disabled =
+      serviceStatusBusy || settling || serviceStatusConfirmationRevision !== status.revision;
+  }
+  if (serviceStatusChangeBtn) {
+    serviceStatusChangeBtn.textContent = status.enabled
+      ? 'End maintenance mode'
+      : 'Enter maintenance mode';
+    serviceStatusChangeBtn.dataset.action = status.enabled ? 'end' : 'enter';
+    serviceStatusChangeBtn.disabled = serviceStatusBusy || settling;
+  }
+  scheduleServiceStatusSettlement(status);
+  restoreServiceStatusConfirmationFocus();
+}
+
+function setServiceStatusBusy(busy: boolean, targetEnabled: boolean | null = null): void {
+  serviceStatusBusy = busy;
+  if (serviceStatusPanel) {
+    if (busy) serviceStatusPanel.setAttribute('aria-busy', 'true');
+    else serviceStatusPanel.removeAttribute('aria-busy');
+  }
+  if (serviceStatusChangeBtn) {
+    serviceStatusChangeBtn.disabled =
+      busy || !serviceStatusLoaded || isServiceStatusSettling(currentServiceStatus);
+  }
+  for (const button of serviceStatusCancelBtns) button.disabled = busy;
+  if (serviceStatusConfirmBtn) {
+    serviceStatusConfirmBtn.disabled =
+      busy ||
+      !serviceStatusLoaded ||
+      isServiceStatusSettling(currentServiceStatus) ||
+      serviceStatusConfirmationRevision !== currentServiceStatus?.revision;
+    if (busy) {
+      serviceStatusConfirmBtn.textContent = targetEnabled ? 'Entering...' : 'Ending...';
+    } else if (currentServiceStatus) {
+      serviceStatusConfirmBtn.textContent = currentServiceStatus.enabled
+        ? 'Resume service'
+        : 'Enter maintenance';
+    }
+  }
+  if (!busy) restoreServiceStatusConfirmationFocus();
+}
+
+function closeServiceStatusConfirmation({ restoreFocus = true } = {}): void {
+  if (!restoreFocus) serviceStatusRestoreConfirmationFocus = false;
+  else if (serviceStatusConfirmation?.contains(document.activeElement)) {
+    serviceStatusRestoreConfirmationFocus = true;
+  }
+  serviceStatusConfirmationRevision = null;
+  if (serviceStatusConfirmation) serviceStatusConfirmation.hidden = true;
+  if (serviceStatusConfirmBtn) serviceStatusConfirmBtn.disabled = true;
+  serviceStatusChangeBtn?.setAttribute('aria-expanded', 'false');
+}
+
+function restoreServiceStatusConfirmationFocus(): void {
+  if (!serviceStatusRestoreConfirmationFocus || serviceStatusBusy) return;
+  serviceStatusRestoreConfirmationFocus = false;
+  if (
+    dashboard?.hidden ||
+    document.querySelector<HTMLElement>('[data-admin-view="maintenance"]')?.hidden !== false ||
+    (document.activeElement !== null &&
+      document.activeElement !== document.body &&
+      !serviceStatusConfirmation?.contains(document.activeElement))
+  ) {
+    return;
+  }
+  // While the new state settles, the change action is disabled; keep keyboard
+  // focus on the selected Maintenance tab instead of the now-hidden action.
+  const target = !serviceStatusConfirmation?.hidden
+    ? serviceStatusConfirmBtn
+    : serviceStatusChangeBtn?.disabled
+      ? serviceStatusTrigger
+      : serviceStatusChangeBtn;
+  target?.focus();
+}
+
+function openServiceStatusConfirmation(): void {
+  if (
+    !serviceStatusConfirmation ||
+    !serviceStatusLoaded ||
+    !currentServiceStatus ||
+    serviceStatusBusy ||
+    isServiceStatusSettling(currentServiceStatus)
+  ) {
+    return;
+  }
+  serviceStatusConfirmationRevision = currentServiceStatus.revision;
+  if (serviceStatusConfirmationCopy) {
+    serviceStatusConfirmationCopy.textContent = currentServiceStatus.enabled
+      ? 'Resume service?'
+      : 'Enter maintenance mode?';
+  }
+  serviceStatusConfirmation.hidden = false;
+  serviceStatusChangeBtn?.setAttribute('aria-expanded', 'true');
+  if (serviceStatusConfirmBtn) serviceStatusConfirmBtn.disabled = false;
+  serviceStatusCancelBtns[0]?.focus();
+}
+
+async function loadServiceStatus(
+  options: { readonly updateTimestamp?: boolean; readonly reconcileMutation?: boolean } = {},
+): Promise<ServiceStatusState> {
+  // A refresh started during a mutation must not replace its pending state.
+  if (serviceStatusBusy && currentServiceStatus && !options.reconcileMutation) {
+    return currentServiceStatus;
+  }
+  const load = beginLatestAdminLoad('service-status');
+  if (!serviceStatusLoaded && serviceStatusLabel) serviceStatusLabel.textContent = 'Maintenance';
+  try {
+    const payload = await fetchJson('/api/admin/service-status', {
+      signal: load.controller.signal,
+    });
+    throwIfAdminLoadStale(load);
+    const status = normalizeServiceStatusPayload(payload);
+    renderServiceStatus(status);
+    if (options.updateTimestamp !== false && updatedAtEl) {
+      const statusTime = status.enabled ? status.activatedAt || status.updatedAt : status.updatedAt;
+      const state = serviceStatusStateName(status);
+      updatedAtEl.textContent =
+        state === 'activating'
+          ? 'Activating maintenance - background refresh in progress'
+          : state === 'resuming'
+            ? 'Resuming service - background refresh in progress'
+            : status.enabled
+              ? `Maintenance active${statusTime ? ` since ${formatAdminDateTime(statusTime)}` : ''}`
+              : `Updated ${formatAdminDateTime(payload.generatedAt || Date.now())}`;
+    }
+    return status;
+  } catch (error) {
+    if (isLatestAdminLoad(load)) {
+      renderServiceStatusUnavailable(adminErrorMessage(error, 'Service status refresh failed.'));
+    }
+    throw error;
+  } finally {
+    finishLatestAdminLoad(load);
+  }
+}
+
+interface ServiceHistoryEntry {
+  readonly enabled: boolean;
+  readonly revision: number;
+  readonly updatedAt: string;
+}
+
+function isServiceHistoryEntry(value: unknown): value is ServiceHistoryEntry {
+  if (!value || typeof value !== 'object') return false;
+  const entry = value as Partial<ServiceHistoryEntry>;
+  return (
+    typeof entry.enabled === 'boolean' &&
+    typeof entry.revision === 'number' &&
+    Number.isSafeInteger(entry.revision) &&
+    entry.revision > 0 &&
+    typeof entry.updatedAt === 'string' &&
+    Number.isFinite(Date.parse(entry.updatedAt))
+  );
+}
+
+async function loadServiceStatusHistory(): Promise<void> {
+  if (!serviceHistoryListEl) return;
+  const load = beginLatestAdminLoad('service-history');
+  if (serviceHistoryRefreshBtn) serviceHistoryRefreshBtn.disabled = true;
+  if (serviceHistoryStatusEl) {
+    serviceHistoryStatusEl.textContent = 'Loading history…';
+    serviceHistoryStatusEl.dataset.state = 'loading';
+  }
+  try {
+    const payload = await fetchJson('/api/admin/service-status/history', {
+      signal: load.controller.signal,
+    });
+    throwIfAdminLoadStale(load);
+    const history: unknown = payload.history;
+    if (
+      !Array.isArray(history) ||
+      history.length > 64 ||
+      !history.every(isServiceHistoryEntry) ||
+      typeof payload.truncated !== 'boolean'
+    ) {
+      throw new Error('Invalid maintenance history response.');
+    }
+    const rows = history.map((entry: ServiceHistoryEntry) => {
+      const item = document.createElement('li');
+      item.className = 'service-history-item';
+      const event = document.createElement('strong');
+      event.className = 'service-history-event';
+      event.textContent = entry.enabled ? 'Entered maintenance' : 'Service resumed';
+      const badge = document.createElement('span');
+      badge.className = 'service-history-badge';
+      badge.dataset.enabled = String(entry.enabled);
+      badge.setAttribute('aria-hidden', 'true');
+      const time = document.createElement('time');
+      time.className = 'service-history-time';
+      time.dateTime = entry.updatedAt;
+      time.textContent = formatAdminDateTime(entry.updatedAt);
+      item.append(badge, event, time);
+      return item;
+    });
+    serviceHistoryListEl.replaceChildren(...rows);
+    if (serviceHistoryStatusEl) {
+      serviceHistoryStatusEl.dataset.state = rows.length ? 'ready' : 'empty';
+      serviceHistoryStatusEl.textContent = rows.length
+        ? `${payload.truncated ? 'Latest ' : ''}${rows.length} recorded ${rows.length === 1 ? 'change' : 'changes'}`
+        : 'No maintenance changes recorded.';
+    }
+  } catch (error) {
+    if (isLatestAdminLoad(load) && serviceHistoryStatusEl) {
+      serviceHistoryStatusEl.dataset.state = 'error';
+      serviceHistoryStatusEl.textContent = adminErrorMessage(error, 'History could not be loaded.');
+    }
+  } finally {
+    if (isLatestAdminLoad(load) && serviceHistoryRefreshBtn)
+      serviceHistoryRefreshBtn.disabled = false;
+    finishLatestAdminLoad(load);
+  }
+}
+
+function abortNonStatusDashboardLoads(): void {
+  for (const key of ['metrics', 'pro-rooms', 'articles', 'announcement', 'translations']) {
+    adminLatestLoads.get(key)?.abort();
+  }
+}
+
+async function saveServiceStatus(): Promise<ServiceStatusState | undefined> {
+  if (
+    !currentServiceStatus ||
+    !serviceStatusLoaded ||
+    serviceStatusBusy ||
+    isServiceStatusSettling(currentServiceStatus) ||
+    serviceStatusConfirmationRevision !== currentServiceStatus.revision
+  ) {
+    return;
+  }
+  const sessionEpoch = adminSessionEpoch;
+  const previous = currentServiceStatus;
+  const targetEnabled = !previous.enabled;
+  const requestId = serviceStatusRequestId || createAdminRequestId();
+  serviceStatusRequestId = requestId;
+  let next: ServiceStatusState;
+  adminLatestLoads.get('service-status')?.abort();
+  // Chromium blurs a focused button as soon as it is disabled. Capture focus
+  // before locking the controls so completion can restore it if it stayed here.
+  serviceStatusRestoreConfirmationFocus =
+    serviceStatusConfirmation?.contains(document.activeElement) === true;
+  setServiceStatusBusy(true, targetEnabled);
+  if (serviceStatusErrorEl) {
+    serviceStatusErrorEl.textContent = '';
+    serviceStatusErrorEl.hidden = true;
+  }
+  try {
+    const payload = await fetchJson('/api/admin/service-status', {
+      method: 'POST',
+      body: JSON.stringify({
+        enabled: targetEnabled,
+        expectedRevision: previous.revision,
+        requestId,
+      }),
+    });
+    next = normalizeServiceStatusPayload(payload);
+    if (next.enabled !== targetEnabled) {
+      throw adminRequestError(
+        'ADMIN_SERVICE_STATUS_MISMATCH',
+        'The service returned an unexpected state. Refresh before retrying.',
+      );
+    }
+    renderServiceStatus(next);
+    if (targetEnabled) {
+      abortNonStatusDashboardLoads();
+    }
+    if (updatedAtEl) {
+      const state = serviceStatusStateName(next);
+      const statusTime = next.activatedAt || next.updatedAt;
+      updatedAtEl.textContent =
+        state === 'activating'
+          ? 'Activating maintenance - background refresh in progress'
+          : state === 'resuming'
+            ? 'Resuming service - background refresh in progress'
+            : next.enabled
+              ? `Maintenance active${statusTime ? ` since ${formatAdminDateTime(statusTime)}` : ''}`
+              : `Updated ${formatAdminDateTime(next.updatedAt || Date.now())}`;
+    }
+    setServiceStatusBusy(false);
+    closeServiceStatusConfirmation();
+    loadServiceStatusHistory().catch(() => {});
+  } catch (error) {
+    if (sessionEpoch !== adminSessionEpoch) return;
+    const responseStatus = isAdminRequestFailure(error) ? error.payload?.serviceStatus : undefined;
+    if (responseStatus) {
+      try {
+        renderServiceStatus(normalizeServiceStatusPayload({ serviceStatus: responseStatus }));
+      } catch {
+        // A malformed conflict payload must not replace the last verified state.
+      }
+    }
+    if (
+      (isAdminRequestFailure(error) && error.code === 'ADMIN_MUTATION_OUTCOME_UNKNOWN') ||
+      (error instanceof Error && error.message === 'SERVICE_STATUS_REVISION_MISMATCH') ||
+      (error instanceof Error && error.message === 'SERVICE_STATUS_CONFLICT')
+    ) {
+      try {
+        await loadServiceStatus({ updateTimestamp: false, reconcileMutation: true });
+      } catch {
+        // Keep the original mutation error as the actionable message.
+      }
+    } else {
+      serviceStatusRequestId = null;
+    }
+    if (sessionEpoch !== adminSessionEpoch) return;
+    if (serviceStatusErrorEl) {
+      serviceStatusErrorEl.textContent = adminErrorMessage(
+        error,
+        'The service state could not be changed.',
+      );
+      serviceStatusErrorEl.hidden = false;
+    }
+    throw error;
+  } finally {
+    if (sessionEpoch === adminSessionEpoch) setServiceStatusBusy(false);
+  }
+  // The mutation has released its controls. A follow-up refresh must not own
+  // the busy state or error display of a subsequent maintenance change.
+  if (!targetEnabled && !isServiceStatusSettling(next)) await refreshAllDashboardData();
+  return next;
+}
+
+function formatDelta(value: unknown): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '';
+  if (value === 0) return 'same as previous 24h';
+  return `${value > 0 ? '+' : ''}${value}% vs previous 24h`;
+}
+
+function formatArticleDate(value: AdminTimestamp): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  }).format(date);
+}
+
+function formatAdminDateTime(value: AdminTimestamp): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('en-US', {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date);
+}
+
+function toDatetimeLocalValue(value: AdminTimestamp): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (part: number): string => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}`;
+}
+
+function parseAnnouncementExpiresValue(value: unknown): string | null {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2})(?::(\d{1,2}))?)?$/);
+  if (match) {
+    const [, year, month, day, hour = '23', minute = '59'] = match;
+    const date = new Date(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour),
+      Number(minute),
+    );
+    if (
+      date.getFullYear() === Number(year) &&
+      date.getMonth() === Number(month) - 1 &&
+      date.getDate() === Number(day) &&
+      date.getHours() === Number(hour) &&
+      date.getMinutes() === Number(minute)
+    ) {
+      if (date.getTime() <= Date.now()) throw new Error('Expires must be in the future.');
+      return date.toISOString();
+    }
+    // Native parsing normalizes impossible calendar dates into a later day.
+    // Keep a failed validation of the displayed format from reaching that fallback.
+    throw new Error('Use YYYY-MM-DD HH:MM for Expires.');
+  }
+  const fallback = new Date(text);
+  if (!Number.isNaN(fallback.getTime())) {
+    if (fallback.getTime() <= Date.now()) throw new Error('Expires must be in the future.');
+    return fallback.toISOString();
+  }
+  throw new Error('Use YYYY-MM-DD HH:MM for Expires.');
+}
+
+function adminErrorMessage(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : '';
+  if (message === 'EXPIRES_AT_IN_PAST') return 'Expires must be in the future.';
+  if (message === 'INVALID_EXPIRES_AT') return 'Use YYYY-MM-DD HH:MM for Expires.';
+  if (message === 'SERVICE_STATUS_REVISION_MISMATCH' || message === 'SERVICE_STATUS_CONFLICT') {
+    return 'Service status changed in another session. The latest state has been loaded.';
+  }
+  if (message === 'SERVICE_STATUS_AUDIT_UNAVAILABLE') {
+    return 'The change was withheld because the service-status audit is unavailable.';
+  }
+  if (message === 'SERVICE_CONTROL_HISTORY_UNAVAILABLE') {
+    return 'History is temporarily unavailable. Try again.';
+  }
+  if (message === 'SERVICE_STATUS_UNAVAILABLE' || message === 'SERVICE_CONTROL_UNAVAILABLE') {
+    return 'Service status is temporarily unavailable.';
+  }
+  if (message === 'INVALID_PASSWORD') return 'Invalid password.';
+  if (message === 'INVALID_PRO_ROOM') return 'Use a six-digit room number beginning with 0.';
+  if (message === 'PRO_ROOM_NOT_FOUND') return 'This PRO room is not registered.';
+  if (message === 'PRO_ROOM_ACTIVATION_UNAVAILABLE') return 'This room is already active.';
+  if (message === 'PRO_ROOM_ADMIN_NOT_CONFIGURED')
+    return 'PRO room administration is not configured.';
+  if (message === 'PRO_ROOM_ADMIN_UNAVAILABLE') return 'The PRO room service is unavailable.';
+  if (message === 'PRO_ROOM_AUDIT_UNAVAILABLE') {
+    return 'The action was withheld because the audit log is unavailable.';
+  }
+  if (message === 'PRO_ROOM_LEGACY_OWNER_DETACH_INTENT_MISMATCH') {
+    return 'This repair was started with a different retained room. Retry with the exact same retained room number.';
+  }
+  if (message === 'PRO_ROOM_OWNER_DETACH_AUDIT_PENDING') {
+    return 'The owner repair is awaiting its completion audit. Keep this page open and retry the exact same repair; retrying is safe.';
+  }
+  if (message === 'ADMIN_ANNOUNCEMENT_CONFLICT') {
+    return 'The announcement changed in another session. The latest state has been loaded.';
+  }
+  if (message === 'ADMIN_ANNOUNCEMENT_CONTROL_UNAVAILABLE') {
+    return 'The announcement control is temporarily unavailable. If this followed a save, keep the page open and retry the same save; retrying is safe.';
+  }
+  if (message === 'PRO_ROOM_PROVISIONING_INCOMPLETE') {
+    return 'Provisioning is incomplete. Retry from the room list.';
+  }
+  if (message === 'PRO_ROOM_REGISTRY_CAPACITY_REACHED') {
+    return 'The PRO room registry has reached its current capacity.';
+  }
+  if (message === 'PRO_ROOM_GENERATION_MISMATCH') {
+    return 'This room number now refers to a different room. Refresh before making changes.';
+  }
+  if (message === 'PRO_ROOM_GENERATION_CUTOVER_NOT_READY') {
+    return 'Room-number reuse is temporarily unavailable until the generation safety rollout is verified.';
+  }
+  if (message === 'OWNER_TRANSFER_TARGET_UNAVAILABLE') {
+    return 'That account is missing, disabled, incomplete, or being deleted.';
+  }
+  if (message === 'PRO_ROOM_OWNER_TRANSFER_RECONCILIATION_REQUIRED') {
+    return 'A transfer is already pending. The recipient must retry the same link, or wait for it to expire before issuing another.';
+  }
+  if (message === 'PRO_ROOM_OWNER_TRANSFER_UNAVAILABLE') {
+    return 'Ownership transfer is unavailable in this room state.';
+  }
+  if (message === 'PRO_ROOM_OWNER_RECOVERY_UNAVAILABLE') {
+    return 'Recovery requires the same linked owner account. Use ownership transfer to assign a different or previously unlinked account.';
+  }
+  if (message === 'PRO_ROOM_OWNERSHIP_RECOVERY_REQUIRED') {
+    return 'This room requires ownership recovery and cannot be resumed manually.';
+  }
+  if (message === 'DEVELOPER_API_ADMIN_NOT_CONFIGURED') {
+    return 'Developer API key management is not configured.';
+  }
+  if (message === 'DEVELOPER_API_ACTIVE_KEY_LIMIT') {
+    return 'This room already has three active API keys. Revoke one before issuing another.';
+  }
+  if (message === 'DEVELOPER_API_AUTHORITY_FENCED') {
+    return 'API key issuance is blocked while room ownership is being recovered.';
+  }
+  if (message === 'DEVELOPER_API_KEY_NOT_FOUND') return 'This API key is no longer active.';
+  if (message === 'DEVELOPER_API_IDEMPOTENCY_CONFLICT') {
+    return 'This issuance request was already used with different settings. Try again.';
+  }
+  if (message === 'DEVELOPER_API_AUDIT_UNAVAILABLE') {
+    return 'The action was withheld because the API audit log is unavailable.';
+  }
+  if (message === 'PRO_ROOM_NOT_ACTIVE') return 'Only an active room can be suspended.';
+  if (message === 'PRO_ROOM_NOT_SUSPENDED') return 'This room is already active.';
+  if (message === 'PRO_ROOM_SUSPENDED') return 'Resume this room before issuing an API key.';
+  if (message === 'PRO_ROOM_NOT_READY') return 'Finish provisioning this room first.';
+  if (message === 'PRO_ROOM_DELETE_CONFIRMATION_MISMATCH') {
+    return 'Enter the room number exactly as shown to confirm deletion.';
+  }
+  if (message === 'PRO_ROOM_PERMANENTLY_DECOMMISSIONED') {
+    return 'This room has already been permanently deleted.';
+  }
+  if (message === 'PRO_ROOM_DECOMMISSION_NOT_CONFIGURED') {
+    return 'Permanent deletion is not fully configured.';
+  }
+  return message || fallback;
+}
+
+function formatAnnouncementAction(action: unknown): string {
+  if (action === 'published') return 'Published';
+  if (action === 'disabled') return 'Disabled';
+  if (action === 'cleared') return 'Cleared';
+  return 'Updated';
+}
+
+function announcementTitle(tab: string): string {
+  if (tab === 'maintenance') return 'Maintenance';
+  if (tab === 'pro-rooms') return 'PRO Rooms';
+  if (tab === 'articles') return 'Articles';
+  if (tab === 'translations') return 'Translations';
+  if (tab === 'announcements') return 'Announcements';
+  return 'Analytics';
+}
+
+function normalizeProRoomCode(value: unknown): string | null {
+  const digits = String(value || '')
+    .replace(/\D/g, '')
+    .slice(0, 6);
+  return /^0\d{5}$/.test(digits) ? digits : null;
+}
+
+function normalizeProRoomGeneration(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function proRoomIncarnationKey(roomCode: unknown, roomGeneration: unknown): string | null {
+  const normalizedRoomCode = normalizeProRoomCode(roomCode);
+  const normalizedGeneration = normalizeProRoomGeneration(roomGeneration);
+  if (!normalizedRoomCode || normalizedGeneration === null) return null;
+  return `${normalizedRoomCode}:${normalizedGeneration}`;
+}
+
+function isProRoomGenerationMismatchError(error: unknown): boolean {
+  return error instanceof Error && error.message === 'PRO_ROOM_GENERATION_MISMATCH';
+}
+
+function setProRoomStatus(message: string, isError = false): void {
+  if (!proRoomStatusEl) return;
+  proRoomStatusEl.textContent = message || '';
+  proRoomStatusEl.classList.toggle('is-error', isError);
+}
+
+function formatProRoomStatus(
+  status: unknown,
+  suspensionReason: string | null | undefined = null,
+  ownerAccountLinked: boolean | null = null,
+  ownerTransferPrepared = false,
+): string {
+  if (status === 'active') {
+    if (ownerAccountLinked === false) return 'Ownership transfer required';
+    if (ownerAccountLinked !== true) return 'Owner status unavailable';
+    return 'Active';
+  }
+  if (status === 'suspended') {
+    if (suspensionReason === 'owner_account_deleted') return 'Ownership transfer required';
+    if (suspensionReason === 'ownership_transfer_pending') {
+      return ownerTransferPrepared ? 'Transfer pending' : 'Ownership transfer required';
+    }
+    return 'Suspended';
+  }
+  if (status === 'decommissioning') return 'Deleting';
+  if (status === 'decommissioned') return 'Permanently deleted';
+  if (status === 'provisioning') return 'Provisioning incomplete';
+  if (status === 'unactivated') return 'Awaiting activation';
+  return 'Registered';
+}
+
+function dismissProRoomClaim(): void {
+  visibleProRoomClaimIncarnation = null;
+  if (!proRoomClaimEl) return;
+  proRoomClaimEl.hidden = true;
+  if (proRoomClaimUrlEl) proRoomClaimUrlEl.value = '';
+  if (proRoomClaimExpiryEl) proRoomClaimExpiryEl.textContent = '';
+  if (proRoomClaimTitleEl) proRoomClaimTitleEl.textContent = 'Owner activation link';
+  if (proRoomClaimCopyBtn) proRoomClaimCopyBtn.textContent = 'Copy link';
+}
+
+function clearProRoomClaimState(): void {
+  dismissProRoomClaim();
+  issuedActivationLinks.clear();
+  issuedOwnerRecoveryLinks.clear();
+  issuedOwnerTransferLinks.clear();
+}
+
+function showProRoomClaim(
+  payload: AdminApiPayload,
+  kind: 'activation' | 'recovery' | 'transfer' = 'activation',
+  expectedRoomGeneration: number | null = null,
+): void {
+  if (!proRoomClaimEl || !proRoomClaimUrlEl) return;
+  const roomCode = normalizeProRoomCode(payload.roomCode);
+  const roomGeneration = normalizeProRoomGeneration(payload.roomGeneration);
+  const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+  const isRecovery = kind === 'recovery';
+  const isTransfer = kind === 'transfer';
+  const claimUrl = isTransfer
+    ? payload.transferUrl
+    : isRecovery
+      ? payload.recoveryUrl
+      : payload.activationUrl;
+  if (
+    !roomCode ||
+    roomGeneration === null ||
+    roomGeneration !== expectedRoomGeneration ||
+    !incarnationKey ||
+    typeof claimUrl !== 'string' ||
+    !claimUrl
+  ) {
+    throw new Error(
+      isTransfer
+        ? 'INVALID_OWNER_TRANSFER_LINK'
+        : isRecovery
+          ? 'INVALID_OWNER_RECOVERY_LINK'
+          : 'INVALID_ACTIVATION_LINK',
+    );
+  }
+  if (isTransfer) issuedOwnerTransferLinks.add(incarnationKey);
+  else if (isRecovery) issuedOwnerRecoveryLinks.add(incarnationKey);
+  else issuedActivationLinks.add(incarnationKey);
+  visibleProRoomClaimIncarnation = incarnationKey;
+  if (proRoomClaimTitleEl) {
+    proRoomClaimTitleEl.textContent = `${roomCode} owner ${
+      isTransfer ? 'transfer' : isRecovery ? 'recovery' : 'activation'
+    } link`;
+  }
+  if (proRoomClaimExpiryEl) {
+    const expiry = formatAdminDateTime(payload.expiresAt);
+    proRoomClaimExpiryEl.textContent = expiry ? `Expires ${expiry}` : 'Short-lived link';
+  }
+  proRoomClaimUrlEl.value = claimUrl;
+  proRoomClaimUrlEl.setAttribute(
+    'aria-label',
+    isTransfer
+      ? 'Owner transfer link'
+      : isRecovery
+        ? 'Owner recovery link'
+        : 'Owner activation link',
+  );
+  proRoomClaimEl.hidden = false;
+  proRoomClaimEl.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function copyProRoomClaim(): Promise<void> {
+  const value = String(proRoomClaimUrlEl?.value || '');
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    proRoomClaimUrlEl?.focus();
+    proRoomClaimUrlEl?.select();
+    if (!document.execCommand?.('copy')) throw new Error('COPY_FAILED');
+  }
+  if (proRoomClaimCopyBtn) {
+    proRoomClaimCopyBtn.textContent = 'Copied';
+    window.setTimeout(() => {
+      if (proRoomClaimCopyBtn) proRoomClaimCopyBtn.textContent = 'Copy link';
+    }, 1600);
+  }
+}
+
+function proRoomRawStatus(room: ProRoomRecord | null | undefined): string {
+  const registryStatus = String(room?.status || 'registered');
+  const activationState = String(room?.activationState || '');
+  if (registryStatus === 'decommissioned') return 'decommissioned';
+  if (registryStatus === 'decommissioning') return 'decommissioning';
+  if (registryStatus === 'provisioning') return 'provisioning';
+  if (registryStatus === 'suspended') return 'suspended';
+  if (activationState === 'active') return 'active';
+  if (activationState === 'unactivated') return 'unactivated';
+  return 'registered';
+}
+
+function clearProRoomApiSecret(roomCode: string, roomGeneration: unknown): void {
+  const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+  if (!incarnationKey) return;
+  proRoomApiSecrets.delete(incarnationKey);
+  proRoomApiIssuanceOwners.delete(incarnationKey);
+  const panel = document.querySelector(
+    `[data-pro-room-api-panel="${roomCode}"][data-pro-room-generation="${roomGeneration}"]`,
+  );
+  panel?.querySelector('[data-pro-room-api-secret]')?.replaceChildren();
+}
+
+function clearAllProRoomApiSecrets(): void {
+  proRoomApiSecrets.clear();
+  proRoomApiIssuanceOwners.clear();
+  for (const host of document.querySelectorAll('[data-pro-room-api-secret]')) {
+    host.replaceChildren();
+  }
+}
+
+function resetProRoomDestroyDialog(): void {
+  if (!proRoomDestroyDialogElements) return;
+  const { dialog, form, input, cancelButton, confirmButton, error } = proRoomDestroyDialogElements;
+  const restoreFocus = proRoomDestroyTarget?.restoreFocus;
+  proRoomDestroyTarget = null;
+  form.reset();
+  form.removeAttribute('aria-busy');
+  input.disabled = false;
+  cancelButton.disabled = false;
+  confirmButton.disabled = true;
+  confirmButton.textContent = 'Delete permanently';
+  error.textContent = '';
+  if (restoreFocus?.isConnected) restoreFocus.focus();
+  dialog.removeAttribute('data-room-code');
+}
+
+function closeProRoomDestroyDialog({
+  restoreFocus = true,
+}: { readonly restoreFocus?: boolean } = {}): void {
+  if (!proRoomDestroyDialogElements) return;
+  const { dialog } = proRoomDestroyDialogElements;
+  if (!restoreFocus && proRoomDestroyTarget) proRoomDestroyTarget.restoreFocus = null;
+  if (!dialog.open && !dialog.hasAttribute('open')) {
+    resetProRoomDestroyDialog();
+    return;
+  }
+  if (typeof dialog.close === 'function') {
+    try {
+      dialog.close();
+      return;
+    } catch {
+      // Fall through to the attribute fallback used by lightweight DOM implementations.
+    }
+  }
+  dialog.removeAttribute('open');
+  dialog.dispatchEvent(new Event('close'));
+}
+
+function setProRoomDestroyBusy(isBusy: boolean): void {
+  if (!proRoomDestroyDialogElements) return;
+  const { form, input, cancelButton, confirmButton } = proRoomDestroyDialogElements;
+  if (isBusy) form.setAttribute('aria-busy', 'true');
+  else form.removeAttribute('aria-busy');
+  input.disabled = isBusy;
+  cancelButton.disabled = isBusy;
+  confirmButton.disabled =
+    isBusy || String(input.value || '') !== String(proRoomDestroyTarget?.roomCode || '');
+  confirmButton.textContent = isBusy ? 'Deleting...' : 'Delete permanently';
+  if (proRoomDestroyTarget) proRoomDestroyTarget.busy = isBusy;
+}
+
+function updateProRoomDestroyConfirmation(): void {
+  if (!proRoomDestroyDialogElements) return;
+  const { input, confirmButton, error } = proRoomDestroyDialogElements;
+  const digits = String(input.value || '')
+    .replace(/\D/g, '')
+    .slice(0, 6);
+  if (input.value !== digits) input.value = digits;
+  error.textContent = '';
+  confirmButton.disabled =
+    Boolean(proRoomDestroyTarget?.busy) || digits !== proRoomDestroyTarget?.roomCode;
+}
+
+function focusProRoomListAfterDestroy(): HTMLElement | null {
+  const nextSummary = proRoomListEl?.querySelector<HTMLElement>('summary');
+  if (nextSummary) return nextSummary;
+  if (!proRoomListStatusEl) return null;
+  proRoomListStatusEl.tabIndex = -1;
+  return proRoomListStatusEl;
+}
+
+function clearDestroyedProRoomState(roomCode: string, roomGeneration: number): void {
+  const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+  if (!incarnationKey) return;
+  expandedProRooms.delete(roomCode);
+  issuedActivationLinks.delete(incarnationKey);
+  issuedOwnerRecoveryLinks.delete(incarnationKey);
+  issuedOwnerTransferLinks.delete(incarnationKey);
+  proRoomApiCache.delete(incarnationKey);
+  proRoomApiRequestGenerations.set(
+    incarnationKey,
+    (proRoomApiRequestGenerations.get(incarnationKey) || 0) + 1,
+  );
+  clearProRoomApiSecret(roomCode, roomGeneration);
+  const claimRoomCode = normalizeProRoomCode(
+    String(proRoomClaimTitleEl?.textContent || '').slice(0, 6),
+  );
+  if (claimRoomCode === roomCode) dismissProRoomClaim();
+}
+
+async function permanentlyDeleteProRoom(): Promise<void> {
+  if (!proRoomDestroyDialogElements || !proRoomDestroyTarget) return;
+  const { input, error } = proRoomDestroyDialogElements;
+  const target = proRoomDestroyTarget;
+  const roomCode = target.roomCode;
+  const roomGeneration = target.roomGeneration;
+  if (input.value !== roomCode || target.busy) return;
+
+  setProRoomDestroyBusy(true);
+  error.textContent = '';
+  try {
+    const result = await fetchJson(`/api/admin/pro-rooms/${roomCode}`, {
+      method: 'DELETE',
+      body: JSON.stringify({
+        confirmRoomCode: roomCode,
+        roomGeneration,
+        requestId: target.requestId,
+      }),
+    });
+    if (
+      result?.roomCode !== roomCode ||
+      normalizeProRoomGeneration(result?.roomGeneration) !== roomGeneration
+    ) {
+      throw new Error('PRO_ROOM_GENERATION_MISMATCH');
+    }
+    clearDestroyedProRoomState(roomCode, roomGeneration);
+    document.querySelector(`[data-pro-room-item="${roomCode}"]`)?.remove();
+    const deletionPending = result?.status === 'decommissioning';
+    setProRoomStatus(
+      deletionPending
+        ? `${roomCode} is closed. Final storage cleanup is in progress.`
+        : `${roomCode} permanently deleted.`,
+    );
+    try {
+      await loadProRooms();
+    } catch {
+      proRoomsLoaded = false;
+      setProRoomStatus(
+        deletionPending
+          ? `${roomCode} is closed. Refresh the room list to check storage cleanup.`
+          : `${roomCode} permanently deleted. Refresh the room list to confirm the latest state.`,
+      );
+    }
+    if (proRoomDestroyTarget) {
+      proRoomDestroyTarget.restoreFocus = focusProRoomListAfterDestroy();
+    }
+    closeProRoomDestroyDialog();
+  } catch (deleteError) {
+    if (proRoomDestroyTarget !== target) return;
+    error.textContent = adminErrorMessage(
+      deleteError,
+      'The room could not be permanently deleted.',
+    );
+    setProRoomDestroyBusy(false);
+    input.focus();
+  }
+}
+
+function ensureProRoomDestroyDialog(): ProRoomDestroyDialogElements {
+  if (proRoomDestroyDialogElements) return proRoomDestroyDialogElements;
+
+  const dialog = document.createElement('dialog');
+  dialog.className = 'pro-room-destroy-dialog';
+  dialog.dataset.proRoomDestroyDialog = '';
+  dialog.setAttribute('aria-labelledby', 'pro-room-destroy-title');
+  dialog.setAttribute('aria-describedby', 'pro-room-destroy-description');
+
+  const form = document.createElement('form');
+  form.className = 'pro-room-destroy-form';
+  form.dataset.proRoomDestroyForm = '';
+
+  const copy = document.createElement('div');
+  copy.className = 'pro-room-destroy-copy';
+  const eyebrow = document.createElement('span');
+  eyebrow.className = 'pro-room-destroy-eyebrow';
+  eyebrow.textContent = 'Permanent deletion';
+  const title = document.createElement('h2');
+  title.id = 'pro-room-destroy-title';
+  title.dataset.proRoomDestroyTitle = '';
+  const description = document.createElement('p');
+  description.id = 'pro-room-destroy-description';
+  description.textContent =
+    'This room incarnation, playlist, uploaded media, active sessions, owner access, and API keys will be permanently removed. Connected participants will be signed out. This deletion cannot be undone; after cleanup completes, an administrator may register the room number as a new room.';
+  copy.append(eyebrow, title, description);
+
+  const field = document.createElement('label');
+  field.className = 'pro-room-destroy-field';
+  const fieldLabel = document.createElement('span');
+  fieldLabel.dataset.proRoomDestroyLabel = '';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.inputMode = 'numeric';
+  input.maxLength = 6;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.dataset.proRoomDestroyInput = '';
+  input.setAttribute('aria-describedby', 'pro-room-destroy-description pro-room-destroy-error');
+  field.append(fieldLabel, input);
+
+  const error = document.createElement('p');
+  error.id = 'pro-room-destroy-error';
+  error.className = 'pro-room-destroy-error';
+  error.dataset.proRoomDestroyError = '';
+  error.setAttribute('role', 'alert');
+  error.setAttribute('aria-live', 'assertive');
+
+  const actions = document.createElement('div');
+  actions.className = 'pro-room-destroy-actions';
+  const cancelButton = document.createElement('button');
+  cancelButton.type = 'button';
+  cancelButton.className = 'is-secondary';
+  cancelButton.textContent = 'Cancel';
+  cancelButton.dataset.proRoomDestroyCancel = '';
+  const confirmButton = document.createElement('button');
+  confirmButton.type = 'submit';
+  confirmButton.className = 'is-danger';
+  confirmButton.textContent = 'Delete permanently';
+  confirmButton.disabled = true;
+  confirmButton.dataset.proRoomDestroyConfirm = '';
+  actions.append(cancelButton, confirmButton);
+
+  form.append(copy, field, error, actions);
+  dialog.append(form);
+  document.body.append(dialog);
+  proRoomDestroyDialogElements = {
+    dialog,
+    form,
+    title,
+    fieldLabel,
+    input,
+    error,
+    cancelButton,
+    confirmButton,
+  };
+
+  input.addEventListener('input', updateProRoomDestroyConfirmation);
+  cancelButton.addEventListener('click', () => closeProRoomDestroyDialog());
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    permanentlyDeleteProRoom().catch(() => {});
+  });
+  dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    if (!proRoomDestroyTarget?.busy) closeProRoomDestroyDialog();
+  });
+  dialog.addEventListener('close', resetProRoomDestroyDialog);
+  return proRoomDestroyDialogElements;
+}
+
+function openProRoomDestroyDialog(
+  roomCode: string,
+  roomGeneration: number,
+  trigger: HTMLElement | null,
+): void {
+  if (normalizeProRoomGeneration(roomGeneration) === null) {
+    setProRoomStatus('Room generation is unavailable. Refresh before making changes.', true);
+    return;
+  }
+  const elements = ensureProRoomDestroyDialog();
+  const { dialog, form, title, fieldLabel, input, error, cancelButton, confirmButton } = elements;
+  proRoomDestroyTarget = {
+    roomCode,
+    roomGeneration,
+    restoreFocus: trigger,
+    busy: false,
+    requestId: createAdminRequestId(),
+  };
+  form.reset();
+  form.removeAttribute('aria-busy');
+  title.textContent = `Permanently delete PRO room ${roomCode}?`;
+  fieldLabel.textContent = `Enter ${roomCode} to confirm`;
+  input.disabled = false;
+  cancelButton.disabled = false;
+  confirmButton.disabled = true;
+  confirmButton.textContent = 'Delete permanently';
+  error.textContent = '';
+  dialog.dataset.roomCode = roomCode;
+  if (typeof dialog.showModal === 'function') {
+    try {
+      dialog.showModal();
+    } catch {
+      dialog.setAttribute('open', '');
+    }
+  } else {
+    dialog.setAttribute('open', '');
+  }
+  input.focus();
+}
+
+function resetProRoomLegacyOwnerDetachDialog(): void {
+  if (!proRoomLegacyOwnerDetachDialogElements) return;
+  const { dialog, form, retainedInput, targetInput, cancelButton, confirmButton, error } =
+    proRoomLegacyOwnerDetachDialogElements;
+  const restoreFocus = proRoomLegacyOwnerDetachTarget?.restoreFocus;
+  proRoomLegacyOwnerDetachTarget = null;
+  form.reset();
+  form.removeAttribute('aria-busy');
+  retainedInput.disabled = false;
+  targetInput.disabled = false;
+  cancelButton.disabled = false;
+  confirmButton.disabled = true;
+  confirmButton.textContent = 'Detach legacy owner';
+  error.textContent = '';
+  dialog.removeAttribute('data-room-code');
+  if (restoreFocus?.isConnected) restoreFocus.focus();
+}
+
+function closeProRoomLegacyOwnerDetachDialog({
+  restoreFocus = true,
+}: { readonly restoreFocus?: boolean } = {}): void {
+  if (!proRoomLegacyOwnerDetachDialogElements) return;
+  const { dialog } = proRoomLegacyOwnerDetachDialogElements;
+  if (!restoreFocus && proRoomLegacyOwnerDetachTarget) {
+    proRoomLegacyOwnerDetachTarget.restoreFocus = null;
+  }
+  if (!dialog.open && !dialog.hasAttribute('open')) {
+    resetProRoomLegacyOwnerDetachDialog();
+    return;
+  }
+  if (typeof dialog.close === 'function') {
+    try {
+      dialog.close();
+      return;
+    } catch {
+      // Lightweight DOM implementations use the attribute fallback.
+    }
+  }
+  dialog.removeAttribute('open');
+  dialog.dispatchEvent(new Event('close'));
+}
+
+function normalizeProRoomConfirmationInput(input: HTMLInputElement): string {
+  const digits = String(input?.value || '')
+    .replace(/\D/g, '')
+    .slice(0, 6);
+  if (input && input.value !== digits) input.value = digits;
+  return digits;
+}
+
+function syncProRoomLegacyOwnerDetachDialog(): void {
+  if (!proRoomLegacyOwnerDetachDialogElements) return;
+  const { retainedInput, targetInput, error, confirmButton } =
+    proRoomLegacyOwnerDetachDialogElements;
+  const retainedRoomCode = normalizeProRoomConfirmationInput(retainedInput);
+  const targetRoomCode = normalizeProRoomConfirmationInput(targetInput);
+  const expectedTarget = proRoomLegacyOwnerDetachTarget?.roomCode || '';
+  error.textContent = '';
+  confirmButton.disabled =
+    Boolean(proRoomLegacyOwnerDetachTarget?.busy) ||
+    !/^0\d{5}$/.test(retainedRoomCode) ||
+    retainedRoomCode === expectedTarget ||
+    targetRoomCode !== expectedTarget;
+}
+
+function setProRoomLegacyOwnerDetachBusy(isBusy: boolean): void {
+  if (!proRoomLegacyOwnerDetachDialogElements) return;
+  const { form, retainedInput, targetInput, cancelButton, confirmButton } =
+    proRoomLegacyOwnerDetachDialogElements;
+  if (isBusy) form.setAttribute('aria-busy', 'true');
+  else form.removeAttribute('aria-busy');
+  retainedInput.disabled = isBusy;
+  targetInput.disabled = isBusy;
+  cancelButton.disabled = isBusy;
+  confirmButton.textContent = isBusy ? 'Detaching...' : 'Detach legacy owner';
+  if (proRoomLegacyOwnerDetachTarget) proRoomLegacyOwnerDetachTarget.busy = isBusy;
+  syncProRoomLegacyOwnerDetachDialog();
+}
+
+async function detachProRoomLegacyOwner(): Promise<void> {
+  if (!proRoomLegacyOwnerDetachDialogElements || !proRoomLegacyOwnerDetachTarget) return;
+  const { retainedInput, targetInput, error } = proRoomLegacyOwnerDetachDialogElements;
+  const target = proRoomLegacyOwnerDetachTarget;
+  const retainedRoomCode = normalizeProRoomConfirmationInput(retainedInput);
+  const confirmedTargetRoomCode = normalizeProRoomConfirmationInput(targetInput);
+  if (
+    target.busy ||
+    !/^0\d{5}$/.test(retainedRoomCode) ||
+    retainedRoomCode === target.roomCode ||
+    confirmedTargetRoomCode !== target.roomCode
+  ) {
+    return;
+  }
+
+  setProRoomLegacyOwnerDetachBusy(true);
+  error.textContent = '';
+  try {
+    const payload = await fetchJson(`/api/admin/pro-rooms/${target.roomCode}/legacy-owner-detach`, {
+      method: 'POST',
+      body: JSON.stringify({
+        roomGeneration: target.roomGeneration,
+        retainRoomCode: retainedRoomCode,
+        confirmRoomCode: target.roomCode,
+      }),
+    });
+    const containsSensitiveOwnerRemovalField = [
+      'previousOwnerAccountId',
+      'accountId',
+      'removalId',
+    ].some((key) => Object.prototype.hasOwnProperty.call(payload || {}, key));
+    if (
+      containsSensitiveOwnerRemovalField ||
+      payload?.ok !== true ||
+      payload?.roomCode !== target.roomCode ||
+      normalizeProRoomGeneration(payload?.roomGeneration) !== target.roomGeneration ||
+      payload?.status !== 'suspended' ||
+      payload?.suspensionReason !== 'ownership_transfer_pending' ||
+      payload?.ownerAccountLinked !== false ||
+      payload?.retainedRoomCode !== retainedRoomCode
+    ) {
+      throw new Error('PRO_ROOM_ADMIN_INVALID_RESPONSE');
+    }
+
+    const incarnationKey = proRoomIncarnationKey(target.roomCode, target.roomGeneration);
+    if (incarnationKey) {
+      issuedOwnerRecoveryLinks.delete(incarnationKey);
+      issuedOwnerTransferLinks.delete(incarnationKey);
+      proRoomApiCache.delete(incarnationKey);
+      clearProRoomApiSecret(target.roomCode, target.roomGeneration);
+      if (visibleProRoomClaimIncarnation === incarnationKey) dismissProRoomClaim();
+    }
+    setProRoomStatus(
+      `${target.roomCode} owner authority detached. The room is suspended pending ownership transfer; ${retainedRoomCode} was verified as the retained room when this repair began.`,
+    );
+    try {
+      await loadProRooms();
+    } catch {
+      proRoomsLoaded = false;
+      setProRoomStatus(
+        `${target.roomCode} owner authority detached. Refresh the room list before issuing a transfer link.`,
+      );
+    }
+    target.restoreFocus = document.querySelector(
+      `[data-pro-room-item="${target.roomCode}"] > summary`,
+    );
+    closeProRoomLegacyOwnerDetachDialog();
+  } catch (detachError) {
+    if (proRoomLegacyOwnerDetachTarget !== target) return;
+    const safeRetryRequired =
+      (detachError instanceof Error &&
+        detachError.message === 'PRO_ROOM_OWNER_DETACH_RECONCILIATION_REQUIRED') ||
+      (detachError instanceof Error &&
+        detachError.message === 'PRO_ROOM_OWNER_DETACH_AUDIT_PENDING') ||
+      (isAdminRequestFailure(detachError) && detachError.code === 'ADMIN_MUTATION_OUTCOME_UNKNOWN');
+    setProRoomLegacyOwnerDetachBusy(false);
+    error.textContent = safeRetryRequired
+      ? 'The repair may be incomplete or its result is unknown. Keep this page open and retry the same repair; retrying is safe. Do not refresh.'
+      : adminErrorMessage(detachError, 'The legacy owner could not be detached.');
+    retainedInput.focus();
+  }
+}
+
+function ensureProRoomLegacyOwnerDetachDialog(): ProRoomLegacyOwnerDetachDialogElements {
+  if (proRoomLegacyOwnerDetachDialogElements) return proRoomLegacyOwnerDetachDialogElements;
+
+  const dialog = document.createElement('dialog');
+  dialog.className = 'pro-room-owner-detach-dialog';
+  dialog.dataset.proRoomOwnerDetachDialog = '';
+  dialog.setAttribute('aria-labelledby', 'pro-room-owner-detach-title');
+  dialog.setAttribute('aria-describedby', 'pro-room-owner-detach-description');
+
+  const form = document.createElement('form');
+  form.className = 'pro-room-owner-detach-form';
+  const copy = document.createElement('div');
+  copy.className = 'pro-room-owner-detach-copy';
+  const eyebrow = document.createElement('span');
+  eyebrow.className = 'pro-room-owner-detach-eyebrow';
+  eyebrow.textContent = 'Legacy owner repair';
+  const title = document.createElement('h2');
+  title.id = 'pro-room-owner-detach-title';
+  const description = document.createElement('p');
+  description.id = 'pro-room-owner-detach-description';
+  description.textContent =
+    'Use only when a legacy beta account is linked to two PRO rooms. This revokes the target room owner, sessions, PIN, delegated admins, credentials, and API keys, then suspends the room until ownership transfer. The room number, playlist, uploads, and settings stay intact. This does not transfer or delete the room.';
+  copy.append(eyebrow, title, description);
+
+  const retainedField = document.createElement('label');
+  retainedField.className = 'pro-room-owner-detach-field';
+  const retainedLabel = document.createElement('span');
+  retainedLabel.textContent = 'Retained room code (same owner)';
+  const retainedInput = document.createElement('input');
+  retainedInput.type = 'text';
+  retainedInput.inputMode = 'numeric';
+  retainedInput.maxLength = 6;
+  retainedInput.autocomplete = 'off';
+  retainedInput.spellcheck = false;
+  retainedInput.placeholder = '000001';
+  retainedInput.dataset.proRoomOwnerDetachRetained = '';
+  retainedInput.setAttribute(
+    'aria-describedby',
+    'pro-room-owner-detach-description pro-room-owner-detach-note pro-room-owner-detach-error',
+  );
+  retainedField.append(retainedLabel, retainedInput);
+
+  const targetField = document.createElement('label');
+  targetField.className = 'pro-room-owner-detach-field';
+  const targetLabel = document.createElement('span');
+  targetLabel.dataset.proRoomOwnerDetachTargetLabel = '';
+  const targetInput = document.createElement('input');
+  targetInput.type = 'text';
+  targetInput.inputMode = 'numeric';
+  targetInput.maxLength = 6;
+  targetInput.autocomplete = 'off';
+  targetInput.spellcheck = false;
+  targetInput.dataset.proRoomOwnerDetachTarget = '';
+  targetInput.setAttribute(
+    'aria-describedby',
+    'pro-room-owner-detach-description pro-room-owner-detach-note pro-room-owner-detach-error',
+  );
+  targetField.append(targetLabel, targetInput);
+
+  const note = document.createElement('p');
+  note.id = 'pro-room-owner-detach-note';
+  note.className = 'pro-room-owner-detach-note';
+  note.textContent =
+    'The server will verify that both rooms have the same canonical owner. Use ownership transfer after this repair to assign the target room to a different account.';
+  const error = document.createElement('p');
+  error.id = 'pro-room-owner-detach-error';
+  error.className = 'pro-room-owner-detach-error';
+  error.dataset.proRoomOwnerDetachError = '';
+  error.setAttribute('role', 'alert');
+  error.setAttribute('aria-live', 'assertive');
+
+  const actions = document.createElement('div');
+  actions.className = 'pro-room-owner-detach-actions';
+  const cancelButton = document.createElement('button');
+  cancelButton.type = 'button';
+  cancelButton.className = 'is-secondary';
+  cancelButton.textContent = 'Cancel';
+  cancelButton.dataset.proRoomOwnerDetachCancel = '';
+  const confirmButton = document.createElement('button');
+  confirmButton.type = 'submit';
+  confirmButton.className = 'is-danger';
+  confirmButton.textContent = 'Detach legacy owner';
+  confirmButton.disabled = true;
+  confirmButton.dataset.proRoomOwnerDetachConfirm = '';
+  actions.append(cancelButton, confirmButton);
+
+  form.append(copy, retainedField, targetField, note, error, actions);
+  dialog.append(form);
+  document.body.append(dialog);
+  proRoomLegacyOwnerDetachDialogElements = {
+    dialog,
+    form,
+    title,
+    targetLabel,
+    retainedInput,
+    targetInput,
+    error,
+    cancelButton,
+    confirmButton,
+  };
+  retainedInput.addEventListener('input', syncProRoomLegacyOwnerDetachDialog);
+  targetInput.addEventListener('input', syncProRoomLegacyOwnerDetachDialog);
+  cancelButton.addEventListener('click', () => closeProRoomLegacyOwnerDetachDialog());
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    detachProRoomLegacyOwner().catch(() => {});
+  });
+  dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    if (!proRoomLegacyOwnerDetachTarget?.busy) closeProRoomLegacyOwnerDetachDialog();
+  });
+  dialog.addEventListener('close', resetProRoomLegacyOwnerDetachDialog);
+  return proRoomLegacyOwnerDetachDialogElements;
+}
+
+function openProRoomLegacyOwnerDetachDialog(
+  roomCode: string,
+  roomGeneration: number,
+  trigger: HTMLElement | null,
+): void {
+  if (normalizeProRoomGeneration(roomGeneration) === null) {
+    setProRoomStatus('Room generation is unavailable. Refresh before making changes.', true);
+    return;
+  }
+  const elements = ensureProRoomLegacyOwnerDetachDialog();
+  const {
+    dialog,
+    form,
+    title,
+    targetLabel,
+    retainedInput,
+    targetInput,
+    error,
+    cancelButton,
+    confirmButton,
+  } = elements;
+  proRoomLegacyOwnerDetachTarget = {
+    roomCode,
+    roomGeneration,
+    restoreFocus: trigger,
+    busy: false,
+  };
+  form.reset();
+  form.removeAttribute('aria-busy');
+  title.textContent = `Detach legacy owner from PRO room ${roomCode}?`;
+  targetLabel.textContent = `Enter ${roomCode} to confirm the target room`;
+  retainedInput.disabled = false;
+  targetInput.disabled = false;
+  error.textContent = '';
+  cancelButton.disabled = false;
+  confirmButton.disabled = true;
+  confirmButton.textContent = 'Detach legacy owner';
+  dialog.dataset.roomCode = roomCode;
+  if (typeof dialog.showModal === 'function') {
+    try {
+      dialog.showModal();
+    } catch {
+      dialog.setAttribute('open', '');
+    }
+  } else {
+    dialog.setAttribute('open', '');
+  }
+  retainedInput.focus();
+}
+
+function resetProRoomTransferDialog(): void {
+  if (!proRoomTransferDialogElements) return;
+  const { form, input, error, issueButton } = proRoomTransferDialogElements;
+  const restoreFocus = proRoomTransferTarget?.restoreFocus;
+  proRoomTransferTarget = null;
+  form.reset();
+  form.removeAttribute('aria-busy');
+  input.disabled = false;
+  error.textContent = '';
+  issueButton.disabled = false;
+  issueButton.textContent = 'Issue transfer link';
+  restoreFocus?.focus?.({ preventScroll: true });
+}
+
+function closeProRoomTransferDialog({
+  restoreFocus = true,
+}: { readonly restoreFocus?: boolean } = {}): void {
+  if (!proRoomTransferDialogElements) return;
+  const { dialog } = proRoomTransferDialogElements;
+  if (!restoreFocus && proRoomTransferTarget) proRoomTransferTarget.restoreFocus = null;
+  if (!dialog.open && !dialog.hasAttribute('open')) {
+    resetProRoomTransferDialog();
+    return;
+  }
+  if (typeof dialog.close === 'function') {
+    try {
+      dialog.close();
+      return;
+    } catch {
+      // Lightweight DOM implementations use the attribute fallback.
+    }
+  }
+  dialog.removeAttribute('open');
+  dialog.dispatchEvent(new Event('close'));
+}
+
+function syncProRoomTransferDialog(): void {
+  if (!proRoomTransferDialogElements) return;
+  const { input, error, issueButton } = proRoomTransferDialogElements;
+  const value = String(input.value || '').trim();
+  error.textContent = '';
+  const validAccountId = /^acct_[A-Za-z0-9_-]{22}$/.test(value);
+  const validNickname =
+    value.length >= 1 && value.length <= 128 && Array.from(value.normalize('NFC')).length <= 20;
+  issueButton.disabled = Boolean(proRoomTransferTarget?.busy) || !(validAccountId || validNickname);
+}
+
+async function issueProRoomOwnerTransfer(): Promise<void> {
+  if (!proRoomTransferDialogElements || !proRoomTransferTarget) return;
+  const { input, error, cancelButton, issueButton, form } = proRoomTransferDialogElements;
+  const target = proRoomTransferTarget;
+  const targetAccount = String(input.value || '').trim();
+  const validAccountId = /^acct_[A-Za-z0-9_-]{22}$/.test(targetAccount);
+  const validNickname =
+    targetAccount.length >= 1 &&
+    targetAccount.length <= 128 &&
+    Array.from(targetAccount.normalize('NFC')).length <= 20;
+  if (target.busy || !(validAccountId || validNickname)) return;
+
+  target.busy = true;
+  form.setAttribute('aria-busy', 'true');
+  input.disabled = true;
+  cancelButton.disabled = true;
+  issueButton.disabled = true;
+  issueButton.textContent = 'Issuing...';
+  error.textContent = '';
+  try {
+    const payload = await fetchJson(
+      `/api/admin/pro-rooms/${target.roomCode}/owner-transfer-claim`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          roomGeneration: target.roomGeneration,
+          targetAccount,
+        }),
+      },
+    );
+    if (
+      payload?.roomCode !== target.roomCode ||
+      normalizeProRoomGeneration(payload?.roomGeneration) !== target.roomGeneration ||
+      !/^acct_[A-Za-z0-9_-]{22}$/.test(payload?.targetAccountId || '') ||
+      (validAccountId && payload.targetAccountId !== targetAccount) ||
+      typeof payload?.targetNickname !== 'string' ||
+      !payload.targetNickname.trim()
+    ) {
+      throw new Error('PRO_ROOM_GENERATION_MISMATCH');
+    }
+    closeProRoomTransferDialog({ restoreFocus: false });
+    showProRoomClaim(payload, 'transfer', target.roomGeneration);
+    setProRoomStatus(
+      `${target.roomCode} transfer link issued${
+        typeof payload.targetNickname === 'string' && payload.targetNickname
+          ? ` for ${payload.targetNickname}`
+          : ''
+      }.`,
+    );
+    proRoomClaimUrlEl?.focus({ preventScroll: true });
+  } catch (issueError) {
+    if (proRoomTransferTarget !== target) return;
+    target.busy = false;
+    form.removeAttribute('aria-busy');
+    input.disabled = false;
+    cancelButton.disabled = false;
+    issueButton.textContent = 'Issue transfer link';
+    syncProRoomTransferDialog();
+    error.textContent = adminErrorMessage(
+      issueError,
+      'The owner transfer link could not be issued.',
+    );
+    input.focus();
+  }
+}
+
+function ensureProRoomTransferDialog(): ProRoomTransferDialogElements {
+  if (proRoomTransferDialogElements) return proRoomTransferDialogElements;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'pro-room-transfer-dialog';
+  dialog.setAttribute('aria-labelledby', 'pro-room-transfer-title');
+  dialog.setAttribute('aria-describedby', 'pro-room-transfer-description');
+
+  const form = document.createElement('form');
+  form.className = 'pro-room-transfer-form';
+  const eyebrow = document.createElement('span');
+  eyebrow.className = 'pro-room-transfer-eyebrow';
+  eyebrow.textContent = 'Ownership transfer';
+  const title = document.createElement('h2');
+  title.id = 'pro-room-transfer-title';
+  const description = document.createElement('p');
+  description.id = 'pro-room-transfer-description';
+  description.textContent =
+    'Bind a one-time link to one active, fully configured MUSIXQUARE account. When redeemed, the old owner is signed out and every existing Developer API key is revoked.';
+
+  const field = document.createElement('label');
+  field.className = 'pro-room-transfer-field';
+  const fieldLabel = document.createElement('span');
+  fieldLabel.textContent = 'Target nickname or account ID';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.maxLength = 128;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.placeholder = 'Nickname or acct_…';
+  input.setAttribute('aria-describedby', 'pro-room-transfer-description pro-room-transfer-error');
+  field.append(fieldLabel, input);
+
+  const note = document.createElement('p');
+  note.className = 'pro-room-transfer-note';
+  note.textContent =
+    'Enter the exact unique nickname or immutable account ID. The recipient must sign in to the verified account before opening the link. No account search or suggestions are exposed, and the full link is shown only once.';
+  const error = document.createElement('p');
+  error.id = 'pro-room-transfer-error';
+  error.className = 'pro-room-transfer-error';
+  error.setAttribute('role', 'alert');
+  error.setAttribute('aria-live', 'assertive');
+
+  const actions = document.createElement('div');
+  actions.className = 'pro-room-transfer-actions';
+  const cancelButton = document.createElement('button');
+  cancelButton.type = 'button';
+  cancelButton.className = 'is-secondary';
+  cancelButton.textContent = 'Cancel';
+  const issueButton = document.createElement('button');
+  issueButton.type = 'submit';
+  issueButton.textContent = 'Issue transfer link';
+  issueButton.disabled = true;
+  actions.append(cancelButton, issueButton);
+  form.append(eyebrow, title, description, field, note, error, actions);
+  dialog.append(form);
+  document.body.append(dialog);
+  proRoomTransferDialogElements = {
+    dialog,
+    form,
+    title,
+    input,
+    error,
+    cancelButton,
+    issueButton,
+  };
+  input.addEventListener('input', syncProRoomTransferDialog);
+  cancelButton.addEventListener('click', () => closeProRoomTransferDialog());
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    issueProRoomOwnerTransfer().catch(() => {});
+  });
+  dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    if (!proRoomTransferTarget?.busy) closeProRoomTransferDialog();
+  });
+  dialog.addEventListener('close', resetProRoomTransferDialog);
+  return proRoomTransferDialogElements;
+}
+
+function openProRoomTransferDialog(
+  roomCode: string,
+  roomGeneration: number,
+  trigger: HTMLElement | null,
+): void {
+  if (normalizeProRoomGeneration(roomGeneration) === null) {
+    setProRoomStatus('Room generation is unavailable. Refresh before making changes.', true);
+    return;
+  }
+  const elements = ensureProRoomTransferDialog();
+  const { dialog, form, title, input, error, cancelButton, issueButton } = elements;
+  proRoomTransferTarget = {
+    roomCode,
+    roomGeneration,
+    restoreFocus: trigger,
+    busy: false,
+  };
+  form.reset();
+  form.removeAttribute('aria-busy');
+  title.textContent = `Transfer PRO room ${roomCode}`;
+  input.disabled = false;
+  error.textContent = '';
+  cancelButton.disabled = false;
+  issueButton.disabled = true;
+  const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+  issueButton.textContent =
+    incarnationKey && issuedOwnerTransferLinks.has(incarnationKey)
+      ? 'Issue another link'
+      : 'Issue transfer link';
+  if (typeof dialog.showModal === 'function') {
+    try {
+      dialog.showModal();
+    } catch {
+      dialog.setAttribute('open', '');
+    }
+  } else {
+    dialog.setAttribute('open', '');
+  }
+  input.focus();
+}
+
+async function copySensitiveValue(
+  value: string,
+  input: HTMLInputElement,
+  button: HTMLButtonElement,
+): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    input?.focus();
+    input?.select();
+    if (!document.execCommand?.('copy')) throw new Error('COPY_FAILED');
+  }
+  const previous = button.textContent;
+  button.textContent = 'Copied';
+  window.setTimeout(() => {
+    if (button.isConnected) button.textContent = previous;
+  }, 1600);
+}
+
+function renderProRoomApiSecret(roomCode: string, roomGeneration: number | null): HTMLElement {
+  const host = document.createElement('div');
+  host.className = 'pro-room-api-secret';
+  host.dataset.proRoomApiSecret = roomCode;
+  host.setAttribute('aria-live', 'polite');
+  const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+  const issued = incarnationKey ? proRoomApiSecrets.get(incarnationKey) : null;
+  if (!issued?.apiKey) return host;
+
+  const copy = document.createElement('div');
+  copy.className = 'pro-room-api-secret-copy';
+  const title = document.createElement('strong');
+  title.textContent = 'API key issued';
+  const warning = document.createElement('span');
+  warning.textContent = 'Copy it now. The full key cannot be shown again.';
+  copy.append(title, warning);
+
+  const row = document.createElement('div');
+  row.className = 'pro-room-api-secret-row';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.readOnly = true;
+  input.autocomplete = 'off';
+  input.value = issued.apiKey;
+  input.setAttribute('aria-label', `${roomCode} Developer API key`);
+  const copyButton = document.createElement('button');
+  copyButton.type = 'button';
+  copyButton.textContent = 'Copy key';
+  copyButton.addEventListener('click', () => {
+    copySensitiveValue(issued.apiKey, input, copyButton).catch(() => {
+      input.focus();
+      input.select();
+    });
+  });
+  const dismiss = document.createElement('button');
+  dismiss.type = 'button';
+  dismiss.className = 'is-secondary';
+  dismiss.textContent = 'Dismiss';
+  dismiss.addEventListener('click', () => clearProRoomApiSecret(roomCode, roomGeneration));
+  row.append(input, copyButton, dismiss);
+  host.append(copy, row);
+  return host;
+}
+
+function renderProRoomApiKey(
+  roomCode: string,
+  roomGeneration: number | null,
+  roomStatus: string,
+  panel: HTMLElement,
+  key: DeveloperApiKey,
+  refresh: ProRoomApiRefresh,
+): HTMLElement {
+  const item = document.createElement('article');
+  item.className = 'pro-room-api-key';
+  const identity = document.createElement('div');
+  identity.className = 'pro-room-api-key-identity';
+  const label = document.createElement('strong');
+  label.textContent = String(key?.label || 'Unnamed integration');
+  const id = document.createElement('code');
+  id.textContent = String(key?.keyId || '');
+  identity.append(label, id);
+
+  const metadata = document.createElement('div');
+  metadata.className = 'pro-room-api-key-meta';
+  const state = document.createElement('span');
+  const keyStatus =
+    typeof key.status === 'string' && ['active', 'expired', 'revoked'].includes(key.status)
+      ? key.status
+      : 'revoked';
+  state.className = `pro-room-api-key-state is-${keyStatus}`;
+  state.textContent = keyStatus.charAt(0).toUpperCase() + keyStatus.slice(1);
+  const expiry = document.createElement('small');
+  const expiresAt = formatAdminDateTime(key?.expiresAt);
+  expiry.textContent = expiresAt ? `Expires ${expiresAt}` : 'Expiry unavailable';
+  const lastUsed = document.createElement('small');
+  const lastUsedAt = formatAdminDateTime(key?.lastUsedAt ?? key?.lastUsedHour);
+  lastUsed.textContent = lastUsedAt ? `Last used ${lastUsedAt}` : 'Not used yet';
+  metadata.append(state, expiry, lastUsed);
+
+  const scopes = document.createElement('div');
+  scopes.className = 'pro-room-api-key-scopes';
+  for (const scope of Array.isArray(key?.scopes) ? key.scopes : []) {
+    const chip = document.createElement('span');
+    chip.textContent = developerApiScopeLabels[scope] || scope;
+    scopes.append(chip);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'pro-room-api-key-actions';
+  if (keyStatus === 'active' && key?.keyId && roomGeneration !== null) {
+    const revoke = document.createElement('button');
+    revoke.type = 'button';
+    revoke.textContent = 'Revoke';
+    revoke.setAttribute('aria-label', `Revoke ${label.textContent}`);
+    addAsyncAdminEventListener(revoke, 'click', async () => {
+      if (!window.confirm(`Revoke “${label.textContent}”? This cannot be undone.`)) return;
+      revoke.disabled = true;
+      revoke.textContent = 'Revoking...';
+      try {
+        const revoked = await fetchJson(`/api/admin/pro-rooms/${roomCode}/api-keys/${key.keyId}`, {
+          method: 'DELETE',
+          body: JSON.stringify({ roomGeneration }),
+        });
+        if (
+          revoked?.roomCode !== roomCode ||
+          normalizeProRoomGeneration(revoked?.roomGeneration) !== roomGeneration
+        ) {
+          throw new Error('PRO_ROOM_GENERATION_MISMATCH');
+        }
+        const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+        if (incarnationKey && proRoomApiSecrets.get(incarnationKey)?.keyId === key.keyId) {
+          clearProRoomApiSecret(roomCode, roomGeneration);
+        }
+        await refresh('API key revoked.');
+      } catch (error) {
+        revoke.disabled = false;
+        revoke.textContent = 'Revoke';
+        if (isProRoomGenerationMismatchError(error)) {
+          const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+          if (incarnationKey) proRoomApiCache.delete(incarnationKey);
+          clearProRoomApiSecret(roomCode, roomGeneration);
+          renderProRoomApiPanel(
+            roomCode,
+            null,
+            roomStatus,
+            panel,
+            { keys: [], maxActiveKeys: 3 },
+            adminErrorMessage(error, 'API key revocation failed.'),
+            true,
+          );
+          loadProRooms({ updateTimestamp: false }).catch(() => {});
+          return;
+        }
+        await refresh(adminErrorMessage(error, 'API key revocation failed.'), true, false);
+      }
+    });
+    actions.append(revoke);
+  }
+  item.append(identity, metadata, scopes, actions);
+  return item;
+}
+
+function renderProRoomApiShell(roomCode: string, panel: HTMLElement): void {
+  panel.replaceChildren();
+  panel.classList.add('is-loading');
+  panel.setAttribute('aria-busy', 'true');
+
+  const head = document.createElement('div');
+  head.className = 'pro-room-api-head';
+  const heading = document.createElement('div');
+  const title = document.createElement('strong');
+  title.textContent = 'Developer API';
+  const description = document.createElement('span');
+  description.textContent = 'Issue room-bound credentials for servers, bots, and integrations.';
+  heading.append(title, description);
+  const count = document.createElement('span');
+  count.className = 'pro-room-api-skeleton-line is-count';
+  count.setAttribute('aria-hidden', 'true');
+  head.append(heading, count);
+
+  const form = document.createElement('div');
+  form.className = 'pro-room-api-form is-loading';
+  form.setAttribute('aria-hidden', 'true');
+  for (const labelText of ['Integration name', 'Access', 'Expires']) {
+    const field = document.createElement('div');
+    field.className = 'pro-room-api-field';
+    const label = document.createElement('span');
+    label.textContent = labelText;
+    const control = document.createElement('span');
+    control.className = 'pro-room-api-skeleton-control';
+    field.append(label, control);
+    form.append(field);
+  }
+  const issue = document.createElement('span');
+  issue.className = 'pro-room-api-skeleton-button';
+  form.append(issue);
+
+  const status = document.createElement('p');
+  status.className = 'pro-room-api-status';
+  status.dataset.proRoomApiStatus = roomCode;
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  status.textContent = 'Loading API keys...';
+
+  const list = document.createElement('div');
+  list.className = 'pro-room-api-key-list';
+  list.setAttribute('aria-hidden', 'true');
+  const key = document.createElement('div');
+  key.className = 'pro-room-api-key is-loading';
+  for (const className of ['is-identity', 'is-metadata', 'is-scopes', 'is-action']) {
+    const placeholder = document.createElement('span');
+    placeholder.className = `pro-room-api-skeleton-line ${className}`;
+    key.append(placeholder);
+  }
+  list.append(key);
+
+  panel.append(head, form, status, list);
+}
+
+function renderProRoomApiPanel(
+  roomCode: string,
+  roomGeneration: number | null,
+  roomStatus: string,
+  panel: HTMLElement,
+  payload: AdminApiPayload,
+  message = '',
+  isError = false,
+): void {
+  const validRoomGeneration = normalizeProRoomGeneration(roomGeneration) !== null;
+  const keys = Array.isArray(payload?.keys) ? payload.keys : [];
+  const activeCount = keys.filter((key) => key?.status === 'active').length;
+  const maxActiveKeys =
+    typeof payload.maxActiveKeys === 'number' && Number.isSafeInteger(payload.maxActiveKeys)
+      ? payload.maxActiveKeys
+      : 3;
+  panel.replaceChildren();
+  panel.classList.remove('is-loading');
+  panel.removeAttribute('aria-busy');
+
+  const head = document.createElement('div');
+  head.className = 'pro-room-api-head';
+  const heading = document.createElement('div');
+  const title = document.createElement('strong');
+  title.textContent = 'Developer API';
+  const description = document.createElement('span');
+  description.textContent = 'Issue room-bound credentials for servers, bots, and integrations.';
+  heading.append(title, description);
+  const count = document.createElement('span');
+  count.textContent = `${activeCount} active · ${maxActiveKeys} max`;
+  head.append(heading, count);
+
+  const status = document.createElement('p');
+  status.className = `pro-room-api-status${isError ? ' is-error' : ''}`;
+  status.dataset.proRoomApiStatus = roomCode;
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  status.textContent = message;
+
+  const form = document.createElement('form');
+  form.className = 'pro-room-api-form';
+  form.dataset.proRoomApiForm = roomCode;
+  const labelField = document.createElement('label');
+  labelField.className = 'pro-room-api-field';
+  const labelTitle = document.createElement('span');
+  labelTitle.textContent = 'Integration name';
+  const labelInput = document.createElement('input');
+  labelInput.name = 'label';
+  labelInput.maxLength = 64;
+  labelInput.placeholder = 'Cafe controller';
+  labelInput.autocomplete = 'off';
+  labelInput.required = true;
+  labelField.append(labelTitle, labelInput);
+
+  const accessField = document.createElement('label');
+  accessField.className = 'pro-room-api-field';
+  const accessTitle = document.createElement('span');
+  accessTitle.textContent = 'Access';
+  const accessSelect = document.createElement('select');
+  accessSelect.name = 'preset';
+  const accessOptions: readonly (readonly [string, string])[] = [
+    ['read', 'Read only'],
+    ['playlist', 'Playback, playlist & upload'],
+    ['full', 'Full control'],
+  ];
+  for (const [value, text] of accessOptions) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    if (value === 'read') option.selected = true;
+    accessSelect.append(option);
+  }
+  accessField.append(accessTitle, accessSelect);
+
+  const expiryField = document.createElement('label');
+  expiryField.className = 'pro-room-api-field';
+  const expiryTitle = document.createElement('span');
+  expiryTitle.textContent = 'Expires';
+  const expirySelect = document.createElement('select');
+  expirySelect.name = 'days';
+  for (const days of [30, 90, 180, 365]) {
+    const option = document.createElement('option');
+    option.value = String(days);
+    option.textContent = `${days} days`;
+    if (days === 90) option.selected = true;
+    expirySelect.append(option);
+  }
+  expiryField.append(expiryTitle, expirySelect);
+
+  const issue = document.createElement('button');
+  issue.type = 'submit';
+  issue.textContent = 'Issue API key';
+  issue.disabled = !validRoomGeneration || activeCount >= maxActiveKeys || roomStatus !== 'active';
+  if (!validRoomGeneration) {
+    issue.title = 'Refresh the room list before issuing a key.';
+  } else if (roomStatus !== 'active') {
+    issue.title = 'Activate or resume this room before issuing a key.';
+  }
+  form.append(labelField, accessField, expiryField, issue);
+  addAsyncAdminEventListener(form, 'submit', async (event) => {
+    event.preventDefault();
+    if (!validRoomGeneration || issue.disabled) return;
+    const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+    if (!incarnationKey) return;
+    const sessionEpoch = adminSessionEpoch;
+    const issuanceOwner = Symbol();
+    proRoomApiIssuanceOwners.set(incarnationKey, issuanceOwner);
+    const ownsIssuance = () =>
+      adminSessionEpoch === sessionEpoch &&
+      proRoomApiIssuanceOwners.get(incarnationKey) === issuanceOwner &&
+      panel.isConnected &&
+      panel.closest<HTMLDetailsElement>('[data-pro-room-item]')?.open === true;
+    const preset = developerApiPresets[accessSelect.value] || developerApiPresets.read || [];
+    const requestBody = JSON.stringify({
+      roomGeneration,
+      label: labelInput.value.trim(),
+      days: Number(expirySelect.value),
+      scopes: preset,
+      requestId: createAdminRequestId(),
+    });
+    issue.disabled = true;
+    issue.textContent = 'Issuing...';
+    try {
+      let issued: AdminApiPayload | undefined;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (!ownsIssuance()) return;
+        try {
+          issued = await fetchJson(`/api/admin/pro-rooms/${roomCode}/api-keys`, {
+            method: 'POST',
+            body: requestBody,
+          });
+          break;
+        } catch (error) {
+          if (!ownsIssuance()) return;
+          if (isAdminRequestFailure(error) && error.code === 'ADMIN_REQUEST_CANCELLED') return;
+          if ((isAdminRequestFailure(error) && error.status) || attempt === 1) throw error;
+        }
+      }
+      if (!ownsIssuance()) return;
+      if (typeof issued?.apiKey !== 'string' || !issued.apiKey.startsWith('mxqr_live_')) {
+        throw new Error('INVALID_DEVELOPER_API_KEY_RESPONSE');
+      }
+      if (
+        issued?.roomCode !== roomCode ||
+        normalizeProRoomGeneration(issued?.roomGeneration) !== roomGeneration
+      ) {
+        throw new Error('PRO_ROOM_GENERATION_MISMATCH');
+      }
+      proRoomApiSecrets.set(incarnationKey, {
+        apiKey: issued.apiKey,
+        keyId: typeof issued?.key?.keyId === 'string' ? issued.key.keyId : '',
+      });
+      form.reset();
+      await loadProRoomApiKeys(
+        roomCode,
+        roomGeneration,
+        roomStatus,
+        panel,
+        'API key issued. Copy it now.',
+      );
+      if (!ownsIssuance()) return;
+      panel
+        .querySelector<HTMLElement>(`[aria-label="${roomCode} Developer API key"]`)
+        ?.focus({ preventScroll: true });
+    } catch (error) {
+      if (!ownsIssuance()) return;
+      if (isProRoomGenerationMismatchError(error)) {
+        const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+        if (incarnationKey) proRoomApiCache.delete(incarnationKey);
+        clearProRoomApiSecret(roomCode, roomGeneration);
+        renderProRoomApiPanel(
+          roomCode,
+          null,
+          roomStatus,
+          panel,
+          { keys: [], maxActiveKeys: 3 },
+          adminErrorMessage(error, 'API key issuance failed.'),
+          true,
+        );
+        loadProRooms({ updateTimestamp: false }).catch(() => {});
+        return;
+      }
+      await loadProRoomApiKeys(
+        roomCode,
+        roomGeneration,
+        roomStatus,
+        panel,
+        adminErrorMessage(error, 'API key issuance failed.'),
+        true,
+      );
+    }
+  });
+
+  const list = document.createElement('div');
+  list.className = 'pro-room-api-key-list';
+  const refresh: ProRoomApiRefresh = async (
+    nextMessage = '',
+    nextIsError = false,
+    reload = true,
+  ) => {
+    if (reload) {
+      await loadProRoomApiKeys(
+        roomCode,
+        roomGeneration,
+        roomStatus,
+        panel,
+        nextMessage,
+        nextIsError,
+      );
+      return;
+    }
+    renderProRoomApiPanel(
+      roomCode,
+      roomGeneration,
+      roomStatus,
+      panel,
+      payload,
+      nextMessage,
+      nextIsError,
+    );
+  };
+  const rows = keys.map((key) =>
+    renderProRoomApiKey(roomCode, roomGeneration, roomStatus, panel, key, refresh),
+  );
+  if (rows.length) list.append(...rows);
+  else {
+    const empty = document.createElement('p');
+    empty.className = 'pro-room-api-empty';
+    empty.textContent = 'No API keys issued for this room.';
+    list.append(empty);
+  }
+
+  panel.append(head, renderProRoomApiSecret(roomCode, roomGeneration), form, status, list);
+}
+
+async function loadProRoomApiKeys(
+  roomCode: string,
+  roomGeneration: number | null,
+  roomStatus: string,
+  panel: HTMLElement,
+  message = '',
+  isError = false,
+): Promise<void> {
+  if (!panel?.isConnected) return;
+  const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+  if (!incarnationKey) {
+    renderProRoomApiPanel(
+      roomCode,
+      roomGeneration,
+      roomStatus,
+      panel,
+      { keys: [], maxActiveKeys: 3 },
+      'Room generation is unavailable. Refresh before making changes.',
+      true,
+    );
+    return;
+  }
+  const requestGeneration = (proRoomApiRequestGenerations.get(incarnationKey) || 0) + 1;
+  proRoomApiRequestGenerations.set(incarnationKey, requestGeneration);
+  if (!message) {
+    const status = panel.querySelector('[data-pro-room-api-status]');
+    if (status) status.textContent = 'Loading API keys...';
+  }
+  try {
+    const payload = await fetchJson(`/api/admin/pro-rooms/${roomCode}/api-keys`);
+    if (proRoomApiRequestGenerations.get(incarnationKey) !== requestGeneration) return;
+    if (normalizeProRoomGeneration(payload?.roomGeneration) !== roomGeneration) {
+      throw new Error('PRO_ROOM_GENERATION_MISMATCH');
+    }
+    proRoomApiCache.set(incarnationKey, payload);
+    if (panel.isConnected) {
+      renderProRoomApiPanel(roomCode, roomGeneration, roomStatus, panel, payload, message, isError);
+    }
+  } catch (error) {
+    if (proRoomApiRequestGenerations.get(incarnationKey) !== requestGeneration) return;
+    const generationMismatch = isProRoomGenerationMismatchError(error);
+    if (generationMismatch) {
+      proRoomApiCache.delete(incarnationKey);
+      clearProRoomApiSecret(roomCode, roomGeneration);
+    }
+    const cached = generationMismatch
+      ? { keys: [], maxActiveKeys: 3 }
+      : proRoomApiCache.get(incarnationKey) || { keys: [], maxActiveKeys: 3 };
+    if (panel.isConnected) {
+      renderProRoomApiPanel(
+        roomCode,
+        generationMismatch ? null : roomGeneration,
+        roomStatus,
+        panel,
+        cached,
+        adminErrorMessage(error, 'API keys could not be loaded.'),
+        true,
+      );
+    }
+    if (generationMismatch) loadProRooms({ updateTimestamp: false }).catch(() => {});
+  }
+}
+
+function renderProRoomLabelEditor(
+  room: ProRoomRecord,
+  roomCode: string,
+  roomGeneration: number,
+): HTMLElement {
+  const form = document.createElement('form');
+  form.className = 'pro-room-label-form';
+  form.dataset.proRoomLabelForm = roomCode;
+
+  const field = document.createElement('label');
+  field.className = 'pro-room-label-field';
+  const title = document.createElement('span');
+  title.textContent = 'Room label';
+  const input = document.createElement('input');
+  input.name = 'label';
+  input.value = String(room?.label || '');
+  input.maxLength = 64;
+  input.autocomplete = 'off';
+  input.required = true;
+  input.setAttribute('aria-label', `${roomCode} room label`);
+  field.append(title, input);
+
+  const save = document.createElement('button');
+  save.type = 'submit';
+  save.textContent = 'Save label';
+  save.disabled = true;
+
+  const status = document.createElement('p');
+  status.className = 'pro-room-label-status';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+
+  const syncSaveState = () => {
+    const nextLabel = input.value.trim();
+    save.disabled =
+      !nextLabel || nextLabel.length > 64 || nextLabel === String(room?.label || '').trim();
+  };
+  input.addEventListener('input', syncSaveState);
+  addAsyncAdminEventListener(form, 'submit', async (event) => {
+    event.preventDefault();
+    const nextLabel = input.value.trim();
+    if (!nextLabel || nextLabel.length > 64 || save.disabled) return;
+    input.disabled = true;
+    save.disabled = true;
+    save.textContent = 'Saving...';
+    status.textContent = '';
+    status.classList.remove('is-error');
+    try {
+      const payload = await fetchJson(`/api/admin/pro-rooms/${roomCode}/label`, {
+        method: 'POST',
+        body: JSON.stringify({ roomGeneration, label: nextLabel }),
+      });
+      if (
+        payload?.roomCode !== roomCode ||
+        normalizeProRoomGeneration(payload?.roomGeneration) !== roomGeneration ||
+        typeof payload?.label !== 'string' ||
+        !payload.label.trim()
+      ) {
+        throw new Error('PRO_ROOM_GENERATION_MISMATCH');
+      }
+      room.label = payload.label.trim();
+      input.value = room.label;
+      const summaryLabel = form
+        .closest('[data-pro-room-item]')
+        ?.querySelector('[data-pro-room-label-value]');
+      if (summaryLabel) summaryLabel.textContent = room.label;
+      status.textContent =
+        payload.changed === false ? 'Label is already up to date.' : 'Label saved.';
+    } catch (error) {
+      status.textContent = adminErrorMessage(error, 'Room label could not be saved.');
+      status.classList.add('is-error');
+      if (isProRoomGenerationMismatchError(error)) {
+        loadProRooms({ updateTimestamp: false }).catch(() => {});
+      }
+    } finally {
+      input.disabled = false;
+      save.textContent = 'Save label';
+      syncSaveState();
+    }
+  });
+
+  form.append(field, save, status);
+  return form;
+}
+
+function renderProRoomActions(
+  room: ProRoomRecord,
+  roomCode: string,
+  roomGeneration: number | null,
+  rawStatus: string,
+): HTMLElement {
+  const section = document.createElement('section');
+  section.className = 'pro-room-controls';
+  const heading = document.createElement('strong');
+  heading.textContent = 'Room controls';
+  const actions = document.createElement('div');
+  actions.className = 'pro-room-actions';
+  const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+  const suspensionReason =
+    typeof room?.suspensionReason === 'string' ? room.suspensionReason : null;
+  const ownerAccountLinked =
+    rawStatus === 'active' && typeof room?.ownerAccountLinked === 'boolean'
+      ? room.ownerAccountLinked
+      : null;
+  const ownerTransferPrepared = room?.ownerTransferPrepared === true;
+  if (!incarnationKey || roomGeneration === null) {
+    const message = document.createElement('p');
+    message.className = 'pro-room-terminal-copy';
+    message.textContent =
+      'Room generation is unavailable. Refresh before making administrative changes.';
+    section.append(heading, message);
+    return section;
+  }
+
+  if (rawStatus === 'decommissioning' || rawStatus === 'decommissioned') {
+    const message = document.createElement('p');
+    message.className = 'pro-room-terminal-copy';
+    message.textContent =
+      rawStatus === 'decommissioning'
+        ? 'The room is closed while the final storage sweep completes.'
+        : 'This room incarnation is permanently deleted. An administrator may register the room number as a new room.';
+    section.append(heading, message);
+    return section;
+  }
+
+  const labelEditor =
+    rawStatus === 'provisioning' ? null : renderProRoomLabelEditor(room, roomCode, roomGeneration);
+
+  if (rawStatus !== 'provisioning' && rawStatus !== 'suspended') {
+    const open = document.createElement('a');
+    open.href = `/${roomCode}`;
+    open.target = '_blank';
+    open.rel = 'noopener noreferrer';
+    open.textContent = 'Open room';
+    actions.append(open);
+  }
+
+  const activation = document.createElement('button');
+  activation.type = 'button';
+  if (rawStatus === 'provisioning') {
+    activation.textContent = 'Retry provisioning';
+    addAsyncAdminEventListener(activation, 'click', async () => {
+      activation.disabled = true;
+      activation.textContent = 'Retrying...';
+      setProRoomStatus('');
+      try {
+        await fetchJson('/api/admin/pro-rooms', {
+          method: 'POST',
+          body: JSON.stringify({ roomCode, label: room.label || undefined }),
+        });
+        setProRoomStatus(`${roomCode} provisioned.`);
+        await loadProRooms();
+      } catch (error) {
+        activation.disabled = false;
+        activation.textContent = 'Retry provisioning';
+        setProRoomStatus(adminErrorMessage(error, 'Provisioning retry failed.'), true);
+      }
+    });
+  } else if (rawStatus === 'active' && ownerAccountLinked === true) {
+    activation.textContent = issuedOwnerRecoveryLinks.has(incarnationKey)
+      ? 'Issue another owner recovery link'
+      : 'Issue owner recovery link';
+    activation.title =
+      'Recovery works only for the same account already linked as owner. To assign a different or previously unlinked account, use ownership transfer.';
+    addAsyncAdminEventListener(activation, 'click', async () => {
+      activation.disabled = true;
+      activation.textContent = 'Issuing...';
+      setProRoomStatus('');
+      try {
+        const payload = await fetchJson(`/api/admin/pro-rooms/${roomCode}/owner-recovery-claim`, {
+          method: 'POST',
+          body: JSON.stringify({ roomGeneration }),
+        });
+        showProRoomClaim(payload, 'recovery', roomGeneration);
+        activation.textContent = 'Issue another owner recovery link';
+        activation.disabled = false;
+      } catch (error) {
+        activation.disabled = false;
+        activation.textContent = 'Issue owner recovery link';
+        setProRoomStatus(adminErrorMessage(error, 'Owner recovery link failed.'), true);
+        loadProRooms({ updateTimestamp: false }).catch(() => {});
+      }
+    });
+  } else if (
+    (rawStatus === 'active' && ownerAccountLinked === false) ||
+    (rawStatus === 'suspended' &&
+      (suspensionReason === 'owner_account_deleted' ||
+        (suspensionReason === 'ownership_transfer_pending' && !ownerTransferPrepared)))
+  ) {
+    activation.textContent = issuedOwnerTransferLinks.has(incarnationKey)
+      ? 'Issue another owner transfer link'
+      : 'Assign a new owner';
+    activation.title =
+      'Ownership transfer required. Bind a one-time ownership transfer link to one active MUSIXQUARE account.';
+    activation.addEventListener('click', () =>
+      openProRoomTransferDialog(roomCode, roomGeneration, activation),
+    );
+  } else if (rawStatus === 'active') {
+    activation.textContent = 'Owner status unavailable';
+    activation.title = 'Refresh the room list before issuing an owner-authority link.';
+    activation.disabled = true;
+  } else if (
+    rawStatus === 'suspended' &&
+    suspensionReason === 'ownership_transfer_pending' &&
+    ownerTransferPrepared
+  ) {
+    activation.textContent = 'Replace expired transfer link';
+    activation.title =
+      'If the current transfer is still valid, the service will preserve it. Once it expires, this issues a replacement bound to the account you choose.';
+    activation.addEventListener('click', () =>
+      openProRoomTransferDialog(roomCode, roomGeneration, activation),
+    );
+  } else {
+    activation.textContent = issuedActivationLinks.has(incarnationKey)
+      ? 'Reissue activation link'
+      : 'Issue activation link';
+    activation.disabled = rawStatus === 'suspended';
+    if (rawStatus === 'suspended') activation.title = 'Resume the room before issuing a link.';
+    addAsyncAdminEventListener(activation, 'click', async () => {
+      activation.disabled = true;
+      activation.textContent = 'Issuing...';
+      setProRoomStatus('');
+      try {
+        const payload = await fetchJson(`/api/admin/pro-rooms/${roomCode}/activation-claim`, {
+          method: 'POST',
+          body: JSON.stringify({ roomGeneration }),
+        });
+        showProRoomClaim(payload, 'activation', roomGeneration);
+        activation.textContent = 'Reissue activation link';
+        activation.disabled = false;
+      } catch (error) {
+        activation.disabled = false;
+        activation.textContent = 'Issue activation link';
+        setProRoomStatus(adminErrorMessage(error, 'Activation link failed.'), true);
+        loadProRooms({ updateTimestamp: false }).catch(() => {});
+      }
+    });
+  }
+  actions.append(activation);
+
+  if (rawStatus === 'active' && ownerAccountLinked === true) {
+    const transfer = document.createElement('button');
+    transfer.type = 'button';
+    transfer.className = 'is-secondary';
+    transfer.textContent = issuedOwnerTransferLinks.has(incarnationKey)
+      ? 'Issue another transfer link'
+      : 'Transfer ownership';
+    transfer.title =
+      'Bind a one-time link to the exact recipient account. Redemption signs out the old owner and revokes API keys.';
+    transfer.addEventListener('click', () =>
+      openProRoomTransferDialog(roomCode, roomGeneration, transfer),
+    );
+    actions.append(transfer);
+  }
+
+  if (
+    rawStatus === 'active' ||
+    (rawStatus === 'suspended' && suspensionReason === 'operator_suspended')
+  ) {
+    const targetStatus = rawStatus === 'active' ? 'suspended' : 'active';
+    const stateButton = document.createElement('button');
+    stateButton.type = 'button';
+    stateButton.className = rawStatus === 'active' ? 'is-danger' : 'is-secondary';
+    stateButton.textContent = rawStatus === 'active' ? 'Suspend room' : 'Resume room';
+    addAsyncAdminEventListener(stateButton, 'click', async () => {
+      if (
+        targetStatus === 'suspended' &&
+        !window.confirm(`Suspend room ${roomCode}? Connected participants will be signed out.`)
+      ) {
+        return;
+      }
+      stateButton.disabled = true;
+      stateButton.textContent = targetStatus === 'suspended' ? 'Suspending...' : 'Resuming...';
+      try {
+        const result = await fetchJson(`/api/admin/pro-rooms/${roomCode}/state`, {
+          method: 'POST',
+          body: JSON.stringify({ roomGeneration, status: targetStatus }),
+        });
+        if (
+          result?.roomCode !== roomCode ||
+          normalizeProRoomGeneration(result?.roomGeneration) !== roomGeneration ||
+          result?.status !== targetStatus
+        ) {
+          throw new Error('PRO_ROOM_GENERATION_MISMATCH');
+        }
+        setProRoomStatus(
+          targetStatus === 'suspended' ? `${roomCode} suspended.` : `${roomCode} resumed.`,
+        );
+        await loadProRooms();
+      } catch (error) {
+        stateButton.disabled = false;
+        stateButton.textContent = rawStatus === 'active' ? 'Suspend room' : 'Resume room';
+        setProRoomStatus(adminErrorMessage(error, 'Room status update failed.'), true);
+      }
+    });
+    actions.append(stateButton);
+  }
+
+  section.append(heading);
+  if (labelEditor) section.append(labelEditor);
+  section.append(actions);
+  return section;
+}
+
+function renderProRoomDangerZone(
+  roomCode: string,
+  roomGeneration: number,
+  rawStatus: string,
+): HTMLElement {
+  const section = document.createElement('section');
+  section.className = 'pro-room-danger-zone';
+  const copy = document.createElement('div');
+  const heading = document.createElement('strong');
+  heading.textContent = 'Danger zone';
+  const description = document.createElement('p');
+  description.textContent =
+    rawStatus === 'decommissioning'
+      ? 'Access is blocked. Uploaded media is being swept after old upload links expire.'
+      : rawStatus === 'decommissioned'
+        ? 'This room incarnation and its API access were permanently removed. The room number may be registered as a new room.'
+        : 'Permanently remove this room, its uploaded media, access, and API keys.';
+  copy.append(heading, description);
+  if (rawStatus === 'decommissioning' || rawStatus === 'decommissioned') {
+    section.append(copy);
+    return section;
+  }
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'is-danger';
+  button.textContent = 'Delete room permanently';
+  button.dataset.proRoomDestroy = roomCode;
+  button.addEventListener('click', () =>
+    openProRoomDestroyDialog(roomCode, roomGeneration, button),
+  );
+  section.append(copy, button);
+  return section;
+}
+
+function renderProRoomLegacyOwnerRepair(
+  room: ProRoomRecord,
+  roomCode: string,
+  roomGeneration: number,
+  rawStatus: string,
+): HTMLElement | DocumentFragment {
+  const suspensionReason =
+    typeof room?.suspensionReason === 'string' ? room.suspensionReason : null;
+  const eligibleStatus =
+    rawStatus === 'active' ||
+    (rawStatus === 'suspended' && suspensionReason === 'operator_suspended');
+  if (room?.ownerAccountLinked !== true || !eligibleStatus) {
+    return document.createDocumentFragment();
+  }
+
+  const section = document.createElement('section');
+  section.className = 'pro-room-owner-repair';
+  const copy = document.createElement('div');
+  const heading = document.createElement('strong');
+  heading.textContent = 'Legacy owner repair';
+  const description = document.createElement('p');
+  description.textContent =
+    'Only for a legacy beta account linked to two PRO rooms. Detach this room before assigning it to another account; room data is preserved. This is not transfer or deletion.';
+  copy.append(heading, description);
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'is-danger';
+  button.textContent = 'Detach legacy owner';
+  button.dataset.proRoomOwnerDetach = roomCode;
+  button.addEventListener('click', () =>
+    openProRoomLegacyOwnerDetachDialog(roomCode, roomGeneration, button),
+  );
+  section.append(copy, button);
+  return section;
+}
+
+function renderProRoomRow(room: ProRoomRecord): HTMLDetailsElement | null {
+  const roomCode = normalizeProRoomCode(room?.roomCode);
+  if (!roomCode) return null;
+  const roomGeneration = normalizeProRoomGeneration(room?.roomGeneration);
+  const incarnationKey = proRoomIncarnationKey(roomCode, roomGeneration);
+  const rawStatus = proRoomRawStatus(room);
+  const ownerAccountLinked =
+    rawStatus === 'active' && typeof room?.ownerAccountLinked === 'boolean'
+      ? room.ownerAccountLinked
+      : null;
+  const ownerTransferPrepared = room?.ownerTransferPrepared === true;
+  const item = document.createElement('details');
+  item.className = 'pro-room-item';
+  item.dataset.proRoomItem = roomCode;
+  if (roomGeneration !== null) item.dataset.proRoomGeneration = String(roomGeneration);
+  item.open = expandedProRooms.has(roomCode);
+
+  const summary = document.createElement('summary');
+  summary.className = 'pro-room-summary';
+  const identity = document.createElement('div');
+  identity.className = 'pro-room-identity';
+  const code = document.createElement('strong');
+  code.textContent = roomCode;
+  const label = document.createElement('span');
+  label.dataset.proRoomLabelValue = roomCode;
+  label.textContent = String(room.label || 'Unlabelled PRO room');
+  identity.append(code, label);
+
+  const details = document.createElement('div');
+  details.className = 'pro-room-details';
+  const status = document.createElement('span');
+  const displayStatus =
+    rawStatus === 'active' && ownerAccountLinked !== true
+      ? ownerAccountLinked === false
+        ? 'suspended'
+        : 'provisioning'
+      : rawStatus;
+  status.className = `pro-room-state is-${displayStatus.replace(/[^a-z-]/g, '')}`;
+  status.textContent = formatProRoomStatus(
+    rawStatus,
+    room?.suspensionReason,
+    ownerAccountLinked,
+    ownerTransferPrepared,
+  );
+  const created = document.createElement('small');
+  const createdAt = formatAdminDateTime(room.createdAt);
+  created.textContent = createdAt ? `Created ${createdAt}` : 'Creation time unavailable';
+  details.append(status, created);
+  const chevron = document.createElement('span');
+  chevron.className = 'pro-room-chevron';
+  chevron.setAttribute('aria-hidden', 'true');
+  chevron.innerHTML =
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.5 9 5.5 5.5L17.5 9"/></svg>';
+  summary.append(identity, details, chevron);
+
+  const expanded = document.createElement('div');
+  expanded.className = 'pro-room-expanded';
+  const controls = renderProRoomActions(room, roomCode, roomGeneration, rawStatus);
+  const apiPanel = document.createElement('section');
+  apiPanel.className = 'pro-room-api-panel';
+  apiPanel.dataset.proRoomApiPanel = roomCode;
+  if (roomGeneration !== null) apiPanel.dataset.proRoomGeneration = String(roomGeneration);
+  apiPanel.setAttribute('aria-label', `${roomCode} Developer API`);
+  const isTerminal = rawStatus === 'decommissioning' || rawStatus === 'decommissioned';
+  const cached = incarnationKey ? proRoomApiCache.get(incarnationKey) : null;
+  if (!incarnationKey) {
+    const unavailable = document.createElement('p');
+    unavailable.className = 'pro-room-api-status is-error';
+    unavailable.textContent =
+      'Room generation is unavailable. Refresh before managing Developer API keys.';
+    apiPanel.append(unavailable);
+  } else if (isTerminal) {
+    const unavailable = document.createElement('p');
+    unavailable.className = 'pro-room-api-status';
+    unavailable.textContent = 'Developer API access has been removed.';
+    apiPanel.append(unavailable);
+  } else if (cached) {
+    renderProRoomApiPanel(roomCode, roomGeneration, rawStatus, apiPanel, cached);
+  } else {
+    renderProRoomApiShell(roomCode, apiPanel);
+  }
+  const dangerZone =
+    incarnationKey && roomGeneration !== null
+      ? renderProRoomDangerZone(roomCode, roomGeneration, rawStatus)
+      : document.createDocumentFragment();
+  const ownerRepair =
+    incarnationKey && roomGeneration !== null
+      ? renderProRoomLegacyOwnerRepair(room, roomCode, roomGeneration, rawStatus)
+      : document.createDocumentFragment();
+  expanded.append(controls, ownerRepair, apiPanel, dangerZone);
+  item.append(summary, expanded);
+  item.addEventListener('toggle', () => {
+    if (item.open) {
+      expandedProRooms.add(roomCode);
+      if (!isTerminal && incarnationKey && roomGeneration !== null) {
+        loadProRoomApiKeys(roomCode, roomGeneration, rawStatus, apiPanel).catch(() => {});
+      }
+    } else {
+      expandedProRooms.delete(roomCode);
+      if (incarnationKey) {
+        proRoomApiRequestGenerations.set(
+          incarnationKey,
+          (proRoomApiRequestGenerations.get(incarnationKey) || 0) + 1,
+        );
+        clearProRoomApiSecret(roomCode, roomGeneration);
+      }
+    }
+  });
+  return item;
+}
+
+function renderProRooms(payload: AdminApiPayload): void {
+  const allRooms = Array.isArray(payload?.rooms) ? payload.rooms : [];
+  proRoomsSnapshot = allRooms;
+  const query = String(proRoomSearchEl?.value || '')
+    .trim()
+    .toLocaleLowerCase('en-US');
+  const rooms = query
+    ? allRooms.filter((room) => {
+        const roomCode = String(room?.roomCode || '').toLocaleLowerCase('en-US');
+        const label = String(room?.label || '').toLocaleLowerCase('en-US');
+        return roomCode.includes(query) || label.includes(query);
+      })
+    : allRooms;
+  const currentIncarnations = new Set(
+    allRooms
+      .map((room) => proRoomIncarnationKey(room?.roomCode, room?.roomGeneration))
+      .filter((incarnationKey): incarnationKey is string => incarnationKey !== null),
+  );
+  for (const collection of [
+    issuedActivationLinks,
+    issuedOwnerRecoveryLinks,
+    issuedOwnerTransferLinks,
+    proRoomApiCache,
+    proRoomApiSecrets,
+    proRoomApiIssuanceOwners,
+    proRoomApiRequestGenerations,
+  ]) {
+    for (const incarnationKey of collection.keys()) {
+      if (!currentIncarnations.has(incarnationKey)) collection.delete(incarnationKey);
+    }
+  }
+  if (visibleProRoomClaimIncarnation && !currentIncarnations.has(visibleProRoomClaimIncarnation)) {
+    dismissProRoomClaim();
+  }
+  if (proRoomListStatusEl) {
+    proRoomListStatusEl.textContent = query
+      ? `${formatter.format(rooms.length)} of ${formatter.format(allRooms.length)} rooms`
+      : `${formatter.format(allRooms.length)} rooms`;
+  }
+  if (!proRoomListEl) return;
+  const rows = rooms.map(renderProRoomRow).filter((row): row is HTMLDetailsElement => row !== null);
+  if (rows.length) {
+    proRoomListEl.replaceChildren(...rows);
+    for (const row of rows) {
+      if (!row.open) continue;
+      const roomCode = row.dataset.proRoomItem;
+      const room = rooms.find((candidate) => candidate?.roomCode === roomCode);
+      const panel = row.querySelector<HTMLElement>('[data-pro-room-api-panel]');
+      const rawStatus = proRoomRawStatus(room);
+      const roomGeneration = normalizeProRoomGeneration(room?.roomGeneration);
+      if (
+        roomCode &&
+        roomGeneration !== null &&
+        panel &&
+        rawStatus !== 'decommissioning' &&
+        rawStatus !== 'decommissioned'
+      ) {
+        loadProRoomApiKeys(roomCode, roomGeneration, rawStatus, panel).catch(() => {});
+      }
+    }
+    return;
+  }
+  const empty = document.createElement('p');
+  empty.className = 'pro-room-empty';
+  empty.textContent = query
+    ? `No rooms match “${String(proRoomSearchEl?.value || '').trim()}”.`
+    : 'No PRO rooms registered yet.';
+  proRoomListEl.replaceChildren(empty);
+}
+
+function setProGrantCampaignMessage(message: string, isError = false): void {
+  if (!proGrantCampaignStatusEl) return;
+  proGrantCampaignStatusEl.textContent = message || '';
+  proGrantCampaignStatusEl.classList.toggle('is-error', isError);
+}
+
+function proGrantCampaignStatusCopy(status: string): string {
+  const labels: Readonly<Record<string, string>> = {
+    active: 'Active',
+    paused: 'Paused',
+    scheduled: 'Scheduled',
+    ended: 'Ended',
+    revoked: 'Unused codes revoked',
+    draft: 'Draft',
+    review: 'In review',
+    'not-created': 'Not created',
+  };
+  return labels[status] || status || 'Unknown';
+}
+
+function proGrantCampaignPublicPath(slug: unknown): string {
+  const normalized = String(slug || '')
+    .trim()
+    .toLowerCase();
+  const numbered = /^([a-z0-9]+(?:-[a-z0-9]+)*)-(\d+)$/u.exec(normalized);
+  if (numbered) {
+    return `/events/${encodeURIComponent(numbered[1] ?? '')}/${numbered[2] ?? ''}/`;
+  }
+  return `/events/${encodeURIComponent(normalized)}/`;
+}
+
+function proGrantCampaignPublicUrl(slug: unknown): string {
+  return new URL(proGrantCampaignPublicPath(slug), window.location.origin).href;
+}
+
+function proGrantPoolFingerprint(config: ProGrantConfig | null): string {
+  return config ? `${config.campaign.slug}:${config.roomCodes.join(',')}` : '';
+}
+
+function normalizeProGrantCampaignEntries(
+  payload: AdminApiPayload,
+): NormalizedProGrantCampaignEntry[] | null {
+  if (!Array.isArray(payload?.campaigns)) return null;
+  return payload.campaigns
+    .map((entry) => {
+      const campaign = entry?.campaign || entry;
+      if (!campaign || typeof campaign.slug !== 'string' || typeof campaign.title !== 'string') {
+        return null;
+      }
+      return {
+        ...(entry?.campaign ? entry : {}),
+        campaign,
+        counts: entry?.counts || entry?.voucherCounts || campaign.counts || {},
+        ...(Array.isArray(entry?.roomCodes) ? { roomCodes: entry.roomCodes } : {}),
+      };
+    })
+    .filter((entry): entry is NormalizedProGrantCampaignEntry => entry !== null);
+}
+
+function renderProGrantCampaignList(): void {
+  if (!proGrantCampaignListEl) return;
+  const draftSlug = proGrantCampaignDraft?.campaign?.slug;
+  const entries = proGrantCampaigns.filter((entry) => (entry.campaign || entry).slug !== draftSlug);
+  if (proGrantCampaignDraft) entries.unshift(proGrantCampaignDraft);
+  if (entries.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'pro-grant-campaign-empty';
+    empty.innerHTML =
+      '<strong>No events yet.</strong><span>Select New event to get started.</span>';
+    proGrantCampaignListEl.replaceChildren(empty);
+    return;
+  }
+  const rows = entries.map((entry) => {
+    const campaign = entry.campaign || entry;
+    const counts = normalizedProGrantCounts(entry);
+    const state = entry.isDraft ? 'review' : campaign.status || 'not-created';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'pro-grant-campaign-item';
+    button.dataset.proGrantCampaignSelect = campaign.slug;
+    button.setAttribute('aria-pressed', String(campaign.slug === selectedProGrantCampaignSlug));
+    button.disabled = proGrantCampaignBusy;
+    const title = document.createElement('strong');
+    title.textContent = proGrantCampaignDisplayTitle(campaign);
+    const meta = document.createElement('span');
+    meta.textContent = `${campaign.slug} · ${formatter.format(counts.redeemed)}/${formatter.format(counts.total)} redeemed`;
+    const status = document.createElement('span');
+    status.className = 'pro-grant-campaign-item-state';
+    status.dataset.state = state;
+    status.textContent = proGrantCampaignStatusCopy(state);
+    button.append(title, meta, status);
+    if (
+      pendingProGrantVoucherExport?.campaign?.slug === campaign.slug &&
+      !pendingProGrantVoucherExport?.applied
+    ) {
+      const pending = document.createElement('span');
+      pending.className = 'pro-grant-campaign-pending';
+      pending.textContent = 'Code file awaiting application';
+      button.append(pending);
+    }
+    button.addEventListener('click', () => {
+      const restoreFocus = document.activeElement === button;
+      selectedProGrantCampaignSlug = campaign.slug || null;
+      proGrantCampaignState = entry;
+      renderProGrantCampaignState(entry);
+      if (restoreFocus) {
+        proGrantCampaignListEl
+          ?.querySelector<HTMLElement>(`[data-pro-grant-campaign-select="${campaign.slug}"]`)
+          ?.focus({ preventScroll: true });
+      }
+    });
+    return button;
+  });
+  proGrantCampaignListEl.replaceChildren(...rows);
+}
+
+function setProGrantCampaignBusy(busy: boolean): void {
+  if (busy) adminLatestLoads.get('pro-grants')?.abort();
+  proGrantCampaignBusy = busy;
+  proGrantCampaignPanelEl?.toggleAttribute('aria-busy', busy);
+  for (const button of [
+    proGrantCampaignNewBtn,
+    proGrantCampaignImportBtn,
+    proGrantCampaignVerifyBtn,
+    proGrantCampaignCreateBtn,
+    proGrantCampaignApplyBtn,
+    proGrantCampaignPauseBtn,
+    proGrantCampaignEndBtn,
+    proGrantCampaignRevokeBtn,
+    proGrantCampaignDownloadBtn,
+    proGrantCampaignCopyBtn,
+  ]) {
+    if (button) button.disabled = busy;
+  }
+  if (proGrantCampaignFormEl) {
+    for (const control of proGrantCampaignFormEl.elements) {
+      if ('disabled' in control && typeof control.disabled === 'boolean') control.disabled = busy;
+    }
+  }
+  if (!busy) renderProGrantCampaignState(proGrantCampaignState);
+}
+
+function normalizedProGrantCounts(
+  payload: ProGrantCampaignEntry | null | undefined,
+): Required<ProGrantCounts> {
+  const raw = payload?.counts || payload?.voucherCounts || {};
+  const source = Array.isArray(raw)
+    ? Object.fromEntries(
+        raw
+          .filter((entry) => typeof entry?.status === 'string')
+          .map((entry) => [entry.status, Number(entry.count)]),
+      )
+    : raw;
+  const count = (key: 'available' | 'redeemed' | 'revoked' | 'total'): number => {
+    const value = Number(source[key] || 0);
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  };
+  const available = count('available');
+  const redeemed = count('redeemed');
+  const revoked = count('revoked');
+  const explicitTotal = count('total');
+  return {
+    total: explicitTotal || available + redeemed + revoked,
+    available,
+    redeemed,
+    revoked,
+  };
+}
+
+function renderProGrantCampaignState(payload: NormalizedProGrantCampaignEntry | null): void {
+  if (!proGrantCampaignPanelEl) return;
+  const entry = payload?.campaign || payload?.slug ? payload : selectedProGrantCampaign();
+  const campaign = entry?.campaign || (entry?.slug ? entry : null);
+  const config = campaign ? proGrantCampaignConfig(entry) : null;
+  const state = entry?.isDraft ? 'review' : campaign?.status || 'not-created';
+  const counts = normalizedProGrantCounts(entry);
+  const hasExactPendingBatch = Boolean(
+    pendingProGrantVoucherExport &&
+    campaign?.slug &&
+    pendingProGrantVoucherExport.campaign?.slug === campaign.slug,
+  );
+  const pendingApplied = hasExactPendingBatch && pendingProGrantVoucherExport?.applied === true;
+  const hasUnappliedBatch = Boolean(
+    pendingProGrantVoucherExport && pendingProGrantVoucherExport.applied !== true,
+  );
+  const poolVerified = Boolean(
+    verifiedProGrantPool?.fingerprint &&
+    verifiedProGrantPool.fingerprint === proGrantPoolFingerprint(config),
+  );
+  proGrantCampaignPanelEl.dataset.proGrantCampaign = campaign?.slug || '';
+  proGrantCampaignDetailEl?.toggleAttribute('data-empty', !campaign);
+  if (proGrantCampaignTitleEl) {
+    proGrantCampaignTitleEl.textContent =
+      proGrantCampaignDisplayTitle(campaign) || 'Select an event';
+  }
+  if (proGrantCampaignMetaEl) {
+    if (!campaign) {
+      proGrantCampaignMetaEl.textContent = 'Select an event from the list or create a new one.';
+    } else {
+      const rooms = config?.roomCodes || [];
+      const roomRange =
+        rooms.length > 0
+          ? `${rooms[0]}–${rooms.at(-1)} · ${formatter.format(rooms.length)} rooms`
+          : 'Room range unavailable';
+      const starts = normalizeCampaignTimestamp(campaign.startsAt);
+      const ends = normalizeCampaignTimestamp(campaign.endsAt);
+      proGrantCampaignMetaEl.textContent = `${campaign.slug} · ${roomRange} · 1 per account · ${
+        starts ? formatAdminDateTime(starts) : 'Start time unset'
+      }${ends ? `–${formatAdminDateTime(ends)}` : '–Manual end'}`;
+    }
+  }
+  if (proGrantCampaignStateEl) {
+    proGrantCampaignStateEl.textContent = proGrantCampaignStatusCopy(state);
+    proGrantCampaignStateEl.dataset.state = state;
+  }
+  if (proGrantCampaignEventLinkEl) {
+    proGrantCampaignEventLinkEl.hidden = !campaign;
+    const link = proGrantCampaignEventLinkEl.querySelector('a');
+    if (link && campaign) {
+      link.href = proGrantCampaignPublicUrl(campaign.slug);
+      link.textContent = proGrantCampaignPublicPath(campaign.slug);
+    }
+  }
+  if (proGrantCampaignCountsEl) {
+    proGrantCampaignCountsEl.textContent = campaign
+      ? `${formatter.format(counts.total)} issued · ${formatter.format(counts.available)} available · ${formatter.format(counts.redeemed)} redeemed · ${formatter.format(counts.revoked)} revoked`
+      : 'Create a new event or select one from the list.';
+  }
+  const issuanceClosed =
+    !campaign ||
+    ['ended', 'revoked'].includes(state) ||
+    (!entry?.isDraft && counts.total > 0 && !hasExactPendingBatch);
+  if (proGrantCampaignCreateBtn) {
+    proGrantCampaignCreateBtn.disabled =
+      proGrantCampaignBusy ||
+      !campaign ||
+      issuanceClosed ||
+      !poolVerified ||
+      Boolean(pendingProGrantVoucherExport && !hasExactPendingBatch);
+    proGrantCampaignCreateBtn.textContent = hasExactPendingBatch
+      ? '2. Download the same code file again'
+      : '2. Create code file';
+  }
+  if (proGrantCampaignApplyBtn) {
+    proGrantCampaignApplyBtn.disabled =
+      proGrantCampaignBusy || !hasExactPendingBatch || pendingApplied;
+    proGrantCampaignApplyBtn.textContent = pendingApplied ? '3. Event started' : '3. Start event';
+  }
+  if (proGrantCampaignVerifyBtn) {
+    proGrantCampaignVerifyBtn.disabled = proGrantCampaignBusy || !campaign || issuanceClosed;
+  }
+  if (proGrantCampaignPauseBtn) {
+    const canRecoverIssuedDraft = state === 'draft' && counts.total > 0;
+    proGrantCampaignPauseBtn.disabled =
+      proGrantCampaignBusy ||
+      !campaign ||
+      (!canRecoverIssuedDraft && !['active', 'paused', 'scheduled'].includes(state));
+    proGrantCampaignPauseBtn.textContent = canRecoverIssuedDraft
+      ? 'Start event'
+      : state === 'paused'
+        ? 'Resume'
+        : 'Pause';
+  }
+  if (proGrantCampaignEndBtn) {
+    proGrantCampaignEndBtn.disabled =
+      proGrantCampaignBusy ||
+      !campaign ||
+      !['draft', 'active', 'paused', 'scheduled'].includes(state);
+  }
+  if (proGrantCampaignRevokeBtn) {
+    proGrantCampaignRevokeBtn.disabled =
+      proGrantCampaignBusy || !campaign || counts.available < 1 || state === 'revoked';
+  }
+  if (proGrantCampaignExportEl) proGrantCampaignExportEl.hidden = !hasExactPendingBatch;
+  if (proGrantCampaignDownloadBtn) proGrantCampaignDownloadBtn.disabled = proGrantCampaignBusy;
+  if (proGrantCampaignCopyBtn) proGrantCampaignCopyBtn.disabled = proGrantCampaignBusy;
+  if (proGrantCampaignNewBtn) {
+    proGrantCampaignNewBtn.disabled = proGrantCampaignBusy || hasUnappliedBatch;
+  }
+  if (proGrantCampaignImportBtn) {
+    proGrantCampaignImportBtn.disabled = proGrantCampaignBusy || hasUnappliedBatch;
+  }
+  renderProGrantCampaignList();
+}
+
+async function loadProGrantCampaignStatus(): Promise<NormalizedProGrantCampaignEntry | null> {
+  if (!proGrantCampaignPanelEl) return null;
+  const load = beginLatestAdminLoad('pro-grants');
+  try {
+    let entries: NormalizedProGrantCampaignEntry[] | null = null;
+    let usedLegacyStatusRoute = false;
+    try {
+      const listPayload = await fetchJson('/api/admin/pro-grants/campaigns', {
+        signal: load.controller.signal,
+      });
+      throwIfAdminLoadStale(load);
+      entries = normalizeProGrantCampaignEntries(listPayload);
+    } catch (error) {
+      if (!isAdminRequestFailure(error) || ![404, 405].includes(error.status ?? 0)) throw error;
+    }
+    if (entries === null) {
+      usedLegacyStatusRoute = true;
+      try {
+        const legacy = await fetchJson(
+          `/api/admin/pro-grants/campaigns/${PRO_GRANT_ASAMO_SLUG}/status`,
+          { signal: load.controller.signal },
+        );
+        throwIfAdminLoadStale(load);
+        entries = legacy?.campaign ? normalizeProGrantCampaignEntries({ campaigns: [legacy] }) : [];
+        if (entries === null) entries = [];
+      } catch (error) {
+        if (
+          (isAdminRequestFailure(error) && error.status === 404) ||
+          (error instanceof Error && error.message === 'PRO_GRANT_CAMPAIGN_NOT_FOUND')
+        )
+          entries = [];
+        else throw error;
+      }
+    }
+    if (usedLegacyStatusRoute && entries.length === 0) {
+      entries = [
+        {
+          campaign: {
+            slug: PRO_GRANT_ASAMO_SLUG,
+            title: PRO_GRANT_ASAMO_TITLE,
+            status: 'not-created',
+            startsAt: null,
+            endsAt: null,
+            perAccountLimit: 1,
+          },
+          counts: {},
+          roomCodes: PRO_GRANT_ASAMO_ROOM_CODES,
+          roomLabelPrefix: 'ASAMO 0',
+          isDraft: true,
+        },
+      ];
+    }
+    throwIfAdminLoadStale(load);
+    proGrantCampaigns = entries;
+    if (
+      !selectedProGrantCampaignSlug ||
+      !proGrantCampaigns.some(
+        (entry) => (entry.campaign || entry).slug === selectedProGrantCampaignSlug,
+      )
+    ) {
+      selectedProGrantCampaignSlug =
+        proGrantCampaignDraft?.campaign?.slug ||
+        (proGrantCampaigns[0]?.campaign || proGrantCampaigns[0])?.slug ||
+        null;
+    }
+    proGrantCampaignState = selectedProGrantCampaign();
+    proGrantCampaignLoaded = true;
+    renderProGrantCampaignState(proGrantCampaignState);
+    return proGrantCampaignState;
+  } catch (error) {
+    if (isLatestAdminLoad(load)) proGrantCampaignLoaded = false;
+    throw error;
+  } finally {
+    finishLatestAdminLoad(load);
+  }
+}
+
+function campaignMutationBody(config: ProGrantConfig, dryRun: boolean) {
+  return {
+    slug: config.campaign.slug,
+    title: config.campaign.title,
+    startsAt: config.campaign.startsAt,
+    endsAt: config.campaign.endsAt,
+    perAccountLimit: 1,
+    dryRun,
+  };
+}
+
+function findProGrantCampaignOverlap(config: ProGrantConfig | null) {
+  if (!config) return null;
+  const requested = new Set(config.roomCodes);
+  for (const entry of proGrantCampaigns) {
+    const campaign = entry.campaign || entry;
+    if (campaign.slug === config.campaign.slug) continue;
+    const overlap = proGrantCampaignRoomCodes(entry).find((roomCode) => requested.has(roomCode));
+    if (overlap) return { roomCode: overlap, campaign };
+  }
+  return null;
+}
+
+async function verifyProGrantCampaignPool(): Promise<void> {
+  if (proGrantCampaignBusy) return;
+  const config = proGrantCampaignConfig();
+  if (!config || config.roomCodes.length === 0) {
+    setProGrantCampaignMessage(
+      'This event does not have a valid contiguous room-code range.',
+      true,
+    );
+    return;
+  }
+  setProGrantCampaignBusy(true);
+  setProGrantCampaignMessage(
+    `Checking ${config.roomCodes[0]}–${config.roomCodes.at(-1)} without making changes...`,
+  );
+  try {
+    await loadProGrantCampaignStatus();
+    const overlap = findProGrantCampaignOverlap(config);
+    if (overlap) {
+      throw new Error(
+        `Room ${overlap.roomCode} overlaps with “${proGrantCampaignDisplayTitle(overlap.campaign)}”.`,
+      );
+    }
+    await fetchJson('/api/admin/pro-grants/campaigns', {
+      method: 'POST',
+      body: JSON.stringify(campaignMutationBody(config, true)),
+    });
+    const inventory = await loadProGrantRoomInventory(config.roomCodes);
+    if (inventory.unavailable.length > 0) {
+      const first = inventory.unavailable[0];
+      if (!first) throw new Error('PRO room inventory is invalid.');
+      setProGrantCampaignMessage(
+        `${formatter.format(inventory.unavailable.length)} rooms are unavailable. ${first.roomCode} state: ${first.status}/${first.activationState}.`,
+        true,
+      );
+      return;
+    }
+    verifiedProGrantPool = {
+      fingerprint: proGrantPoolFingerprint(config),
+      inventory,
+      verifiedAt: Date.now(),
+    };
+    setProGrantCampaignMessage(
+      inventory.needsProvisioning.length > 0
+        ? `${formatter.format(inventory.needsProvisioning.length)} rooms will be provisioned during the apply step. Save the code file first.`
+        : `All ${formatter.format(config.roomCodes.length)} rooms are prepared and inactive.`,
+    );
+  } catch (error) {
+    verifiedProGrantPool = null;
+    setProGrantCampaignMessage(
+      adminErrorMessage(error, 'The event room codes could not be verified.'),
+      true,
+    );
+    throw error;
+  } finally {
+    setProGrantCampaignBusy(false);
+  }
+}
+
+function assertSecretFreeProGrantConfirmation(
+  payload: AdminApiPayload,
+  batch: ProGrantVoucherBatch,
+  inventory: ProGrantInventory,
+): AdminApiPayload {
+  if (/"(?:code|codeDigest|code_digest)"\s*:/iu.test(JSON.stringify(payload))) {
+    throw new Error('PRO_GRANT_SECRET_ECHO_REJECTED');
+  }
+  const mappings = payload?.mappings;
+  if (
+    payload?.requestId !== batch.requestId ||
+    payload?.campaign?.slug !== batch.campaign.slug ||
+    payload?.count !== batch.vouchers.length ||
+    !Array.isArray(mappings) ||
+    mappings.length !== batch.vouchers.length
+  ) {
+    throw new Error('PRO_GRANT_BATCH_CONFIRMATION_MISMATCH');
+  }
+  const expectedRooms = new Set(batch.vouchers.map((voucher) => voucher.roomCode));
+  const expectedGenerations = new Map<string, number>();
+  for (const room of [...(inventory?.ready || []), ...(inventory?.unavailable || [])]) {
+    if (
+      expectedRooms.has(room?.roomCode) &&
+      Number.isSafeInteger(room?.roomGeneration) &&
+      room.roomGeneration >= 0
+    ) {
+      expectedGenerations.set(room.roomCode, room.roomGeneration);
+    }
+  }
+  const voucherIds = new Set<string>();
+  for (const mapping of mappings) {
+    const expectedGeneration = expectedGenerations.get(mapping?.roomCode);
+    if (
+      typeof mapping?.voucherId !== 'string' ||
+      !/^voucher_[A-Za-z0-9_-]{22}$/u.test(mapping.voucherId) ||
+      voucherIds.has(mapping.voucherId) ||
+      typeof mapping?.roomCode !== 'string' ||
+      !expectedRooms.delete(mapping.roomCode) ||
+      typeof mapping?.roomGeneration !== 'number' ||
+      !Number.isSafeInteger(mapping.roomGeneration) ||
+      mapping.roomGeneration < 0 ||
+      (expectedGeneration !== undefined && mapping.roomGeneration !== expectedGeneration) ||
+      typeof mapping?.status !== 'string' ||
+      !['available', 'redeemed', 'revoked'].includes(mapping.status)
+    ) {
+      throw new Error('PRO_GRANT_BATCH_CONFIRMATION_MISMATCH');
+    }
+    voucherIds.add(mapping.voucherId);
+  }
+  if (expectedRooms.size !== 0) throw new Error('PRO_GRANT_BATCH_CONFIRMATION_MISMATCH');
+  return payload;
+}
+
+async function applyPendingProGrantVoucherBatch(): Promise<void> {
+  const batch = pendingProGrantVoucherExport;
+  if (!batch || proGrantCampaignBusy) return;
+  const config = {
+    campaign: batch.campaign,
+    roomCodes: batch.vouchers.map((voucher) => voucher.roomCode),
+    roomLabelPrefix: batch.roomLabelPrefix || batch.campaign.title,
+    isDraft: false,
+  };
+  setProGrantCampaignBusy(true);
+  setProGrantCampaignMessage(
+    'Rechecking the saved code file against the room range and starting the event...',
+  );
+  try {
+    const overlap = findProGrantCampaignOverlap(config);
+    if (overlap) {
+      throw new Error(
+        `Room ${overlap.roomCode} overlaps with “${proGrantCampaignDisplayTitle(overlap.campaign)}”.`,
+      );
+    }
+    const provisioning = await provisionProGrantRoomPool(config);
+    await fetchJson('/api/admin/pro-grants/campaigns', {
+      method: 'POST',
+      body: JSON.stringify(campaignMutationBody(config, false)),
+    });
+    const confirmation = await fetchJson(
+      `/api/admin/pro-grants/campaigns/${encodeURIComponent(batch.campaign.slug)}/vouchers`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          requestId: batch.requestId,
+          dryRun: false,
+          vouchers: batch.vouchers,
+        }),
+      },
+    );
+    assertSecretFreeProGrantConfirmation(confirmation, batch, provisioning.inventory);
+    if (provisioning.replayOnly && confirmation.replayed !== true) {
+      throw new Error('Unavailable rooms may only be accepted for an exact existing batch replay.');
+    }
+    await fetchJson(
+      `/api/admin/pro-grants/campaigns/${encodeURIComponent(batch.campaign.slug)}/status`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          requestId: batch.requestId,
+          status: 'active',
+          dryRun: false,
+        }),
+      },
+    );
+    batch.applied = true;
+    setProGrantCampaignMessage(
+      confirmation.replayed
+        ? 'The existing batch is an exact match. No new codes were created.'
+        : `${formatter.format(batch.vouchers.length)} codes were applied. Keep the downloaded file secure.`,
+    );
+    proGrantCampaignDraft = null;
+    await loadProGrantCampaignStatus();
+  } catch (error) {
+    setProGrantCampaignMessage(
+      `${adminErrorMessage(error, 'The codes could not be applied.')} The same batch remains in memory, so you can check the status and retry.`,
+      true,
+    );
+    throw error;
+  } finally {
+    setProGrantCampaignBusy(false);
+  }
+}
+
+async function createAndDownloadProGrantVouchers(): Promise<void> {
+  if (proGrantCampaignBusy) return;
+  if (pendingProGrantVoucherExport) {
+    if (pendingProGrantVoucherExport.campaign.slug !== selectedProGrantCampaignSlug) {
+      setProGrantCampaignMessage(
+        `An unapplied code file for “${proGrantCampaignDisplayTitle(pendingProGrantVoucherExport.campaign)}” is in memory. Apply that event first, or leave the page to discard it.`,
+        true,
+      );
+      return;
+    }
+    downloadProGrantVoucherExport();
+    setProGrantCampaignMessage(
+      'Downloaded the same code file again. Check the file before starting the event.',
+    );
+    return;
+  }
+  const config = proGrantCampaignConfig();
+  if (!config || verifiedProGrantPool?.fingerprint !== proGrantPoolFingerprint(config)) {
+    setProGrantCampaignMessage('Verify the room codes in step 1 first.', true);
+    return;
+  }
+  pendingProGrantVoucherExport = createProGrantVoucherExport(config);
+  renderProGrantCampaignState(proGrantCampaignState);
+  // This phase performs no remote mutation. The operator explicitly applies
+  // only after confirming that the recoverable plaintext file was saved.
+  downloadProGrantVoucherExport(pendingProGrantVoucherExport);
+  setProGrantCampaignMessage(
+    'The code file is ready. Confirm the download, then continue to step 3.',
+  );
+}
+
+async function setProGrantCampaignOperationalStatus(
+  status: 'active' | 'paused' | 'ended',
+): Promise<void> {
+  if (proGrantCampaignBusy || !['active', 'paused', 'ended'].includes(status)) return;
+  const campaign = selectedProGrantCampaign()?.campaign || selectedProGrantCampaign();
+  if (!campaign?.slug) return;
+  if (status === 'ended') {
+    const confirmed = window.confirm(
+      `End “${proGrantCampaignDisplayTitle(campaign)}”?\n\nUnused codes will be preserved but can no longer be redeemed. An ended event cannot be restarted. Already granted PRO rooms remain active.`,
+    );
+    if (!confirmed) return;
+  }
+  setProGrantCampaignBusy(true);
+  setProGrantCampaignMessage(
+    status === 'paused'
+      ? 'Pausing the event...'
+      : status === 'ended'
+        ? 'Ending the event...'
+        : 'Resuming the event...',
+  );
+  try {
+    await fetchJson(`/api/admin/pro-grants/campaigns/${encodeURIComponent(campaign.slug)}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ requestId: createProGrantBatchRequestId(), status, dryRun: false }),
+    });
+    await loadProGrantCampaignStatus();
+    setProGrantCampaignMessage(
+      status === 'paused'
+        ? 'The event is paused.'
+        : status === 'ended'
+          ? 'The event has ended. Unused codes are preserved.'
+          : 'The event has resumed.',
+    );
+  } finally {
+    setProGrantCampaignBusy(false);
+  }
+}
+
+async function revokeProGrantCampaign(): Promise<void> {
+  if (proGrantCampaignBusy) return;
+  const entry = selectedProGrantCampaign();
+  const campaign = entry?.campaign || entry;
+  if (!campaign?.slug) return;
+  const available = normalizedProGrantCounts(entry).available;
+  const confirmed = window.confirm(
+    `Permanently revoke ${formatter.format(available)} unused codes for “${proGrantCampaignDisplayTitle(campaign)}”?\n\nThis cannot be undone. Redeemed codes and granted PRO rooms are unchanged.`,
+  );
+  if (!confirmed) return;
+  setProGrantCampaignBusy(true);
+  setProGrantCampaignMessage('Permanently revoking unused codes...');
+  try {
+    await fetchJson(`/api/admin/pro-grants/campaigns/${encodeURIComponent(campaign.slug)}/revoke`, {
+      method: 'POST',
+      body: JSON.stringify({
+        requestId: createProGrantBatchRequestId(),
+        reason: 'operator_revoked',
+      }),
+    });
+    await loadProGrantCampaignStatus();
+    setProGrantCampaignMessage(
+      'Unused codes were revoked. Already granted PRO rooms are unchanged.',
+    );
+  } finally {
+    setProGrantCampaignBusy(false);
+  }
+}
+
+function formControlValue(form: HTMLFormElement, name: string): string {
+  const control = form.elements.namedItem(name);
+  return control && 'value' in control ? String(control.value) : '';
+}
+
+function focusFormControl(form: HTMLFormElement, selector: string): void {
+  form.querySelector<HTMLElement>(selector)?.focus();
+}
+
+function updateProGrantCampaignFormPreview(): void {
+  if (!proGrantCampaignFormEl) return;
+  const slug = formControlValue(proGrantCampaignFormEl, 'slug').trim().toLowerCase();
+  const slugPreview = proGrantCampaignFormEl.querySelector('[data-pro-grant-slug-preview]');
+  if (slugPreview)
+    slugPreview.textContent = slug ? proGrantCampaignPublicPath(slug).slice(8) : 'event/';
+  const rangePreview = proGrantCampaignFormEl.querySelector('[data-pro-grant-range-preview]');
+  if (!rangePreview) return;
+  try {
+    const roomCodes = campaignRoomCodesFromRange(
+      formControlValue(proGrantCampaignFormEl, 'roomStartCode'),
+      Number(formControlValue(proGrantCampaignFormEl, 'roomCount')),
+    );
+    rangePreview.textContent = `${roomCodes[0]}–${roomCodes.at(-1)} · ${formatter.format(roomCodes.length)} rooms · 1 per account`;
+    rangePreview.classList.remove('is-error');
+  } catch (error) {
+    rangePreview.textContent = adminErrorMessage(error, 'Check the room range.');
+    rangePreview.classList.add('is-error');
+  }
+}
+
+function openProGrantCampaignForm(): void {
+  if (!proGrantCampaignFormEl) return;
+  if (pendingProGrantVoucherExport && pendingProGrantVoucherExport.applied !== true) {
+    selectedProGrantCampaignSlug = pendingProGrantVoucherExport.campaign.slug;
+    proGrantCampaignState = selectedProGrantCampaign();
+    renderProGrantCampaignState(proGrantCampaignState);
+    setProGrantCampaignMessage(
+      `A code file for “${proGrantCampaignDisplayTitle(pendingProGrantVoucherExport.campaign)}” is waiting to be applied. Start that event first, or leave the page to discard it.`,
+      true,
+    );
+    return;
+  }
+  if (pendingProGrantVoucherExport?.applied === true) {
+    pendingProGrantVoucherExport = null;
+    renderProGrantCampaignState(proGrantCampaignState);
+  }
+  proGrantCampaignFormEl.reset();
+  proGrantCampaignFormEl.hidden = false;
+  const startsAt = proGrantCampaignFormEl.elements.namedItem('startsAt');
+  if (startsAt && 'value' in startsAt && !startsAt.value) {
+    startsAt.value = formatCampaignLocalDateTime(Date.now());
+  }
+  updateProGrantCampaignFormPreview();
+  focusFormControl(proGrantCampaignFormEl, 'input[name="title"]');
+}
+
+function closeProGrantCampaignForm(): void {
+  if (!proGrantCampaignFormEl) return;
+  proGrantCampaignFormEl.hidden = true;
+  proGrantCampaignNewBtn?.focus();
+}
+
+function stageProGrantCampaignFromForm(): void {
+  if (!proGrantCampaignFormEl) return;
+  const form = new FormData(proGrantCampaignFormEl);
+  const title = String(form.get('title') || '').trim();
+  const slug = String(form.get('slug') || '')
+    .trim()
+    .toLowerCase();
+  if (!title || title.length > 80) throw new Error('Check the event name.');
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(slug) || slug.length > 48) {
+    throw new Error('The URL slug may contain lowercase letters, numbers, and hyphens only.');
+  }
+  if (
+    pendingProGrantVoucherExport &&
+    pendingProGrantVoucherExport.applied !== true &&
+    pendingProGrantVoucherExport?.campaign?.slug !== slug
+  ) {
+    throw new Error(
+      `A code file for “${proGrantCampaignDisplayTitle(pendingProGrantVoucherExport.campaign)}” is waiting to be applied. Start that event first, or leave the page to discard it.`,
+    );
+  }
+  if (proGrantCampaigns.some((entry) => (entry.campaign || entry).slug === slug)) {
+    throw new Error('Another event already uses this URL slug.');
+  }
+  const roomCodes = campaignRoomCodesFromRange(
+    form.get('roomStartCode'),
+    Number(form.get('roomCount')),
+  );
+  const startsAt = parseCampaignLocalDateTime(form.get('startsAt'), { required: true });
+  const endsAt = parseCampaignLocalDateTime(form.get('endsAt'));
+  if (startsAt === null) throw new Error('Enter a start time.');
+  if (endsAt !== null && endsAt <= startsAt) {
+    throw new Error('The end time must be later than the start time.');
+  }
+  const firstRoomCode = roomCodes[0];
+  if (!firstRoomCode) throw new Error('Check the room range.');
+  const draft: NormalizedProGrantCampaignEntry = {
+    campaign: {
+      slug,
+      title,
+      status: 'not-created',
+      startsAt,
+      endsAt,
+      perAccountLimit: 1,
+      roomStartCode: firstRoomCode,
+      roomCount: roomCodes.length,
+    },
+    counts: {},
+    roomCodes,
+    roomLabelPrefix: title,
+    isDraft: true,
+  };
+  const overlap = findProGrantCampaignOverlap(proGrantCampaignConfig(draft));
+  if (overlap) {
+    throw new Error(
+      `Room ${overlap.roomCode} overlaps with “${proGrantCampaignDisplayTitle(overlap.campaign)}”.`,
+    );
+  }
+  proGrantCampaignDraft = draft;
+  selectedProGrantCampaignSlug = slug;
+  proGrantCampaignState = draft;
+  verifiedProGrantPool = null;
+  closeProGrantCampaignForm();
+  renderProGrantCampaignState(draft);
+  setProGrantCampaignMessage('Event details reviewed. Verify the room codes in step 1.');
+}
+
+async function loadProRooms(
+  options: { readonly updateTimestamp?: boolean } = {},
+): Promise<AdminApiPayload> {
+  const load = beginLatestAdminLoad('pro-rooms');
+  if (proRoomListStatusEl) proRoomListStatusEl.textContent = 'Refreshing...';
+  try {
+    const payload = await fetchJson('/api/admin/pro-rooms', {
+      signal: load.controller.signal,
+    });
+    throwIfAdminLoadStale(load);
+    renderProRooms(payload);
+    proRoomsLoaded = true;
+    if (options.updateTimestamp !== false && updatedAtEl) {
+      updatedAtEl.textContent = `Updated ${formatAdminDateTime(payload.generatedAt || Date.now())}`;
+    }
+    return payload;
+  } finally {
+    finishLatestAdminLoad(load);
+  }
+}
+
+async function registerProRoom(): Promise<AdminApiPayload> {
+  const roomCode = normalizeProRoomCode(proRoomCodeEl?.value);
+  const label = String(proRoomLabelEl?.value || '').trim();
+  if (!roomCode) throw new Error('Room number must be six digits beginning with 0.');
+  if (label.length > 64) throw new Error('Label must be 64 characters or fewer.');
+
+  if (proRoomRegisterBtn) proRoomRegisterBtn.disabled = true;
+  setProRoomStatus('Registering...');
+  try {
+    const payload = await fetchJson('/api/admin/pro-rooms', {
+      method: 'POST',
+      body: JSON.stringify({ roomCode, ...(label ? { label } : {}) }),
+    });
+    setProRoomStatus(`${roomCode} registered.`);
+    proRoomForm?.reset();
+    await loadProRooms();
+    return payload;
+  } finally {
+    if (proRoomRegisterBtn) proRoomRegisterBtn.disabled = false;
+  }
+}
+
+function setActiveTab(tab: string): void {
+  if (tab !== 'maintenance') closeServiceStatusConfirmation({ restoreFocus: false });
+  adminTabs.forEach((button) => {
+    const active = button.dataset.adminTab === tab;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+  adminViews.forEach((view) => {
+    const active = view.dataset.adminView === tab;
+    view.hidden = !active;
+    view.classList.toggle('is-active', active);
+  });
+  if (dashboardTitle) dashboardTitle.textContent = announcementTitle(tab);
+}
+
+function renderAccountMetrics(accounts: AdminAccountSummary | null | undefined): void {
+  if (!accountMetricsEl) return;
+  if (!accounts) {
+    const unavailable = document.createElement('p');
+    unavailable.className = 'admin-metric-unavailable';
+    unavailable.textContent = 'Account metrics are temporarily unavailable.';
+    accountMetricsEl.replaceChildren(unavailable);
+    return;
+  }
+  const metrics: readonly (readonly [string, number, string])[] = [
+    ['Active accounts', accounts.totalAccounts, 'Current active account records'],
+    [
+      'Nickname complete',
+      accounts.nicknameCompleteAccounts,
+      'Accounts that completed nickname setup',
+    ],
+    [
+      `Inactive ${accounts.inactiveDays}+ days`,
+      accounts.inactiveAccounts,
+      'No sign-in or authenticated activity in the period',
+    ],
+  ];
+  accountMetricsEl.replaceChildren(
+    ...metrics.map(([label, value, description]) => {
+      const item = document.createElement('article');
+      item.className = 'account-metric';
+      const labelEl = document.createElement('span');
+      labelEl.textContent = label;
+      const valueEl = document.createElement('strong');
+      valueEl.textContent = formatter.format(value);
+      const descriptionEl = document.createElement('small');
+      descriptionEl.textContent = description;
+      item.append(labelEl, valueEl, descriptionEl);
+      return item;
+    }),
+  );
+}
+
+function appendSvgElement<K extends keyof SVGElementTagNameMap>(
+  parent: SVGElement,
+  name: K,
+  attributes: Readonly<Record<string, string>>,
+): SVGElementTagNameMap[K] {
+  const element = document.createElementNS('http://www.w3.org/2000/svg', name);
+  for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
+  parent.appendChild(element);
+  return element;
+}
+
+function lifetimeLinePath(
+  points: readonly AdminLifetimeMetricPoint[],
+  value: (point: AdminLifetimeMetricPoint) => number,
+  maxValue: number,
+): string {
+  const width = 1_000;
+  const height = 220;
+  const timestamps = points.map((point) => Date.parse(point.start));
+  const minTime = Math.min(...timestamps);
+  const maxTime = Math.max(...timestamps);
+  const span = Math.max(1, maxTime - minTime);
+  if (points.length === 1) {
+    const y =
+      height - (Math.max(0, value(points[0] as AdminLifetimeMetricPoint)) / maxValue) * height;
+    return `M0 ${y.toFixed(2)} L${width} ${y.toFixed(2)}`;
+  }
+  return points
+    .map((point, index) => {
+      const timestamp = timestamps[index] ?? minTime;
+      const x = ((timestamp - minTime) / span) * width;
+      const y = height - (Math.max(0, value(point)) / maxValue) * height;
+      return `${index === 0 ? 'M' : 'L'}${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(' ');
+}
+
+function renderLifetimeMetrics(lifetime: AdminLifetimeMetrics | null | undefined): void {
+  if (!lifetimeMetricsEl || !lifetimeChartEl) return;
+  if (!lifetime || !Array.isArray(lifetime.points) || lifetime.points.length === 0) {
+    lifetimeMetricsEl.replaceChildren();
+    const unavailable = document.createElement('p');
+    unavailable.className = 'admin-metric-unavailable';
+    unavailable.textContent = 'Cumulative metrics are temporarily unavailable.';
+    lifetimeChartEl.replaceChildren(unavailable);
+    lifetimeChartEl.removeAttribute('role');
+    lifetimeChartEl.removeAttribute('aria-label');
+    return;
+  }
+
+  const totalRooms = Math.max(0, Number(lifetime.totals?.roomsOpened) || 0);
+  const totalGuests = Math.max(0, Number(lifetime.totals?.guestJoins) || 0);
+  const totals: readonly (readonly [string, number, string])[] = [
+    ['Cumulative rooms opened', totalRooms, 'Fresh Standard rooms; PRO and reconnects excluded'],
+    [
+      'Cumulative guest joins',
+      totalGuests,
+      'Successful Standard-room guest connections; repeats included',
+    ],
+  ];
+  lifetimeMetricsEl.replaceChildren(
+    ...totals.map(([label, value, description]) => {
+      const item = document.createElement('article');
+      item.className = 'lifetime-metric';
+      const labelEl = document.createElement('span');
+      labelEl.textContent = label;
+      const valueEl = document.createElement('strong');
+      valueEl.textContent = formatter.format(value);
+      const descriptionEl = document.createElement('small');
+      descriptionEl.textContent = description;
+      item.append(labelEl, valueEl, descriptionEl);
+      return item;
+    }),
+  );
+
+  const points = lifetime.points.filter(
+    (point) =>
+      Number.isFinite(Date.parse(point.start)) &&
+      Number.isFinite(point.roomsOpened) &&
+      Number.isFinite(point.guestJoins),
+  );
+  if (points.length === 0) {
+    const unavailable = document.createElement('p');
+    unavailable.className = 'admin-metric-unavailable';
+    unavailable.textContent = 'Cumulative chart data is unavailable.';
+    lifetimeChartEl.replaceChildren(unavailable);
+    return;
+  }
+  const maxValue = Math.max(1, ...points.flatMap((point) => [point.roomsOpened, point.guestJoins]));
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.classList.add('lifetime-chart-svg');
+  svg.setAttribute('viewBox', '0 0 1000 220');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.setAttribute('aria-hidden', 'true');
+  for (const ratio of [0, 0.25, 0.5, 0.75, 1]) {
+    appendSvgElement(svg, 'line', {
+      class: 'lifetime-grid-line',
+      x1: '0',
+      x2: '1000',
+      y1: String(220 * ratio),
+      y2: String(220 * ratio),
+    });
+  }
+  appendSvgElement(svg, 'path', {
+    class: 'lifetime-line is-rooms',
+    d: lifetimeLinePath(points, (point) => point.roomsOpened, maxValue),
+  });
+  appendSvgElement(svg, 'path', {
+    class: 'lifetime-line is-guests',
+    d: lifetimeLinePath(points, (point) => point.guestJoins, maxValue),
+  });
+
+  const axis = document.createElement('div');
+  axis.className = 'lifetime-chart-axis';
+  const sampleIndexes = [...new Set([0, Math.floor((points.length - 1) / 2), points.length - 1])];
+  for (const index of sampleIndexes) {
+    const label = document.createElement('span');
+    label.textContent = dayLabel(points[index]?.start || '');
+    axis.appendChild(label);
+  }
+  lifetimeChartEl.setAttribute('role', 'img');
+  lifetimeChartEl.setAttribute(
+    'aria-label',
+    `Cumulative usage: ${formatter.format(totalRooms)} Standard rooms opened and ${formatter.format(totalGuests)} successful Standard-room guest joins, repeat connections included.`,
+  );
+  lifetimeChartEl.replaceChildren(svg, axis);
+}
+
+function renderCards(cards: readonly AdminMetricCard[]): void {
+  if (!cardsEl) return;
+  cardsEl.replaceChildren(
+    ...cards.map((card) => {
+      const article = document.createElement('article');
+      article.className = 'metric-card';
+      const value =
+        typeof card.value === 'number' ? formatter.format(card.value) : String(card.value);
+      article.innerHTML = `
+        <span>${card.label}</span>
+        <strong>${value}</strong>
+        <small>${formatDelta(card.delta)}</small>
+      `;
+      return article;
+    }),
+  );
+}
+
+function hourLabel(iso: string): string {
+  return new Intl.DateTimeFormat('en-US', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(iso));
+}
+
+function dayLabel(iso: string): string {
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+  }).format(new Date(iso));
+}
+
+function compactDayLabel(iso: string): string {
+  const date = new Date(iso);
+  return `${date.getMonth() + 1}/${date.getDate()}`;
+}
+
+function renderHourlyChart(hourly: readonly AdminMetricBucket[]): void {
+  if (!hourlyEl) return;
+  const max = Math.max(
+    1,
+    ...hourly.map((bucket) => (bucket.events.room_opened || 0) + (bucket.events.guest_joined || 0)),
+  );
+  hourlyEl.replaceChildren(
+    ...hourly.map((bucket) => {
+      const rooms = bucket.events.room_opened || 0;
+      const guests = bucket.events.guest_joined || 0;
+      const total = rooms + guests;
+      const row = document.createElement('div');
+      row.className = 'chart-row';
+      row.innerHTML = `
+        <span class="chart-label">${hourLabel(bucket.start)}</span>
+        <span class="chart-track">
+          <span class="bar rooms" style="width:${(rooms / max) * 100}%"></span>
+          <span class="bar guests" style="width:${(guests / max) * 100}%"></span>
+        </span>
+        <span class="chart-value">${formatter.format(total)}</span>
+      `;
+      return row;
+    }),
+  );
+}
+
+function renderDailyList(daily: readonly AdminMetricBucket[]): void {
+  if (!dailyEl) return;
+  const max = Math.max(
+    1,
+    ...daily.map((bucket) => (bucket.events.room_opened || 0) + (bucket.events.guest_joined || 0)),
+  );
+  dailyEl.replaceChildren(
+    ...daily.map((bucket) => {
+      const rooms = bucket.events.room_opened || 0;
+      const guests = bucket.events.guest_joined || 0;
+      const item = document.createElement('article');
+      item.className = 'trend-item';
+      item.innerHTML = `
+        <div>
+          <span>${dayLabel(bucket.start)}</span>
+          <strong>${formatter.format(rooms)} rooms</strong>
+          <small>${formatter.format(guests)} guest joins</small>
+        </div>
+        <div class="trend-bar" aria-hidden="true">
+          <span style="width:${((rooms + guests) / max) * 100}%"></span>
+        </div>
+      `;
+      return item;
+    }),
+  );
+}
+
+function renderMonthlyChart(daily30: readonly AdminMetricBucket[]): void {
+  if (!monthlyEl) return;
+  const totals = daily30.map((bucket) => {
+    const rooms = bucket.events.room_opened || 0;
+    const guests = bucket.events.guest_joined || 0;
+    return rooms + guests;
+  });
+  const max = Math.max(1, ...totals);
+  const mid = Math.ceil(max / 2);
+  const ticks = max > 1 ? [max, mid, 0] : [1, 0];
+
+  const axis = document.createElement('div');
+  axis.className = 'spectrum-axis';
+  axis.setAttribute('aria-hidden', 'true');
+  axis.innerHTML = ticks.map((tick) => `<span>${formatter.format(tick)}</span>`).join('');
+
+  const bars = document.createElement('div');
+  bars.className = 'spectrum-bars';
+  bars.setAttribute('role', 'list');
+
+  daily30.forEach((bucket, index) => {
+    const rooms = bucket.events.room_opened || 0;
+    const guests = bucket.events.guest_joined || 0;
+    const total = rooms + guests;
+    const label = compactDayLabel(bucket.start);
+    const bar = document.createElement('div');
+    bar.className = 'spectrum-bar';
+    bar.setAttribute('role', 'listitem');
+    bar.setAttribute(
+      'aria-label',
+      `${label}: ${formatter.format(total)} total activity, ${formatter.format(rooms)} rooms, ${formatter.format(guests)} guest joins`,
+    );
+    bar.innerHTML = `
+      <span class="spectrum-column" style="height:${Math.max(3, (total / max) * 100)}%">
+        <span class="spectrum-fill rooms" style="height:${total ? (rooms / total) * 100 : 0}%"></span>
+        <span class="spectrum-fill guests" style="height:${total ? (guests / total) * 100 : 0}%"></span>
+      </span>
+      <span class="spectrum-date">${index % 5 === 0 || index === daily30.length - 1 ? label : ''}</span>
+    `;
+    bars.appendChild(bar);
+  });
+
+  monthlyEl.replaceChildren(axis, bars);
+}
+
+function renderSignals(summary: AdminMetricsSummary): void {
+  if (!signalEl) return;
+  const last24 = summary.last24 || {};
+  const signals: readonly (readonly [string, number])[] = [
+    ['Host missing', last24.guest_host_unavailable || 0],
+    ['Password prompts', last24.guest_auth_pending || 0],
+    ['Password failures', last24.guest_auth_failed || 0],
+    ['Password timeouts', last24.guest_auth_timeout || 0],
+    ['Host reconnects', last24.host_reconnected || 0],
+  ];
+  signalEl.replaceChildren(
+    ...signals.map(([label, value]) => {
+      const item = document.createElement('div');
+      item.className = 'signal-item';
+      item.innerHTML = `<span>${label}</span><strong>${formatter.format(value)}</strong>`;
+      return item;
+    }),
+  );
+}
+
+async function loadMetrics(
+  options: { readonly updateTimestamp?: boolean } = {},
+): Promise<AdminApiPayload> {
+  const load = beginLatestAdminLoad('metrics');
+  if (updatedAtEl) updatedAtEl.textContent = 'Refreshing...';
+  try {
+    const metrics = await fetchJson('/api/admin/metrics', {
+      signal: load.controller.signal,
+    });
+    throwIfAdminLoadStale(load);
+    showDashboard();
+    renderAccountMetrics(metrics.accounts);
+    renderCards(metrics.cards || []);
+    renderHourlyChart(metrics.summary?.hourly || []);
+    renderDailyList(metrics.summary?.daily || []);
+    renderMonthlyChart(metrics.summary?.daily30 || []);
+    renderSignals(metrics.summary || {});
+    renderLifetimeMetrics(metrics.lifetime);
+    if (options.updateTimestamp !== false && updatedAtEl) {
+      updatedAtEl.textContent = `Updated ${formatAdminDateTime(metrics.generatedAt)}`;
+    }
+    return metrics;
+  } finally {
+    finishLatestAdminLoad(load);
+  }
+}
+
+function renderArticleRow(article: AdminArticle): HTMLElement {
+  const item = document.createElement('article');
+  item.className = 'article-item';
+  item.classList.toggle('is-hidden', Boolean(article.hidden));
+
+  const body = document.createElement('div');
+  body.className = 'article-body';
+
+  const title = document.createElement('strong');
+  title.textContent = article.title || article.slug || '';
+
+  const meta = document.createElement('span');
+  const parts = [formatArticleDate(article.pubDate), article.slug, article.source].filter(Boolean);
+  meta.textContent = parts.join(' · ');
+
+  body.append(title, meta);
+
+  const actions = document.createElement('div');
+  actions.className = 'article-actions';
+
+  const open = document.createElement('a');
+  open.href = article.href || `/blog/${article.slug}`;
+  open.target = '_blank';
+  open.rel = 'noopener noreferrer';
+  open.textContent = 'Open';
+
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'article-toggle';
+  toggle.textContent = article.hidden ? 'Restore' : 'Hide';
+  addAsyncAdminEventListener(toggle, 'click', async () => {
+    toggle.disabled = true;
+    toggle.textContent = article.hidden ? 'Restoring...' : 'Hiding...';
+    try {
+      await fetchJson('/api/admin/articles/visibility', {
+        method: 'POST',
+        body: JSON.stringify({ slug: article.slug, hidden: !article.hidden }),
+      });
+      await loadArticles();
+    } catch (error) {
+      toggle.disabled = false;
+      toggle.textContent = article.hidden ? 'Restore' : 'Hide';
+      if (articleStatusEl) {
+        articleStatusEl.textContent = adminErrorMessage(error, 'Article update failed.');
+      }
+    }
+  });
+
+  actions.append(open, toggle);
+  item.append(body, actions);
+  return item;
+}
+
+function renderArticles(payload: AdminApiPayload): void {
+  const articles = payload.articles || [];
+  const visibleCount = articles.filter((article) => !article.hidden).length;
+  const hiddenCount = articles.length - visibleCount;
+  if (articleStatusEl) {
+    articleStatusEl.textContent = `${formatter.format(visibleCount)} visible · ${formatter.format(hiddenCount)} hidden`;
+  }
+  if (!articleListEl) return;
+  if (!articles.length) {
+    const empty = document.createElement('p');
+    empty.className = 'article-empty';
+    empty.textContent = 'No articles found.';
+    articleListEl.replaceChildren(empty);
+    return;
+  }
+  articleListEl.replaceChildren(...articles.map(renderArticleRow));
+}
+
+async function loadArticles(
+  options: { readonly updateTimestamp?: boolean } = {},
+): Promise<AdminApiPayload> {
+  const load = beginLatestAdminLoad('articles');
+  if (articleStatusEl) articleStatusEl.textContent = 'Refreshing...';
+  try {
+    const payload = await fetchJson('/api/admin/articles', {
+      signal: load.controller.signal,
+    });
+    throwIfAdminLoadStale(load);
+    renderArticles(payload);
+    articlesLoaded = true;
+    if (options.updateTimestamp !== false && updatedAtEl) {
+      updatedAtEl.textContent = `Updated ${formatAdminDateTime(payload.generatedAt)}`;
+    }
+    return payload;
+  } finally {
+    finishLatestAdminLoad(load);
+  }
+}
+
+function validAdminTranslation(value: unknown): value is AdminTranslationSuggestion {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return (
+    [
+      'id',
+      'locale',
+      'surface',
+      'key',
+      'sourceEn',
+      'sourceKo',
+      'current',
+      'proposed',
+      'reason',
+      'author',
+    ].every((key) => typeof item[key] === 'string') &&
+    ['pending', 'approved', 'rejected', 'withdrawn'].includes(String(item.status)) &&
+    ['revision', 'votes', 'createdAt'].every(
+      (key) => Number.isSafeInteger(item[key]) && Number(item[key]) >= 0,
+    ) &&
+    typeof item.outdated === 'boolean' &&
+    typeof item.applied === 'boolean'
+  );
+}
+
+function reportTranslationAdminError(error: unknown): void {
+  if (isAdminRequestFailure(error) && error.code === 'ADMIN_REQUEST_CANCELLED') return;
+  if (translationStatusEl) {
+    translationStatusEl.dataset.state = 'error';
+    translationStatusEl.textContent = adminErrorMessage(error, 'Translation request failed.');
+  }
+}
+
+function renderTranslationReview(item: AdminTranslationSuggestion): HTMLElement {
+  const row = document.createElement('article');
+  row.className = 'translation-review-item';
+  const head = document.createElement('div');
+  head.className = 'translation-review-card-head';
+  const heading = document.createElement('strong');
+  heading.textContent = `${item.locale} · ${item.surface} · ${item.key}`;
+  const state = document.createElement('span');
+  state.className = 'translation-review-state';
+  state.dataset.state = item.applied ? 'applied' : item.outdated ? 'outdated' : item.status;
+  state.textContent = item.applied ? 'Applied' : item.outdated ? 'References changed' : item.status;
+  head.append(heading, state);
+  const meta = document.createElement('p');
+  meta.className = 'translation-review-meta';
+  const author = document.createElement('bdi');
+  author.textContent = item.author;
+  meta.append(
+    `${item.votes} recommendations · `,
+    author,
+    ` · ${formatAdminDateTime(item.createdAt)}`,
+  );
+  const comparison = document.createElement('div');
+  comparison.className = 'translation-review-comparison';
+  for (const [name, content, kind] of [
+    ['Current translation', item.current, 'current'],
+    ['Suggested translation', item.proposed, 'proposed'],
+  ] as const) {
+    const field = document.createElement('div');
+    field.className = `translation-review-field translation-review-field--${kind}`;
+    const label = document.createElement('span');
+    label.className = 'translation-review-label';
+    label.textContent = name;
+    const value = document.createElement('p');
+    value.className = `translation-review-${kind}`;
+    value.dir = 'auto';
+    value.lang = item.locale;
+    value.textContent = content;
+    field.append(label, value);
+    comparison.append(field);
+  }
+  const references = document.createElement('details');
+  references.className = 'translation-review-references';
+  const summary = document.createElement('summary');
+  summary.textContent = 'References';
+  references.append(summary);
+  for (const [name, content, lang] of [
+    ['Source(English)', item.sourceEn, 'en'],
+    ['Reference(Korean)', item.sourceKo, 'ko'],
+    ['Contributor note', item.reason, ''],
+  ] as const) {
+    if (!content) continue;
+    const field = document.createElement('div');
+    field.className = 'translation-review-reference';
+    const label = document.createElement('span');
+    label.className = 'translation-review-label';
+    label.textContent = name;
+    const text = document.createElement('p');
+    text.dir = 'auto';
+    if (lang) text.lang = lang;
+    text.textContent = content;
+    field.append(label, text);
+    references.append(field);
+  }
+  const actions = document.createElement('div');
+  actions.className = 'translation-review-actions';
+  for (const [status, label] of [
+    ['approved', 'Approve'],
+    ['rejected', 'Reject'],
+    ['pending', 'Reopen'],
+  ] as const) {
+    if (item.status === status || item.status === 'withdrawn' || item.applied) continue;
+    if (status === 'pending' && item.status !== 'rejected') continue;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className =
+      status === 'approved' ? 'is-primary' : status === 'rejected' ? 'is-danger' : 'is-secondary';
+    button.textContent = label;
+    button.disabled = status === 'approved' && item.outdated;
+    addAsyncAdminEventListener(button, 'click', async () => {
+      actions.querySelectorAll('button').forEach((control) => {
+        control.disabled = true;
+      });
+      try {
+        await fetchJson(`/api/admin/translations/${encodeURIComponent(item.id)}/review`, {
+          method: 'POST',
+          body: JSON.stringify({ status, expectedRevision: item.revision }),
+        });
+        await loadTranslations();
+      } catch (error) {
+        reportTranslationAdminError(error);
+        actions.querySelectorAll('button').forEach((control) => {
+          control.disabled = item.outdated && control.textContent === 'Approve';
+        });
+      }
+    });
+    actions.append(button);
+  }
+  row.append(head, meta, comparison, references, actions);
+  return row;
+}
+
+async function loadTranslations(append = false): Promise<void> {
+  if (!translationListEl) return;
+  const load = beginLatestAdminLoad('translations');
+  const query = new URLSearchParams({ status: translationStatusFilter?.value || 'pending' });
+  const locale = translationLocaleFilter?.value.trim();
+  if (locale) query.set('locale', locale);
+  if (append && translationNextCursor) query.set('cursor', translationNextCursor);
+  if (translationMoreBtn) translationMoreBtn.disabled = true;
+  if (translationStatusEl) {
+    translationStatusEl.dataset.state = 'loading';
+    translationStatusEl.textContent = 'Loading…';
+  }
+  try {
+    const payload = await fetchJson(`/api/admin/translations?${query}`, {
+      signal: load.controller.signal,
+      maxResponseBytes: 8 * 1024 * 1024,
+    });
+    throwIfAdminLoadStale(load);
+    if (
+      !Array.isArray(payload.suggestions) ||
+      !payload.suggestions.every(validAdminTranslation) ||
+      (payload.nextCursor !== null && typeof payload.nextCursor !== 'string')
+    ) {
+      throw new Error('Invalid translation response.');
+    }
+    const rows = payload.suggestions.map(renderTranslationReview);
+    if (append) translationListEl.append(...rows);
+    else translationListEl.replaceChildren(...rows);
+    translationNextCursor = payload.nextCursor;
+    translationsLoaded = true;
+    if (translationMoreBtn) translationMoreBtn.hidden = !translationNextCursor;
+    if (translationStatusEl) {
+      translationStatusEl.dataset.state = translationListEl.childElementCount ? 'ready' : 'empty';
+      translationStatusEl.textContent = translationListEl.childElementCount
+        ? `${translationListEl.childElementCount} suggestions · most recommended first`
+        : 'No suggestions.';
+    }
+  } finally {
+    if (isLatestAdminLoad(load) && translationMoreBtn) translationMoreBtn.disabled = false;
+    finishLatestAdminLoad(load);
+  }
+}
+
+async function exportApprovedTranslations(): Promise<void> {
+  if (!translationExportBtn || translationExportBtn.disabled) return;
+  translationExportBtn.disabled = true;
+  const copy = document.querySelector<HTMLTextAreaElement>('[data-translation-export-json]');
+  const details = document.querySelector<HTMLDetailsElement>('[data-translation-export-copy]');
+  if (copy) copy.value = '';
+  if (details) details.hidden = true;
+  try {
+    const payload = await fetchJson('/api/admin/translations/export', {
+      maxResponseBytes: 8 * 1024 * 1024,
+    });
+    if (
+      payload.version !== 1 ||
+      payload.kind !== 'musixquare-approved-translations' ||
+      !Array.isArray(payload.drafts)
+    ) {
+      throw new Error('Invalid approved translation export.');
+    }
+    // Preserve the API/tool byte limit even for an export near its 8 MiB bound.
+    const data = JSON.stringify(payload);
+    if (copy) copy.value = data;
+    if (details) details.hidden = false;
+    const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
+    try {
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'MUSIXQUARE-approved-translations.json';
+      link.click();
+    } finally {
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+    if (translationStatusEl) {
+      translationStatusEl.dataset.state = 'ready';
+      translationStatusEl.textContent = `${payload.drafts.length} approved suggestions exported. Review and apply the file in the repository before release.`;
+    }
+  } catch (error) {
+    reportTranslationAdminError(error);
+  } finally {
+    translationExportBtn.disabled = false;
+  }
+}
+
+function clearAnnouncementExpiryTimer(): void {
+  if (announcementExpiryTimer !== null) {
+    window.clearTimeout(announcementExpiryTimer);
+    announcementExpiryTimer = null;
+  }
+}
+
+function setAnnouncementActiveIndicator(active: unknown, expiresAt: AdminTimestamp = null): void {
+  clearAnnouncementExpiryTimer();
+  const isActive = Boolean(active);
+  announcementTabEl?.classList.toggle('has-active-announcement', isActive);
+  if (announcementTabEl) {
+    announcementTabEl.setAttribute(
+      'aria-label',
+      isActive ? 'Announcements, active announcement' : 'Announcements',
+    );
+  }
+  if (!isActive || !expiresAt) return;
+
+  const expiryMs = new Date(expiresAt).getTime();
+  if (!Number.isFinite(expiryMs)) return;
+  const scheduleExpiryCheck = () => {
+    const remainingMs = expiryMs - Date.now();
+    if (remainingMs <= 0) {
+      setAnnouncementActiveIndicator(false);
+      return;
+    }
+    announcementExpiryTimer = window.setTimeout(
+      scheduleExpiryCheck,
+      Math.min(remainingMs + 50, 2_147_000_000),
+    );
+  };
+  scheduleExpiryCheck();
+}
+
+function isAnnouncementActiveForAdmin(
+  payload: AdminApiPayload,
+  announcement: AdminAnnouncement,
+): boolean {
+  if (!announcement?.enabled || !announcement?.message) return false;
+  if (typeof payload?.active === 'boolean' && !payload.active) return false;
+  if (!announcement.expiresAt) return true;
+  const expiryMs = new Date(announcement.expiresAt).getTime();
+  if (!Number.isFinite(expiryMs) || expiryMs <= Date.now()) return false;
+  return true;
+}
+
+function renderAnnouncement(payload: AdminApiPayload): void {
+  const announcement = payload.announcement || {};
+  const message = announcement.message || '';
+  const active = isAnnouncementActiveForAdmin(payload, announcement);
+  setAnnouncementActiveIndicator(active, announcement.expiresAt);
+  if (announcementMessageEl) announcementMessageEl.value = message;
+  if (announcementEnabledEl) announcementEnabledEl.checked = Boolean(announcement.enabled);
+  if (announcementExpiresEl)
+    announcementExpiresEl.value = toDatetimeLocalValue(announcement.expiresAt);
+
+  const statusParts: string[] = [];
+  statusParts.push(active ? 'Active' : announcement.enabled ? 'Expired' : 'Disabled');
+  if (announcement.expiresAt)
+    statusParts.push(`expires ${formatAdminDateTime(announcement.expiresAt)}`);
+  if (announcement.updatedAt)
+    statusParts.push(`updated ${formatAdminDateTime(announcement.updatedAt)}`);
+  if (announcementStatusEl) announcementStatusEl.textContent = statusParts.join(' - ');
+
+  if (!announcementPreviewEl) return;
+  if (!message) {
+    announcementPreviewEl.hidden = true;
+    announcementPreviewEl.textContent = '';
+    return;
+  }
+  announcementPreviewEl.hidden = false;
+  announcementPreviewEl.innerHTML = `
+    <span>Notice · MUSIXQUARE</span>
+    <p></p>
+  `;
+  const previewMessage = announcementPreviewEl.querySelector<HTMLElement>('p');
+  if (previewMessage) previewMessage.textContent = message;
+}
+
+function renderAnnouncementHistory(payload: AdminApiPayload): void {
+  const history = Array.isArray(payload.history) ? payload.history : [];
+  if (announcementHistoryStatusEl) {
+    announcementHistoryStatusEl.textContent = history.length
+      ? `${formatter.format(history.length)} records`
+      : 'No records';
+  }
+  if (!announcementHistoryListEl) return;
+  if (!history.length) {
+    const empty = document.createElement('p');
+    empty.className = 'announcement-history-empty';
+    empty.textContent = 'No announcement history yet.';
+    announcementHistoryListEl.replaceChildren(empty);
+    return;
+  }
+
+  announcementHistoryListEl.replaceChildren(
+    ...history.map((entry) => {
+      const item = document.createElement('article');
+      const action = String(entry.action || 'updated');
+      item.className = `announcement-history-item action-${action}`;
+
+      const meta = document.createElement('div');
+      meta.className = 'announcement-history-meta';
+
+      const actionEl = document.createElement('strong');
+      actionEl.textContent = formatAnnouncementAction(action);
+      meta.appendChild(actionEl);
+
+      const timeEl = document.createElement('span');
+      timeEl.textContent = formatAdminDateTime(entry.updatedAt);
+      meta.appendChild(timeEl);
+
+      if (entry.expiresAt) {
+        const expiresEl = document.createElement('small');
+        expiresEl.textContent = `expires ${formatAdminDateTime(entry.expiresAt)}`;
+        meta.appendChild(expiresEl);
+      }
+
+      const body = document.createElement('p');
+      body.textContent = entry.message || 'No message';
+
+      item.append(meta, body);
+      return item;
+    }),
+  );
+}
+
+function setAnnouncementMutationBusy(busy: boolean): void {
+  announcementMutationBusy = busy;
+  const controls = new Set([
+    announcementMessageEl,
+    announcementEnabledEl,
+    announcementExpiresEl,
+    announcementClearBtn,
+    ...(announcementForm?.querySelectorAll<HTMLElement>('button, input, textarea') || []),
+  ]);
+  for (const control of controls) {
+    if (control && 'disabled' in control && typeof control.disabled === 'boolean') {
+      control.disabled = busy;
+    }
+  }
+}
+
+async function loadAnnouncement(
+  options: { readonly updateTimestamp?: boolean } = {},
+): Promise<AdminApiPayload | null> {
+  if (announcementMutationBusy) return null;
+  const load = beginLatestAdminLoad('announcement');
+  if (announcementStatusEl) announcementStatusEl.textContent = 'Refreshing...';
+  try {
+    const payload = await fetchJson('/api/admin/announcement', {
+      signal: load.controller.signal,
+    });
+    throwIfAdminLoadStale(load);
+    if (
+      typeof payload.revision !== 'number' ||
+      !Number.isSafeInteger(payload.revision) ||
+      payload.revision < 0
+    ) {
+      throw adminRequestError(
+        'ADMIN_RESPONSE_INVALID',
+        'The server returned an invalid announcement revision.',
+      );
+    }
+    currentAnnouncementRevision = payload.revision;
+    pendingAnnouncementMutation = null;
+    renderAnnouncement(payload);
+    renderAnnouncementHistory(payload);
+    announcementLoaded = true;
+    if (options.updateTimestamp !== false && updatedAtEl) {
+      updatedAtEl.textContent = `Updated ${formatAdminDateTime(payload.generatedAt)}`;
+    }
+    return payload;
+  } finally {
+    finishLatestAdminLoad(load);
+  }
+}
+
+async function saveAnnouncement({ clear = false }: { readonly clear?: boolean } = {}): Promise<
+  void | null
+> {
+  if (announcementMutationBusy) return null;
+  const message = clear ? '' : String(announcementMessageEl?.value || '').trim();
+  const enabled = clear ? false : Boolean(announcementEnabledEl?.checked);
+  const expiresValue = clear ? '' : String(announcementExpiresEl?.value || '').trim();
+  if (
+    currentAnnouncementRevision === null ||
+    !Number.isSafeInteger(currentAnnouncementRevision) ||
+    currentAnnouncementRevision < 0
+  ) {
+    throw adminRequestError(
+      'ADMIN_ANNOUNCEMENT_STATE_UNAVAILABLE',
+      'Refresh the announcement before saving.',
+    );
+  }
+  const expiresAt = parseAnnouncementExpiresValue(expiresValue);
+  const signature = JSON.stringify({
+    message,
+    enabled,
+    expiresAt,
+    expectedRevision: currentAnnouncementRevision,
+  });
+  if (pendingAnnouncementMutation?.signature !== signature) {
+    pendingAnnouncementMutation = { signature, requestId: createAdminRequestId() };
+  }
+  const mutation = pendingAnnouncementMutation;
+  if (!mutation) throw adminRequestError('ADMIN_RESPONSE_INVALID', 'Mutation state unavailable.');
+  const expectedRevision = currentAnnouncementRevision;
+  adminLatestLoads.get('announcement')?.abort();
+  setAnnouncementMutationBusy(true);
+  if (announcementStatusEl) announcementStatusEl.textContent = clear ? 'Clearing...' : 'Saving...';
+  try {
+    const payload = await fetchJson('/api/admin/announcement', {
+      method: 'POST',
+      body: JSON.stringify({
+        message,
+        enabled,
+        expiresAt,
+        expectedRevision,
+        requestId: mutation.requestId,
+      }),
+    });
+    if (
+      typeof payload.revision !== 'number' ||
+      !Number.isSafeInteger(payload.revision) ||
+      payload.revision < 1
+    ) {
+      throw adminRequestError(
+        'ADMIN_RESPONSE_INVALID',
+        'The server returned an invalid announcement revision.',
+      );
+    }
+    currentAnnouncementRevision = payload.revision;
+    if (pendingAnnouncementMutation === mutation) pendingAnnouncementMutation = null;
+    renderAnnouncement(payload);
+    renderAnnouncementHistory(payload);
+    announcementLoaded = true;
+    if (updatedAtEl) updatedAtEl.textContent = `Updated ${formatAdminDateTime(Date.now())}`;
+  } catch (error) {
+    const failure = isAdminRequestFailure(error) ? error : null;
+    const conflictRevision = failure?.payload?.revision;
+    if (
+      error instanceof Error &&
+      error.message === 'ADMIN_ANNOUNCEMENT_CONFLICT' &&
+      typeof conflictRevision === 'number' &&
+      Number.isSafeInteger(conflictRevision) &&
+      conflictRevision >= expectedRevision &&
+      failure?.payload
+    ) {
+      currentAnnouncementRevision = conflictRevision;
+      renderAnnouncement(failure.payload);
+      renderAnnouncementHistory(failure.payload);
+      if (pendingAnnouncementMutation === mutation) pendingAnnouncementMutation = null;
+    } else if (
+      (!(error instanceof Error) || error.message !== 'ADMIN_ANNOUNCEMENT_CONTROL_UNAVAILABLE') &&
+      failure?.code !== 'ADMIN_MUTATION_OUTCOME_UNKNOWN'
+    ) {
+      if (pendingAnnouncementMutation === mutation) pendingAnnouncementMutation = null;
+    }
+    throw error;
+  } finally {
+    setAnnouncementMutationBusy(false);
+  }
+}
+
+async function loadAuthenticatedDashboard({
+  activateAnalytics = true,
+}: { readonly activateAnalytics?: boolean } = {}): Promise<ServiceStatusState | null> {
+  showDashboard();
+  if (activateAnalytics) setActiveTab('operations');
+  // Keep a rolling admin asset update usable if an older server-rendered shell
+  // is briefly paired with this script. Production shells expose the control.
+  if (!serviceStatusTrigger) {
+    await loadMetrics();
+    return null;
+  }
+  if (updatedAtEl) updatedAtEl.textContent = 'Checking service status...';
+
+  let status = null;
+  try {
+    status = await loadServiceStatus({ updateTimestamp: false });
+  } catch {
+    // Keep the dashboard usable if the control plane is temporarily
+    // unavailable. Mutations remain disabled until a verified status loads.
+  }
+  if (!status) {
+    if (updatedAtEl) updatedAtEl.textContent = 'Service status unavailable';
+    return null;
+  }
+  if (status && (status.enabled || isServiceStatusSettling(status))) {
+    const state = serviceStatusStateName(status);
+    const statusTime = status.activatedAt || status.updatedAt;
+    if (updatedAtEl) {
+      updatedAtEl.textContent =
+        state === 'activating'
+          ? 'Activating maintenance - background refresh in progress'
+          : state === 'resuming'
+            ? 'Resuming service - background refresh in progress'
+            : `Maintenance active${statusTime ? ` since ${formatAdminDateTime(statusTime)}` : ''}`;
+    }
+    return status;
+  }
+
+  try {
+    await loadMetrics();
+  } catch (error) {
+    if (updatedAtEl)
+      updatedAtEl.textContent = adminErrorMessage(error, 'Analytics refresh failed.');
+  }
+  if (dashboard?.hidden) return status;
+  await loadAnnouncement({ updateTimestamp: false }).catch((error) => {
+    if (announcementStatusEl) {
+      announcementStatusEl.textContent = adminErrorMessage(error, 'Announcement refresh failed.');
+    }
+  });
+  return status;
+}
+
+async function refreshAllDashboardData(): Promise<void> {
+  const refreshEpoch = adminSessionEpoch;
+  if (document.querySelector<HTMLElement>('[data-admin-view="maintenance"]')?.hidden === false) {
+    loadServiceStatusHistory().catch(() => {});
+  }
+  // Refresh data without replaying the tab selected before the requests began.
+  if (serviceStatusTrigger) {
+    if (updatedAtEl) updatedAtEl.textContent = 'Checking service status...';
+    let status = null;
+    try {
+      status = await loadServiceStatus({ updateTimestamp: false });
+    } catch {
+      // Do not fan out requests while the control-plane state is unknown. This
+      // keeps the maintenance control available even if data APIs are gated.
+    }
+    if (refreshEpoch !== adminSessionEpoch || dashboard?.hidden) return;
+    if (!status) {
+      if (updatedAtEl) updatedAtEl.textContent = 'Service status unavailable';
+      return;
+    }
+    if (status.enabled || isServiceStatusSettling(status)) {
+      const state = serviceStatusStateName(status);
+      const statusTime = status.activatedAt || status.updatedAt;
+      if (updatedAtEl) {
+        updatedAtEl.textContent =
+          state === 'activating'
+            ? 'Activating maintenance - background refresh in progress'
+            : state === 'resuming'
+              ? 'Resuming service - background refresh in progress'
+              : `Maintenance active${statusTime ? ` since ${formatAdminDateTime(statusTime)}` : ''}`;
+      }
+      return;
+    }
+  }
+  if (updatedAtEl) updatedAtEl.textContent = 'Refreshing...';
+  await Promise.all([
+    loadMetrics({ updateTimestamp: false }),
+    loadProRooms({ updateTimestamp: false }).catch((error) => {
+      if (proRoomListStatusEl) {
+        proRoomListStatusEl.textContent = adminErrorMessage(error, 'PRO rooms refresh failed.');
+      }
+    }),
+    loadProGrantCampaignStatus().catch((error) => {
+      if (isAdminRequestFailure(error) && error.code === 'ADMIN_REQUEST_CANCELLED') return;
+      setProGrantCampaignMessage(
+        adminErrorMessage(error, 'PRO grant campaign refresh failed.'),
+        true,
+      );
+    }),
+    loadArticles({ updateTimestamp: false }),
+    loadAnnouncement({ updateTimestamp: false }),
+    ...(translationsLoaded ? [loadTranslations().catch(reportTranslationAdminError)] : []),
+  ]);
+  if (refreshEpoch !== adminSessionEpoch || dashboard?.hidden) return;
+  if (updatedAtEl) updatedAtEl.textContent = `Updated ${formatAdminDateTime(Date.now())}`;
+}
+
+async function init(): Promise<void> {
+  const productionHost = /(^|\.)musixquare\.com$/i.test(window.location.hostname);
+  if (productionHost) {
+    const retryKey = `mxqr-admin-asset-retry-${ADMIN_SCRIPT_VERSION}`;
+    if (root?.dataset.adminAssetVersion === ADMIN_SCRIPT_VERSION) {
+      try {
+        window.sessionStorage.removeItem(retryKey);
+      } catch {
+        // Storage can be unavailable in hardened browser profiles.
+      }
+    } else {
+      let attempts = 0;
+      try {
+        attempts = Number(window.sessionStorage.getItem(retryKey) || 0);
+      } catch {
+        // Storage can be unavailable in hardened browser profiles.
+      }
+      if (attempts >= 8) {
+        setStatus('Admin update is still propagating. Refresh in a moment.');
+        return;
+      }
+      try {
+        window.sessionStorage.setItem(retryKey, String(attempts + 1));
+      } catch {
+        // Storage can be unavailable in hardened browser profiles.
+      }
+      setStatus('Synchronizing admin controls...');
+      window.setTimeout(() => window.location.reload(), 500 + attempts * 250);
+      return;
+    }
+  }
+  if (root?.dataset.adminConfigured !== 'true') {
+    showLogin('Admin secrets are not configured yet.');
+    return;
+  }
+
+  let sessionEpoch = adminSessionEpoch;
+  try {
+    const session = await fetchJson('/api/admin/session', { sessionBound: true });
+    if (sessionEpoch !== adminSessionEpoch) return;
+    if (!session.authenticated) {
+      showLogin();
+      return;
+    }
+    sessionEpoch = beginAdminSession();
+    await loadAuthenticatedDashboard();
+  } catch (error) {
+    if (sessionEpoch !== adminSessionEpoch) return;
+    showLogin(adminErrorMessage(error, 'Failed to load admin session.'));
+  }
+}
+
+addAsyncAdminEventListener(loginForm, 'submit', async (event) => {
+  event.preventDefault();
+  // The logout response clears the server cookie. Never allow a newer login
+  // to race ahead of that response and then have its fresh cookie removed.
+  if (adminLogoutInFlight) {
+    setStatus('Signing out...');
+    return;
+  }
+  // Explicit login owns the session from the user's action onward, including
+  // while the initial session lookup or an older login is still settling.
+  const sessionEpoch = beginAdminSession();
+  const form = new FormData(loginForm ?? undefined);
+  const password = String(form.get('password') || '');
+  setStatus('Checking...');
+  try {
+    await fetchJson('/api/admin/login', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+      sessionBound: false,
+    });
+    if (sessionEpoch !== adminSessionEpoch) return;
+    loginForm?.reset();
+    await loadAuthenticatedDashboard();
+  } catch (error) {
+    if (sessionEpoch !== adminSessionEpoch) return;
+    if (!dashboard?.hidden) showLogin(adminErrorMessage(error, 'Dashboard load failed.'));
+    else setStatus(adminErrorMessage(error, 'Login failed.'), true);
+  }
+});
+
+refreshBtn?.addEventListener('click', () => {
+  refreshAllDashboardData().catch((error) => {
+    if (updatedAtEl) updatedAtEl.textContent = adminErrorMessage(error, 'Refresh failed.');
+  });
+});
+
+adminTabs.forEach((button) => {
+  button.addEventListener('click', () => {
+    const tab = button.dataset.adminTab || 'operations';
+    setActiveTab(tab);
+    if (tab === 'maintenance') {
+      loadServiceStatusHistory().catch(() => {});
+      loadServiceStatus({ updateTimestamp: false }).catch(() => {});
+    }
+    if (tab === 'pro-rooms' && !proRoomsLoaded) {
+      loadProRooms().catch((error) => {
+        if (proRoomListStatusEl) {
+          proRoomListStatusEl.textContent = adminErrorMessage(error, 'Refresh failed.');
+        }
+      });
+    }
+    if (tab === 'pro-rooms' && !proGrantCampaignLoaded) {
+      loadProGrantCampaignStatus().catch((error) => {
+        if (isAdminRequestFailure(error) && error.code === 'ADMIN_REQUEST_CANCELLED') return;
+        setProGrantCampaignMessage(
+          adminErrorMessage(error, 'PRO grant campaign refresh failed.'),
+          true,
+        );
+      });
+    }
+    if (tab === 'articles' && !articlesLoaded) {
+      loadArticles().catch((error) => {
+        if (articleStatusEl) {
+          articleStatusEl.textContent = adminErrorMessage(error, 'Refresh failed.');
+        }
+      });
+    }
+    if (tab === 'translations' && !translationsLoaded) {
+      loadTranslations().catch(reportTranslationAdminError);
+    }
+    if (tab === 'announcements' && !announcementLoaded) {
+      loadAnnouncement().catch((error) => {
+        if (announcementStatusEl)
+          announcementStatusEl.textContent = adminErrorMessage(error, 'Refresh failed.');
+      });
+    }
+  });
+});
+
+document.querySelector('[data-translation-filter]')?.addEventListener('click', () => {
+  loadTranslations().catch(reportTranslationAdminError);
+});
+translationStatusFilter?.addEventListener('change', () => {
+  loadTranslations().catch(reportTranslationAdminError);
+});
+translationMoreBtn?.addEventListener('click', () => {
+  loadTranslations(true).catch(reportTranslationAdminError);
+});
+translationExportBtn?.addEventListener('click', () => {
+  exportApprovedTranslations().catch(reportTranslationAdminError);
+});
+
+serviceStatusChangeBtn?.addEventListener('click', openServiceStatusConfirmation);
+
+for (const button of serviceStatusCancelBtns) {
+  button.addEventListener('click', () => {
+    if (serviceStatusBusy) return;
+    closeServiceStatusConfirmation();
+    restoreServiceStatusConfirmationFocus();
+  });
+}
+
+serviceHistoryRefreshBtn?.addEventListener('click', () => {
+  loadServiceStatusHistory().catch(() => {});
+});
+
+serviceStatusPreviewBtn?.addEventListener('click', () => {
+  window.open('/admin/maintenance-preview', '_blank', 'noopener');
+});
+
+serviceStatusConfirmBtn?.addEventListener('click', () => {
+  saveServiceStatus().catch(() => {});
+});
+
+function bindProGrantCampaignEvents(): void {
+  mountProGrantCampaignPanel();
+  renderProGrantCampaignState(null);
+
+  proGrantCampaignNewBtn?.addEventListener('click', openProGrantCampaignForm);
+  proGrantCampaignImportBtn?.addEventListener('click', () => {
+    if (!proGrantCampaignImportInput) return;
+    proGrantCampaignImportInput.value = '';
+    proGrantCampaignImportInput.click();
+  });
+  const importInput = proGrantCampaignImportInput;
+  importInput?.addEventListener('change', () => {
+    const file = importInput.files?.[0];
+    const sessionEpoch = adminSessionEpoch;
+    importProGrantVoucherExport(file)
+      .catch((error) => {
+        if (sessionEpoch !== adminSessionEpoch) return;
+        setProGrantCampaignMessage(
+          adminErrorMessage(error, 'The code file could not be imported.'),
+          true,
+        );
+      })
+      .finally(() => {
+        importInput.value = '';
+      });
+  });
+  proGrantCampaignFormCancelBtn?.addEventListener('click', closeProGrantCampaignForm);
+  proGrantCampaignFormEl?.addEventListener('input', (event) => {
+    const target = event.target;
+    if (
+      target &&
+      'name' in target &&
+      typeof target.name === 'string' &&
+      ['slug', 'roomStartCode', 'roomCount'].includes(target.name)
+    ) {
+      updateProGrantCampaignFormPreview();
+    }
+  });
+  proGrantCampaignFormEl?.addEventListener('submit', (event) => {
+    event.preventDefault();
+    try {
+      stageProGrantCampaignFromForm();
+    } catch (error) {
+      setProGrantCampaignMessage(adminErrorMessage(error, 'Check the event details.'), true);
+    }
+  });
+  proGrantCampaignVerifyBtn?.addEventListener('click', () => {
+    verifyProGrantCampaignPool().catch(() => {});
+  });
+  proGrantCampaignCreateBtn?.addEventListener('click', () => {
+    createAndDownloadProGrantVouchers().catch(() => {});
+  });
+  proGrantCampaignApplyBtn?.addEventListener('click', () => {
+    applyPendingProGrantVoucherBatch().catch(() => {});
+  });
+  proGrantCampaignPauseBtn?.addEventListener('click', () => {
+    const selected = selectedProGrantCampaign();
+    const campaign = selected?.campaign || selected;
+    const counts = normalizedProGrantCounts(selected);
+    const next =
+      campaign?.status === 'paused' || (campaign?.status === 'draft' && counts.total > 0)
+        ? 'active'
+        : 'paused';
+    setProGrantCampaignOperationalStatus(next).catch((error) => {
+      setProGrantCampaignMessage(
+        adminErrorMessage(error, 'The event status could not be changed.'),
+        true,
+      );
+    });
+  });
+  proGrantCampaignEndBtn?.addEventListener('click', () => {
+    setProGrantCampaignOperationalStatus('ended').catch((error) => {
+      setProGrantCampaignMessage(adminErrorMessage(error, 'The event could not be ended.'), true);
+    });
+  });
+  proGrantCampaignRevokeBtn?.addEventListener('click', () => {
+    revokeProGrantCampaign().catch((error) => {
+      setProGrantCampaignMessage(
+        adminErrorMessage(error, 'Unused codes could not be revoked.'),
+        true,
+      );
+    });
+  });
+  proGrantCampaignDownloadBtn?.addEventListener('click', () => {
+    downloadProGrantVoucherExport();
+  });
+  proGrantCampaignCopyBtn?.addEventListener('click', () => {
+    copyProGrantVoucherExport()
+      .then((copied) =>
+        setProGrantCampaignMessage(
+          copied ? 'Copied room codes and redemption codes.' : 'Clipboard access is unavailable.',
+          !copied,
+        ),
+      )
+      .catch(() => setProGrantCampaignMessage('The codes could not be copied.', true));
+  });
+  proGrantCampaignLinkCopyBtn?.addEventListener('click', () => {
+    const campaign = selectedProGrantCampaign()?.campaign || selectedProGrantCampaign();
+    const value = campaign?.slug ? proGrantCampaignPublicUrl(campaign.slug) : '';
+    if (!value || !navigator.clipboard?.writeText) {
+      setProGrantCampaignMessage('Clipboard access is unavailable.', true);
+      return;
+    }
+    navigator.clipboard
+      .writeText(value)
+      .then(() => setProGrantCampaignMessage('Copied the event page address.'))
+      .catch(() => setProGrantCampaignMessage('The address could not be copied.', true));
+  });
+}
+
+bindProGrantCampaignEvents();
+
+proRoomCodeEl?.addEventListener('input', () => {
+  const digits = String(proRoomCodeEl.value || '')
+    .replace(/\D/g, '')
+    .slice(0, 6);
+  if (proRoomCodeEl.value !== digits) proRoomCodeEl.value = digits;
+  proRoomCodeEl.setCustomValidity(
+    digits.length === 0 || /^0\d{5}$/.test(digits) ? '' : 'Use six digits beginning with 0.',
+  );
+});
+
+proRoomSearchEl?.addEventListener('input', () => {
+  if (proRoomSearchTimer !== null) window.clearTimeout(proRoomSearchTimer);
+  proRoomSearchTimer = window.setTimeout(() => {
+    proRoomSearchTimer = null;
+    renderProRooms({ rooms: proRoomsSnapshot });
+  }, 100);
+});
+
+proRoomSearchEl?.addEventListener('search', () => {
+  if (proRoomSearchTimer !== null) {
+    window.clearTimeout(proRoomSearchTimer);
+    proRoomSearchTimer = null;
+  }
+  renderProRooms({ rooms: proRoomsSnapshot });
+});
+
+proRoomForm?.addEventListener('submit', (event) => {
+  event.preventDefault();
+  registerProRoom().catch((error) => {
+    setProRoomStatus(adminErrorMessage(error, 'Registration failed.'), true);
+    loadProRooms({ updateTimestamp: false }).catch(() => {});
+  });
+});
+
+proRoomClaimCopyBtn?.addEventListener('click', () => {
+  copyProRoomClaim().catch(() => {
+    setProRoomStatus('Copy failed. Select and copy the link.', true);
+  });
+});
+
+proRoomClaimDismissBtn?.addEventListener('click', dismissProRoomClaim);
+window.addEventListener('pagehide', () => {
+  invalidateAdminSession();
+  if (proRoomSearchTimer !== null) window.clearTimeout(proRoomSearchTimer);
+  clearAnnouncementExpiryTimer();
+  clearServiceStatusSettleTimer();
+  closeProRoomDestroyDialog({ restoreFocus: false });
+  closeProRoomLegacyOwnerDetachDialog({ restoreFocus: false });
+  closeProRoomTransferDialog({ restoreFocus: false });
+  clearProRoomClaimState();
+  clearAllProRoomApiSecrets();
+  pendingProGrantVoucherExport = null;
+});
+window.addEventListener('pageshow', (event) => {
+  if (!event.persisted || dashboard?.hidden) return;
+  refreshAllDashboardData().catch((error) => {
+    if (updatedAtEl) updatedAtEl.textContent = adminErrorMessage(error, 'Refresh failed.');
+  });
+});
+window.addEventListener('beforeunload', (event) => {
+  if (pendingProGrantVoucherExport) {
+    event.preventDefault();
+    event.returnValue = '';
+    return;
+  }
+  clearAnnouncementExpiryTimer();
+  clearServiceStatusSettleTimer();
+  closeProRoomDestroyDialog({ restoreFocus: false });
+  closeProRoomLegacyOwnerDetachDialog({ restoreFocus: false });
+  clearProRoomClaimState();
+  clearAllProRoomApiSecrets();
+});
+
+announcementForm?.addEventListener('submit', (event) => {
+  event.preventDefault();
+  saveAnnouncement().catch((error) => {
+    if (announcementStatusEl)
+      announcementStatusEl.textContent = adminErrorMessage(error, 'Save failed.');
+  });
+});
+
+announcementClearBtn?.addEventListener('click', () => {
+  saveAnnouncement({ clear: true }).catch((error) => {
+    if (announcementStatusEl)
+      announcementStatusEl.textContent = adminErrorMessage(error, 'Clear failed.');
+  });
+});
+
+addAsyncAdminEventListener(logoutBtn, 'click', async () => {
+  if (adminLogoutInFlight) return;
+  clearProRoomClaimState();
+  invalidateAdminSession();
+  showLogin('Signing out...', { invalidateSession: false });
+  setLoginFormDisabled(true);
+  const logoutRequest = fetchJson('/api/admin/logout', {
+    method: 'POST',
+    sessionBound: false,
+  }).catch(() => {});
+  adminLogoutInFlight = logoutRequest;
+  try {
+    await logoutRequest;
+  } finally {
+    if (adminLogoutInFlight === logoutRequest) {
+      adminLogoutInFlight = null;
+      setLoginFormDisabled(false);
+      if (dashboard?.hidden) setStatus('');
+    }
+  }
+});
+
+init().catch(reportUnexpectedAdminActionFailure);

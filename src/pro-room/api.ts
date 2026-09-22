@@ -1,0 +1,2236 @@
+import {
+  PRO_ROOM_MAX_ASSET_BYTES,
+  PRO_ROOM_MAX_ADMINISTRATOR_ITEMS,
+  PRO_ROOM_QUOTA_BYTES,
+  type ProRoomAdministrator,
+  type ProRoomPlaybackCheckpoint,
+  type ProRoomPermissionSet,
+  type ProRoomPlaylistWireItem,
+  type ProRoomQuotaSnapshot,
+  type ProRoomR2Source,
+  type ProRoomSnapshot,
+  type ProRoomSystemAudioPublication,
+  type ProRoomSystemAudioState,
+} from './contracts.ts';
+import {
+  isProRoomPin,
+  parseProRoomClaimToken,
+  parseProRoomOwnerRecoveryClaimToken,
+  parseProRoomOwnerTransferClaimToken,
+  parseProRoomSignalingTicket,
+  type ProRoomSignalingTicket,
+} from './credentials.ts';
+import { isProRoomCode } from './room-code.ts';
+import {
+  isProRoomQueueItemId,
+  parseProRoomAdministrator,
+  parseProRoomPlaybackCheckpoint,
+  parseProRoomSnapshot,
+  parseProRoomSystemAudioPublication,
+  parseProRoomSystemAudioState,
+} from './snapshot.ts';
+import type { DeveloperCommandResultCode } from '../network/transport/types.ts';
+import {
+  parseProRoomEffectsSnapshot,
+  parseProRoomSettingsSyncSnapshot,
+  parseRoomEffectsState,
+  type ProRoomEffectsSnapshot,
+  type ProRoomSettingsSyncSnapshot,
+  type RoomEffectsState,
+} from '../core/room-effects.ts';
+import {
+  parseProRoomQueueModeSnapshot,
+  type ProRoomQueueModeSnapshot,
+  type ProRoomRepeatMode,
+} from './queue-mode.ts';
+import { BOT_RATE_LIMIT_MAX_RETRY_SECONDS } from '../core/constants.ts';
+import { createProRoomIdempotencyKey } from './idempotency.ts';
+import {
+  DEFAULT_CONTROL_REQUEST_TIMEOUT_MS,
+  withRequestDeadline,
+} from '../core/request-lifetime.ts';
+import { isSafeVisibleDisplayName } from '../../cloudflare/display-name-policy.ts';
+import {
+  isLoopbackBrowserHref,
+  isLoopbackHostname,
+  localProductionApiFallbackEnabled,
+} from '../network/api-endpoints.ts';
+
+const PRO_ROOM_PRODUCTION_ENDPOINT = 'https://musixquare.com/api/pro-room';
+const PRO_ROOM_R2_HOST = '01353882e4eea3a5acaa0c45e8336af4.r2.cloudflarestorage.com';
+export const proRoomR2HostForTests = PRO_ROOM_R2_HOST;
+
+const MAX_REQUEST_JSON_BYTES = 4 * 1024 * 1024;
+const MAX_RESPONSE_JSON_BYTES = 4 * 1024 * 1024;
+const MAX_ERROR_JSON_BYTES = 16 * 1024;
+const MAX_BOOTSTRAP_JSON_BYTES = 8 * 1024;
+// 201 rows with 128-character IDs, 64-character UTF-8 names and all permission
+// fields fit below 116 KiB. Keep this separate from small bootstrap responses.
+const MAX_ADMINISTRATOR_JSON_BYTES = 128 * 1024;
+const MAX_BOT_RESPONSE_JSON_BYTES = 8 * 1024;
+const MAX_NAME_LENGTH = 2048;
+const MAX_DISPLAY_NAME_LENGTH = 64;
+const MAX_BOT_PROMPT_LENGTH = 500;
+const MAX_BOT_SUMMARY_LENGTH = 2000;
+const PLAYBACK_MAX_POSITION_SECONDS = 7 * 24 * 60 * 60;
+const MAX_URL_LENGTH = 8192;
+const MAX_UPLOAD_HEADERS = 16;
+const MAX_UPLOAD_HEADER_VALUE_LENGTH = 2048;
+const OPAQUE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
+const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+const DEVELOPER_COMMAND_ID_RE = /^cmd_[A-Za-z0-9_-]{22}$/;
+const PLAYBACK_TRANSITION_ID_RE = /^transition_[A-Za-z0-9_-]{22}$/;
+const MIME_RE = /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$/;
+const SHA256_RE = /^(?:[a-f0-9]{64}|[A-Za-z0-9_-]{43})$/;
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._~-]{14,126})[A-Za-z0-9]$/;
+const OWNER_TRANSFER_REQUEST_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
+const SYSTEM_AUDIO_LEASE_ID_RE = /^[A-Za-z0-9_-]{43}$/;
+const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
+const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const FORBIDDEN_UPLOAD_HEADERS = new Set([
+  'authorization',
+  'cookie',
+  'host',
+  'origin',
+  'referer',
+  'content-length',
+]);
+const DEVELOPER_COMMAND_RESULT_CODES = new Set<DeveloperCommandResultCode>([
+  'applied',
+  'already_applied',
+  'busy',
+  'no_media',
+  'stale_queue',
+  'unsupported_mode',
+  'expired',
+  'execution_failed',
+]);
+
+type ProRoomBootstrapStatus = 'activation_required' | 'pin_required' | 'suspended';
+
+export interface ProRoomBootstrap {
+  roomCode: string;
+  status: ProRoomBootstrapStatus;
+}
+
+interface ProRoomAccountLease {
+  leaseExpiresAtMs: number;
+}
+
+export interface ProRoomMediaReservation {
+  assetId: string;
+  version: number;
+  byteLength: number;
+  expiresAtMs: number;
+  upload: {
+    method: 'PUT';
+    url: string;
+    headers: Record<string, string>;
+  };
+  quota: ProRoomQuotaSnapshot;
+}
+
+export interface ProRoomMediaDownload {
+  asset: ProRoomR2Source;
+  url: string;
+  expiresAtMs: number;
+}
+
+export interface ProRoomSignalingAccess {
+  ticket: ProRoomSignalingTicket;
+  expiresAtMs: number;
+  role: 'member';
+  coordinatorEpoch: number;
+  presenceIncarnationId: string;
+  ticketSequence: number;
+  pendingPlaybackTransition: ProRoomPlaybackPrepareEvent | null;
+}
+
+export interface ProRoomPlaybackPrepareEvent {
+  type: 'pro-playback-prepare';
+  transitionId: string;
+  serverTimeMs: number;
+  deadlineAtMs: number;
+  basePlaybackRevision: number;
+  target: ProRoomPlaybackCheckpoint;
+}
+
+export interface ProRoomPlaybackCommitEvent {
+  type: 'pro-playback-commit';
+  transitionId: string | null;
+  serverTimeMs: number;
+  executeAtMs: number;
+  playback: ProRoomPlaybackCheckpoint;
+}
+
+export interface ProRoomPlaybackCancelEvent {
+  type: 'pro-playback-cancel';
+  transitionId: string;
+  serverTimeMs: number;
+  reason: string;
+}
+
+export type ProRoomPlaybackCommand =
+  | { type: 'play' | 'pause' | 'stop' | 'next' | 'previous'; baseRevision: number }
+  | { type: 'seek'; baseRevision: number; positionSeconds: number }
+  | {
+      type: 'select';
+      baseRevision: number;
+      queueItemId: string;
+      state?: 'playing' | 'paused';
+      positionSeconds?: number;
+      youtubeVideoId?: string;
+      youtubeSubIndex?: number;
+    }
+  | {
+      type: 'ended' | 'unavailable';
+      baseRevision: number;
+      queueItemId: string;
+      mediaKind: 'file' | 'youtube';
+      observedPositionSeconds: number;
+      durationSeconds: number | null;
+      youtubeVideoId?: string;
+      youtubeSubIndex?: number;
+    };
+
+export interface ExecuteProRoomPlaybackCommandInput {
+  code: string;
+  command: ProRoomPlaybackCommand;
+  idempotencyKey: string;
+}
+
+export interface ProRoomPlaybackCommandResult {
+  schemaVersion: 1;
+  roomCode: string;
+  status: 'preparing' | 'committed' | 'unchanged';
+  transition: ProRoomPlaybackPrepareEvent | null;
+  playback: ProRoomPlaybackCheckpoint;
+  serverTimeMs: number;
+}
+
+export interface ReportProRoomPlaybackReadyInput {
+  code: string;
+  transitionId: string;
+  basePlaybackRevision: number;
+  status: 'ready' | 'failed';
+}
+
+export interface ProRoomPresenceIdentity {
+  participantId: string;
+  presenceIncarnationId: string;
+}
+
+export interface ProRoomAccountDetachResult {
+  ok: true;
+  detached: true;
+  /** Null means the previous presence already expired before detachment. */
+  snapshot: ProRoomSnapshot | null;
+}
+
+interface ProRoomAdministratorDirectory {
+  authorityVersion: 1;
+  administrators: ProRoomAdministrator[];
+}
+
+interface ProRoomBotCommandInput {
+  code: string;
+  prompt: string;
+  requestId: string;
+}
+
+export interface ProRoomBotCommandResult {
+  ok: true;
+  summary: string;
+  addedCount: number;
+  playbackChanged: boolean;
+}
+
+export interface ProRoomSystemAudioLeaseGrant {
+  systemAudio: ProRoomSystemAudioState;
+  /** Private 32-byte capability. Never publish this through room state or peer messages. */
+  leaseId: string;
+}
+
+export interface CommitProRoomSystemAudioInput {
+  code: string;
+  generation: number;
+  leaseId: string;
+  publication: ProRoomSystemAudioPublication;
+}
+
+export interface UpdateProRoomSystemAudioLeaseInput {
+  code: string;
+  generation: number;
+  leaseId: string;
+}
+
+export interface EnterProRoomPresenceOptions {
+  signal?: AbortSignal;
+  takeover?: boolean;
+}
+
+export interface ActivateProRoomInput {
+  code: string;
+  claimToken: string;
+  temporaryPin: string;
+  newPin: string;
+  ownerName?: string;
+}
+
+export interface CreateProRoomSessionInput {
+  code: string;
+  pin: string;
+  /** Reuse this value after an uncertain transport result to replay one admission. */
+  requestId?: string;
+}
+
+export interface RecoverProRoomOwnerInput {
+  code: string;
+  claimToken: string;
+}
+
+export interface TransferProRoomOwnerInput {
+  code: string;
+  claimToken: string;
+  newPin: string;
+  requestId: string;
+}
+
+export interface CloseProRoomSessionFencedInput {
+  code: string;
+  expectedParticipantId: string;
+  expectedPresenceIncarnationId: string;
+}
+
+export interface UpdateProRoomCompactSnapshotInput {
+  code: string;
+  baseRevision: number;
+  /** Stable queue identity/order; metadata is sent only for changed rows. */
+  /** `null` keeps the existing order for playback/metadata-only mutations. */
+  playlistOrder: string[] | null;
+  upserts: ProRoomPlaylistWireItem[];
+  currentQueueItemId: string | null;
+  playback: ProRoomPlaybackCheckpoint;
+  idempotencyKey: string;
+}
+
+interface UpdateProRoomEffectsInput {
+  code: string;
+  coordinatorEpoch: number;
+  baseRevision: number;
+  effects: RoomEffectsState;
+}
+
+interface UpdateProRoomSettingsSyncInput {
+  code: string;
+  coordinatorEpoch: number;
+  baseRevision: number;
+  masterVolume: number;
+  effects: RoomEffectsState;
+}
+
+interface UpdateProRoomQueueModeInput {
+  code: string;
+  coordinatorEpoch: number;
+  baseRevision: number;
+  playlistRevision: number;
+  repeatMode: ProRoomRepeatMode;
+  shuffleEnabled: boolean;
+  shuffleOrder: string[];
+}
+
+interface AckProRoomDeveloperCommandInput {
+  code: string;
+  commandId: string;
+  resultCode: DeveloperCommandResultCode;
+}
+
+/**
+ * Small unload-safe mutation used only after a confirmed pagehide. Playback is
+ * server-authoritative, so every participant sends a null checkpoint while
+ * releasing its exact presence incarnation.
+ */
+interface CloseProRoomPresenceInput {
+  code: string;
+  expectedParticipantId: string;
+  expectedPresenceIncarnationId: string;
+  baseRevision: number;
+  currentQueueItemId: string | null;
+  playback: ProRoomPlaybackCheckpoint | null;
+  idempotencyKey: string;
+}
+
+export interface CreateProRoomMediaReservationInput {
+  code: string;
+  byteLength: number;
+  name: string;
+  mime: string;
+  sha256?: string;
+  idempotencyKey: string;
+}
+
+export interface CompleteProRoomMediaInput {
+  code: string;
+  assetId: string;
+  idempotencyKey: string;
+}
+
+export type DeleteProRoomMediaInput = CompleteProRoomMediaInput;
+
+export class ProRoomApiError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly retryAfterSeconds: number | null;
+
+  constructor(code: string, status = 0, retryAfterSeconds: number | null = null) {
+    super(`PRO_ROOM_API_${code}`);
+    this.name = 'ProRoomApiError';
+    this.code = code;
+    this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+class BodyLimitError extends Error {}
+
+type JsonRecord = Record<string, unknown>;
+type JsonParser<T> = (value: unknown) => T | null;
+
+function isRecord(value: unknown): value is JsonRecord {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasExactKeys(
+  record: JsonRecord,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return (
+    required.every((key) => Object.prototype.hasOwnProperty.call(record, key)) &&
+    Object.keys(record).every((key) => allowed.has(key))
+  );
+}
+
+function isSafeNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function parseBoundedString(value: unknown, maxLength: number): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 && trimmed.length <= maxLength ? trimmed : null;
+}
+
+function parseEndpoint(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > MAX_URL_LENGTH) return null;
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    return null;
+  }
+  const normalizedPath = url.pathname.replace(/\/+$/, '') || '/';
+  const isMusixquareService =
+    url.protocol === 'https:' && url.hostname.endsWith('.musixquare.com') && normalizedPath === '/';
+  const isProductionFacade =
+    url.protocol === 'https:' &&
+    (url.hostname === 'musixquare.com' || url.hostname === 'www.musixquare.com') &&
+    normalizedPath === '/api/pro-room';
+  const isLocal =
+    (url.protocol === 'http:' || url.protocol === 'https:') && isLoopbackBrowserHref(url.href);
+  if (!isMusixquareService && !isProductionFacade && !isLocal) return null;
+  if (url.username || url.password || url.search || url.hash) return null;
+  if (isLocal && normalizedPath !== '/' && normalizedPath !== '/api/pro-room') return null;
+  return normalizedPath === '/' ? url.origin : `${url.origin}${normalizedPath}`;
+}
+
+function readEndpointOverride(): unknown {
+  return import.meta.env?.VITE_PRO_ROOM_ENDPOINT;
+}
+
+function readLocalProductionApiFallbackOverride(): unknown {
+  return import.meta.env?.VITE_MUSIXQUARE_ALLOW_LOCAL_PRODUCTION_API_FALLBACK;
+}
+
+function readBrowserHref(): string | undefined {
+  return typeof window === 'undefined' ? undefined : window.location.href;
+}
+
+function resolveLoopbackProRoomEndpoint(baseHref: unknown): string | null {
+  if (!isLoopbackBrowserHref(baseHref)) return null;
+  return new URL('/api/pro-room', baseHref).href;
+}
+
+/** Resolve a build-time override without permitting arbitrary credential exfiltration origins. */
+function resolveProRoomEndpoint(
+  override: unknown = readEndpointOverride(),
+  baseHref: unknown = readBrowserHref(),
+  localProductionFallback: unknown = readLocalProductionApiFallbackOverride(),
+  mode = import.meta.env.MODE,
+): string {
+  const configured = parseEndpoint(override);
+  if (configured) return configured;
+
+  const loopbackEndpoint = resolveLoopbackProRoomEndpoint(baseHref);
+  if (
+    loopbackEndpoint &&
+    (mode === 'e2e' || !localProductionApiFallbackEnabled(localProductionFallback))
+  ) {
+    return loopbackEndpoint;
+  }
+  return PRO_ROOM_PRODUCTION_ENDPOINT;
+}
+
+export {
+  PRO_ROOM_PRODUCTION_ENDPOINT as proRoomProductionEndpointForTests,
+  resolveProRoomEndpoint as resolveProRoomEndpointForTests,
+};
+
+function roomPath(code: string): string {
+  if (!isProRoomCode(code)) throw new ProRoomApiError('INVALID_ROOM_CODE');
+  return `/v1/rooms/${code}`;
+}
+
+function validatePin(pin: string): string {
+  if (!isProRoomPin(pin)) throw new ProRoomApiError('INVALID_PIN');
+  return pin;
+}
+
+function validateIdempotencyKey(value: string): string {
+  if (!IDEMPOTENCY_KEY_RE.test(value)) {
+    throw new ProRoomApiError('INVALID_IDEMPOTENCY_KEY');
+  }
+  return value;
+}
+
+function validateOwnerTransferRequestId(value: string): string {
+  if (!OWNER_TRANSFER_REQUEST_ID_RE.test(value)) {
+    throw new ProRoomApiError('INVALID_IDEMPOTENCY_KEY');
+  }
+  return value;
+}
+
+function validateOpaqueId(value: string, errorCode: string): string {
+  if (!OPAQUE_ID_RE.test(value)) throw new ProRoomApiError(errorCode);
+  return value;
+}
+
+function validateDeveloperCommandResultCode(value: DeveloperCommandResultCode): string {
+  if (!DEVELOPER_COMMAND_RESULT_CODES.has(value)) {
+    throw new ProRoomApiError('INVALID_DEVELOPER_COMMAND_RESULT');
+  }
+  return value;
+}
+
+function validateSystemAudioGeneration(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new ProRoomApiError('INVALID_SYSTEM_AUDIO_GENERATION');
+  }
+  return value;
+}
+
+function validateSystemAudioLeaseId(value: string): string {
+  if (!SYSTEM_AUDIO_LEASE_ID_RE.test(value)) {
+    throw new ProRoomApiError('INVALID_SYSTEM_AUDIO_LEASE');
+  }
+  return value;
+}
+
+function validateSystemAudioPublication(
+  value: ProRoomSystemAudioPublication,
+): ProRoomSystemAudioPublication {
+  const publication = parseProRoomSystemAudioPublication(value);
+  if (!publication) throw new ProRoomApiError('INVALID_SYSTEM_AUDIO_PUBLICATION');
+  return publication;
+}
+
+function encodeRequestBody(value: unknown): string {
+  let body: string;
+  try {
+    body = JSON.stringify(value);
+  } catch {
+    throw new ProRoomApiError('INVALID_REQUEST');
+  }
+  if (new TextEncoder().encode(body).byteLength > MAX_REQUEST_JSON_BYTES) {
+    throw new ProRoomApiError('REQUEST_TOO_LARGE');
+  }
+  return body;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('Aborted', 'AbortError');
+}
+
+function cancelReaderBestEffort(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  reason?: unknown,
+): void {
+  try {
+    Promise.resolve(reader.cancel(reason)).catch(() => undefined);
+  } catch {
+    // Cancellation is cleanup only; preserve the protocol result.
+  }
+}
+
+function cancelUnreadResponseBody(response: Response): void {
+  try {
+    response.body?.cancel().catch(() => undefined);
+  } catch {
+    // Best-effort resource release; the protocol error below is authoritative.
+  }
+}
+
+function readBodyChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (!signal) return reader.read();
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = () => signal.removeEventListener('abort', onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      finish();
+      reject(abortReason(signal));
+      cancelReaderBestEffort(reader, signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    void reader.read().then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        finish();
+        resolve(result);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        finish();
+        reject(error);
+      },
+    );
+  });
+}
+
+async function readBoundedText(
+  response: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const declaredLength = response.headers.get('content-length');
+  if (declaredLength !== null) {
+    const parsedLength = Number(declaredLength);
+    if (!Number.isSafeInteger(parsedLength) || parsedLength < 0 || parsedLength > maxBytes) {
+      cancelUnreadResponseBody(response);
+      throw new BodyLimitError();
+    }
+  }
+
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await readBodyChunk(reader, signal);
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        cancelReaderBestEffort(reader, 'PRO_ROOM_RESPONSE_TOO_LARGE');
+        throw new BodyLimitError();
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // A deliberately non-cooperative stream may keep its read pending after
+      // abort. The request promise is still released; native fetch streams
+      // settle their pending read when the linked signal aborts.
+    }
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new ProRoomApiError('INVALID_RESPONSE');
+  }
+}
+
+function isJsonResponse(response: Response): boolean {
+  const contentType = response.headers.get('content-type');
+  return contentType !== null && /^application\/json(?:\s*;|$)/i.test(contentType);
+}
+
+async function readJson(
+  response: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  if (!isJsonResponse(response)) {
+    cancelUnreadResponseBody(response);
+    throw new ProRoomApiError('INVALID_RESPONSE', response.status);
+  }
+  let text: string;
+  try {
+    text = await readBoundedText(response, maxBytes, signal);
+  } catch (error) {
+    if (error instanceof BodyLimitError) {
+      throw new ProRoomApiError('RESPONSE_TOO_LARGE', response.status);
+    }
+    throw error;
+  }
+  if (!text) throw new ProRoomApiError('INVALID_RESPONSE', response.status);
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new ProRoomApiError('INVALID_RESPONSE', response.status);
+  }
+}
+
+function parseRetryAfter(response: Response, payload: unknown): number | null {
+  const header = response.headers.get('retry-after');
+  const headerSeconds = header === null ? Number.NaN : Number(header);
+  if (
+    Number.isSafeInteger(headerSeconds) &&
+    headerSeconds >= 0 &&
+    headerSeconds <= BOT_RATE_LIMIT_MAX_RETRY_SECONDS
+  ) {
+    return headerSeconds;
+  }
+  if (
+    isRecord(payload) &&
+    Number.isSafeInteger(payload.retryAfterSeconds) &&
+    (payload.retryAfterSeconds as number) >= 0 &&
+    (payload.retryAfterSeconds as number) <= BOT_RATE_LIMIT_MAX_RETRY_SECONDS
+  ) {
+    return payload.retryAfterSeconds as number;
+  }
+  return null;
+}
+
+async function throwResponseError(response: Response, signal?: AbortSignal): Promise<never> {
+  let payload: unknown = null;
+  try {
+    if (isJsonResponse(response)) {
+      payload = await readJson(response, MAX_ERROR_JSON_BYTES, signal);
+    } else {
+      cancelUnreadResponseBody(response);
+    }
+  } catch {
+    if (signal?.aborted) throw abortReason(signal);
+    payload = null;
+  }
+  const serverCode = isRecord(payload) && typeof payload.error === 'string' ? payload.error : null;
+  const code =
+    serverCode && ERROR_CODE_RE.test(serverCode) ? serverCode : `HTTP_${response.status}`;
+  throw new ProRoomApiError(code, response.status, parseRetryAfter(response, payload));
+}
+
+function parseSnapshotEnvelope(value: unknown, expectedCode: string): ProRoomSnapshot | null {
+  if (!isRecord(value) || !hasExactKeys(value, ['snapshot'])) return null;
+  const snapshot = parseProRoomSnapshot(value.snapshot);
+  return snapshot?.roomCode === expectedCode ? snapshot : null;
+}
+
+function parseAccountDetachResult(
+  value: unknown,
+  expectedCode: string,
+): ProRoomAccountDetachResult | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['ok', 'detached', 'snapshot']) ||
+    value.ok !== true ||
+    value.detached !== true
+  ) {
+    return null;
+  }
+  if (value.snapshot === null) return { ok: true, detached: true, snapshot: null };
+  const snapshot = parseProRoomSnapshot(value.snapshot);
+  // A detach response is authority evidence only when the server projects the
+  // same room as anonymous. Never reinterpret an authenticated snapshot as a
+  // successful authority downgrade.
+  if (
+    !snapshot ||
+    snapshot.roomCode !== expectedCode ||
+    snapshot.viewer === null ||
+    snapshot.viewer.isAuthenticated
+  ) {
+    return null;
+  }
+  return { ok: true, detached: true, snapshot };
+}
+
+function parseAdministratorDirectory(value: unknown): ProRoomAdministratorDirectory | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['authorityVersion', 'administrators']) ||
+    value.authorityVersion !== 1 ||
+    !Array.isArray(value.administrators) ||
+    value.administrators.length > PRO_ROOM_MAX_ADMINISTRATOR_ITEMS
+  ) {
+    return null;
+  }
+  const administrators: ProRoomAdministrator[] = [];
+  const memberIds = new Set<string>();
+  for (const rawAdministrator of value.administrators) {
+    const administrator = parseProRoomAdministrator(rawAdministrator);
+    if (!administrator || memberIds.has(administrator.memberId)) return null;
+    memberIds.add(administrator.memberId);
+    administrators.push(administrator);
+  }
+  if (administrators.filter((administrator) => administrator.role === 'owner').length !== 1) {
+    return null;
+  }
+  return { authorityVersion: 1, administrators };
+}
+
+function validateAdministratorPermissions(value: ProRoomPermissionSet): ProRoomPermissionSet {
+  const keys = ['media.add', 'playback.control', 'members.kick', 'chat.notice'] as const;
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, keys) ||
+    keys.some((key) => typeof value[key] !== 'boolean')
+  ) {
+    throw new ProRoomApiError('INVALID_ADMINISTRATOR_PERMISSIONS');
+  }
+  return {
+    'media.add': value['media.add'],
+    'playback.control': value['playback.control'],
+    'members.kick': value['members.kick'],
+    'chat.notice': value['chat.notice'],
+  };
+}
+
+function parseHeartbeatEnvelope(
+  value: unknown,
+  expectedCode: string,
+  knownSnapshot: ProRoomSnapshot | null,
+): ProRoomSnapshot | null {
+  const snapshot = parseSnapshotEnvelope(value, expectedCode);
+  if (snapshot) return snapshot;
+  if (
+    knownSnapshot === null ||
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'notModified',
+      'revision',
+      'playlistRevision',
+      'presenceRevision',
+      'playbackRevision',
+      'coordinatorEpoch',
+    ]) ||
+    value.notModified !== true ||
+    !isSafeNonNegativeInteger(value.revision) ||
+    !isSafeNonNegativeInteger(value.playlistRevision) ||
+    !isSafeNonNegativeInteger(value.presenceRevision) ||
+    !isSafeNonNegativeInteger(value.playbackRevision) ||
+    !isSafeNonNegativeInteger(value.coordinatorEpoch)
+  ) {
+    return null;
+  }
+  return knownSnapshot.roomCode === expectedCode &&
+    knownSnapshot.revision === value.revision &&
+    knownSnapshot.playlistRevision === value.playlistRevision &&
+    knownSnapshot.presence.revision === value.presenceRevision &&
+    knownSnapshot.playback.revision === value.playbackRevision &&
+    knownSnapshot.presence.coordinatorEpoch === value.coordinatorEpoch
+    ? knownSnapshot
+    : null;
+}
+
+function parseSystemAudioEnvelope(value: unknown): ProRoomSystemAudioState | null {
+  if (!isRecord(value) || !hasExactKeys(value, ['systemAudio'])) return null;
+  return parseProRoomSystemAudioState(value.systemAudio);
+}
+
+function parseSystemAudioLeaseGrant(value: unknown): ProRoomSystemAudioLeaseGrant | null {
+  if (!isRecord(value) || !hasExactKeys(value, ['systemAudio', 'leaseId'])) return null;
+  const systemAudio = parseProRoomSystemAudioState(value.systemAudio);
+  if (
+    !systemAudio ||
+    systemAudio.status === 'idle' ||
+    typeof value.leaseId !== 'string' ||
+    !SYSTEM_AUDIO_LEASE_ID_RE.test(value.leaseId)
+  ) {
+    return null;
+  }
+  return { systemAudio, leaseId: value.leaseId };
+}
+
+function parseOk(value: unknown): true | null {
+  return isRecord(value) && hasExactKeys(value, ['ok']) && value.ok === true ? true : null;
+}
+
+function parseAccountLease(value: unknown): ProRoomAccountLease | null {
+  return isRecord(value) &&
+    hasExactKeys(value, ['ok', 'leaseExpiresAtMs']) &&
+    value.ok === true &&
+    Number.isSafeInteger(value.leaseExpiresAtMs) &&
+    (value.leaseExpiresAtMs as number) > 0
+    ? { leaseExpiresAtMs: value.leaseExpiresAtMs as number }
+    : null;
+}
+
+function parseBotCommandResult(value: unknown): ProRoomBotCommandResult | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['ok', 'summary', 'addedCount', 'playbackChanged']) ||
+    value.ok !== true ||
+    typeof value.summary !== 'string' ||
+    value.summary.trim().length < 1 ||
+    value.summary.length > MAX_BOT_SUMMARY_LENGTH ||
+    !Number.isSafeInteger(value.addedCount) ||
+    (value.addedCount as number) < 0 ||
+    (value.addedCount as number) > 1000 ||
+    typeof value.playbackChanged !== 'boolean'
+  ) {
+    return null;
+  }
+  return {
+    ok: true,
+    summary: value.summary.trim(),
+    addedCount: value.addedCount as number,
+    playbackChanged: value.playbackChanged,
+  };
+}
+
+function parseQuota(value: unknown): ProRoomQuotaSnapshot | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['limitBytes', 'perAssetLimitBytes', 'usedBytes', 'reservedBytes'])
+  ) {
+    return null;
+  }
+  if (
+    value.limitBytes !== PRO_ROOM_QUOTA_BYTES ||
+    value.perAssetLimitBytes !== PRO_ROOM_MAX_ASSET_BYTES ||
+    !isSafeNonNegativeInteger(value.usedBytes) ||
+    !isSafeNonNegativeInteger(value.reservedBytes) ||
+    value.usedBytes + value.reservedBytes > PRO_ROOM_QUOTA_BYTES
+  ) {
+    return null;
+  }
+  return {
+    limitBytes: value.limitBytes,
+    perAssetLimitBytes: value.perAssetLimitBytes,
+    usedBytes: value.usedBytes,
+    reservedBytes: value.reservedBytes,
+  };
+}
+
+function parseR2Asset(value: unknown): ProRoomR2Source | null {
+  if (!isRecord(value)) return null;
+  if (
+    !hasExactKeys(value, ['kind', 'assetId', 'version', 'byteLength', 'mime'], ['sha256']) ||
+    value.kind !== 'pro-r2' ||
+    typeof value.assetId !== 'string' ||
+    !OPAQUE_ID_RE.test(value.assetId) ||
+    !Number.isSafeInteger(value.version) ||
+    (value.version as number) <= 0 ||
+    !Number.isSafeInteger(value.byteLength) ||
+    (value.byteLength as number) <= 0 ||
+    (value.byteLength as number) > PRO_ROOM_MAX_ASSET_BYTES ||
+    typeof value.mime !== 'string' ||
+    !MIME_RE.test(value.mime) ||
+    (value.sha256 !== undefined &&
+      (typeof value.sha256 !== 'string' || !SHA256_RE.test(value.sha256)))
+  ) {
+    return null;
+  }
+  return {
+    kind: 'pro-r2',
+    assetId: value.assetId,
+    version: value.version as number,
+    byteLength: value.byteLength as number,
+    mime: value.mime,
+    ...(value.sha256 === undefined ? {} : { sha256: value.sha256 as string }),
+  };
+}
+
+function isValidPresignedR2Url(url: URL): boolean {
+  if (url.protocol !== 'https:' || url.hostname !== PRO_ROOM_R2_HOST || url.port !== '')
+    return false;
+  const required = [
+    'X-Amz-Algorithm',
+    'X-Amz-Credential',
+    'X-Amz-Date',
+    'X-Amz-Expires',
+    'X-Amz-SignedHeaders',
+    'X-Amz-Signature',
+  ];
+  return (
+    url.searchParams.get('X-Amz-Algorithm') === 'AWS4-HMAC-SHA256' &&
+    required.every((name) => url.searchParams.getAll(name).length === 1)
+  );
+}
+
+export function parseProRoomMediaTransferUrl(value: unknown, endpoint?: string): string | null {
+  if (typeof value !== 'string' || value.length > MAX_URL_LENGTH) return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.username || url.password || url.hash) return null;
+  if (endpoint !== undefined) {
+    let endpointUrl: URL | null = null;
+    try {
+      endpointUrl = new URL(endpoint);
+    } catch {
+      // An invalid endpoint cannot authorize a returned same-origin URL.
+    }
+    if (endpointUrl) {
+      const exactLoopbackOrigin =
+        (endpointUrl.protocol === 'http:' || endpointUrl.protocol === 'https:') &&
+        url.protocol === endpointUrl.protocol &&
+        isLoopbackHostname(endpointUrl.hostname) &&
+        url.origin === endpointUrl.origin;
+      if (exactLoopbackOrigin) return url.toString();
+    }
+  }
+  return isValidPresignedR2Url(url) ? url.toString() : null;
+}
+
+function parseUploadHeaders(value: unknown): Record<string, string> | null {
+  if (!isRecord(value) || Object.keys(value).length > MAX_UPLOAD_HEADERS) return null;
+  const headers: Record<string, string> = {};
+  for (const [rawName, rawValue] of Object.entries(value)) {
+    const name = rawName.toLowerCase();
+    if (
+      !HEADER_NAME_RE.test(rawName) ||
+      typeof rawValue !== 'string' ||
+      rawValue.length > MAX_UPLOAD_HEADER_VALUE_LENGTH ||
+      FORBIDDEN_UPLOAD_HEADERS.has(name) ||
+      name.startsWith('proxy-') ||
+      name.startsWith('sec-')
+    ) {
+      return null;
+    }
+    headers[name] = rawValue;
+  }
+  return headers;
+}
+
+function parseBootstrap(value: unknown, expectedCode: string): ProRoomBootstrap | null {
+  if (!isRecord(value) || !hasExactKeys(value, ['roomCode', 'status'])) return null;
+  if (value.roomCode !== expectedCode) return null;
+  if (
+    value.status !== 'activation_required' &&
+    value.status !== 'pin_required' &&
+    value.status !== 'suspended'
+  ) {
+    return null;
+  }
+  return { roomCode: expectedCode, status: value.status };
+}
+
+function parseSessionEnvelope(value: unknown, expectedCode: string): ProRoomSnapshot | null {
+  if (!isRecord(value) || !hasExactKeys(value, ['snapshot', 'session'])) return null;
+  if (
+    !isRecord(value.session) ||
+    !hasExactKeys(value.session, ['expiresAtMs']) ||
+    !isSafeNonNegativeInteger(value.session.expiresAtMs)
+  ) {
+    return null;
+  }
+  const snapshot = parseProRoomSnapshot(value.snapshot);
+  return snapshot?.roomCode === expectedCode ? snapshot : null;
+}
+
+export function parseProRoomPlaybackPrepareEvent(
+  value: unknown,
+): ProRoomPlaybackPrepareEvent | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'type',
+      'transitionId',
+      'serverTimeMs',
+      'deadlineAtMs',
+      'basePlaybackRevision',
+      'target',
+    ]) ||
+    value.type !== 'pro-playback-prepare' ||
+    typeof value.transitionId !== 'string' ||
+    !PLAYBACK_TRANSITION_ID_RE.test(value.transitionId) ||
+    !isSafeNonNegativeInteger(value.serverTimeMs) ||
+    !isSafeNonNegativeInteger(value.deadlineAtMs) ||
+    value.deadlineAtMs < value.serverTimeMs ||
+    !isSafeNonNegativeInteger(value.basePlaybackRevision)
+  ) {
+    return null;
+  }
+  const target = parseProRoomPlaybackCheckpoint(value.target);
+  if (!target || target.revision !== value.basePlaybackRevision + 1) return null;
+  return {
+    type: 'pro-playback-prepare',
+    transitionId: value.transitionId,
+    serverTimeMs: value.serverTimeMs,
+    deadlineAtMs: value.deadlineAtMs,
+    basePlaybackRevision: value.basePlaybackRevision,
+    target,
+  };
+}
+
+export function parseProRoomPlaybackCommitEvent(value: unknown): ProRoomPlaybackCommitEvent | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['type', 'transitionId', 'serverTimeMs', 'executeAtMs', 'playback']) ||
+    value.type !== 'pro-playback-commit' ||
+    (value.transitionId !== null &&
+      (typeof value.transitionId !== 'string' ||
+        !PLAYBACK_TRANSITION_ID_RE.test(value.transitionId))) ||
+    !isSafeNonNegativeInteger(value.serverTimeMs) ||
+    !isSafeNonNegativeInteger(value.executeAtMs)
+  ) {
+    return null;
+  }
+  const playback = parseProRoomPlaybackCheckpoint(value.playback);
+  if (!playback) return null;
+  return {
+    type: 'pro-playback-commit',
+    transitionId: value.transitionId,
+    serverTimeMs: value.serverTimeMs,
+    executeAtMs: value.executeAtMs,
+    playback,
+  };
+}
+
+export function parseProRoomPlaybackCancelEvent(value: unknown): ProRoomPlaybackCancelEvent | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['type', 'transitionId', 'serverTimeMs', 'reason']) ||
+    value.type !== 'pro-playback-cancel' ||
+    typeof value.transitionId !== 'string' ||
+    !PLAYBACK_TRANSITION_ID_RE.test(value.transitionId) ||
+    !isSafeNonNegativeInteger(value.serverTimeMs)
+  ) {
+    return null;
+  }
+  const reason = parseBoundedString(value.reason, 64);
+  return reason
+    ? {
+        type: 'pro-playback-cancel',
+        transitionId: value.transitionId,
+        serverTimeMs: value.serverTimeMs,
+        reason,
+      }
+    : null;
+}
+
+function parsePlaybackCommandResult(
+  value: unknown,
+  expectedCode: string,
+): ProRoomPlaybackCommandResult | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(
+      value,
+      ['schemaVersion', 'roomCode', 'status', 'playback', 'serverTimeMs'],
+      ['transition'],
+    ) ||
+    value.schemaVersion !== 1 ||
+    value.roomCode !== expectedCode ||
+    (value.status !== 'preparing' &&
+      value.status !== 'committed' &&
+      value.status !== 'unchanged') ||
+    !isSafeNonNegativeInteger(value.serverTimeMs)
+  ) {
+    return null;
+  }
+  const playback = parseProRoomPlaybackCheckpoint(value.playback);
+  const transition =
+    value.transition === undefined ? null : parseProRoomPlaybackPrepareEvent(value.transition);
+  if (!playback || (value.status === 'preparing') !== (transition !== null)) return null;
+  return {
+    schemaVersion: 1,
+    roomCode: expectedCode,
+    status: value.status,
+    transition,
+    playback,
+    serverTimeMs: value.serverTimeMs,
+  };
+}
+
+function validatePlaybackCommand(command: ProRoomPlaybackCommand): ProRoomPlaybackCommand {
+  if (!isSafeNonNegativeInteger(command.baseRevision)) {
+    throw new ProRoomApiError('INVALID_PLAYBACK_REVISION');
+  }
+  if (
+    command.type === 'play' ||
+    command.type === 'pause' ||
+    command.type === 'stop' ||
+    command.type === 'next' ||
+    command.type === 'previous'
+  ) {
+    return { type: command.type, baseRevision: command.baseRevision };
+  }
+  if (command.type === 'seek') {
+    if (
+      !Number.isFinite(command.positionSeconds) ||
+      command.positionSeconds < 0 ||
+      command.positionSeconds > PLAYBACK_MAX_POSITION_SECONDS
+    ) {
+      throw new ProRoomApiError('INVALID_PLAYBACK_POSITION');
+    }
+    return { ...command };
+  }
+  if (!('queueItemId' in command)) throw new ProRoomApiError('INVALID_PLAYBACK_COMMAND');
+  if (!isProRoomQueueItemId(command.queueItemId)) {
+    throw new ProRoomApiError('INVALID_QUEUE_ITEM_ID');
+  }
+  const hasVideoId = command.youtubeVideoId !== undefined;
+  const hasSubIndex = command.youtubeSubIndex !== undefined;
+  if (
+    (hasVideoId && !hasSubIndex) ||
+    (hasVideoId && !YOUTUBE_VIDEO_ID_RE.test(command.youtubeVideoId ?? '')) ||
+    (hasSubIndex &&
+      (!Number.isSafeInteger(command.youtubeSubIndex) ||
+        (command.youtubeSubIndex as number) < 0 ||
+        (command.youtubeSubIndex as number) > 100_000))
+  ) {
+    throw new ProRoomApiError('INVALID_YOUTUBE_IDENTITY');
+  }
+  if (command.type === 'select') {
+    if (
+      command.positionSeconds !== undefined &&
+      (!Number.isFinite(command.positionSeconds) ||
+        command.positionSeconds < 0 ||
+        command.positionSeconds > PLAYBACK_MAX_POSITION_SECONDS)
+    ) {
+      throw new ProRoomApiError('INVALID_PLAYBACK_POSITION');
+    }
+    return { ...command };
+  }
+  if (
+    (command.mediaKind !== 'file' && command.mediaKind !== 'youtube') ||
+    !Number.isFinite(command.observedPositionSeconds) ||
+    command.observedPositionSeconds < 0 ||
+    command.observedPositionSeconds > PLAYBACK_MAX_POSITION_SECONDS ||
+    (command.durationSeconds !== null &&
+      (!Number.isFinite(command.durationSeconds) ||
+        command.durationSeconds <= 0 ||
+        command.durationSeconds > PLAYBACK_MAX_POSITION_SECONDS)) ||
+    (command.mediaKind === 'youtube' && (!hasVideoId || !hasSubIndex)) ||
+    (command.mediaKind === 'file' && (hasVideoId || hasSubIndex))
+  ) {
+    throw new ProRoomApiError('INVALID_PLAYBACK_OBSERVATION');
+  }
+  return { ...command };
+}
+
+interface RequestOptions<T> {
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  body?: unknown;
+  headers?: HeadersInit;
+  idempotencyKey?: string;
+  signal?: AbortSignal;
+  parser: JsonParser<T>;
+  maxResponseBytes?: number;
+  keepalive?: boolean;
+  simpleTextBody?: boolean;
+  /** Attach the tab-local incarnation lease to a live-session request. */
+  activeRoomCode?: string;
+}
+
+export class ProRoomApiClient {
+  readonly endpoint: string;
+  readonly #fetch: typeof fetch;
+  readonly #presenceIdentities = new Map<string, ProRoomPresenceIdentity>();
+
+  constructor(options: { endpoint?: unknown; fetch?: typeof fetch } = {}) {
+    this.endpoint = resolveProRoomEndpoint(options.endpoint);
+    this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
+  }
+
+  async #request<T>(path: string, options: RequestOptions<T>): Promise<T> {
+    if (options.signal?.aborted) throw new ProRoomApiError('ABORTED');
+    const endpoint = new URL(`${this.endpoint}/`);
+    const url = new URL(path.replace(/^\/+/, ''), endpoint);
+    if (url.origin !== endpoint.origin || !url.pathname.startsWith(endpoint.pathname)) {
+      throw new ProRoomApiError('INVALID_REQUEST');
+    }
+
+    const headers = new Headers(options.headers);
+    let body: string | undefined;
+    if (options.body !== undefined) {
+      body = encodeRequestBody(options.body);
+      headers.set(
+        'Content-Type',
+        options.simpleTextBody === true ? 'text/plain;charset=UTF-8' : 'application/json',
+      );
+    }
+    if (options.idempotencyKey !== undefined) {
+      headers.set('Idempotency-Key', validateIdempotencyKey(options.idempotencyKey));
+    }
+    if (options.activeRoomCode !== undefined) {
+      const roomCode = options.activeRoomCode;
+      if (!isProRoomCode(roomCode)) throw new ProRoomApiError('INVALID_ROOM_CODE');
+      const identity = this.#presenceIdentities.get(roomCode);
+      if (!identity) throw new ProRoomApiError('PRESENCE_IDENTITY_REQUIRED', 409);
+      headers.set('X-MXQR-Pro-Participant-Id', identity.participantId);
+      headers.set('X-MXQR-Pro-Presence-Incarnation', identity.presenceIncarnationId);
+      headers.set('X-MXQR-Pro-Presence-Recovery', '1');
+    }
+
+    try {
+      return await withRequestDeadline(
+        async (requestSignal) => {
+          const response = await this.#fetch(url, {
+            method: options.method ?? 'GET',
+            headers,
+            body,
+            credentials: 'include',
+            cache: 'no-store',
+            redirect: 'error',
+            referrerPolicy: 'no-referrer',
+            signal: requestSignal,
+            ...(options.keepalive === true ? { keepalive: true } : {}),
+          });
+
+          // Keep the intrinsic deadline alive through the complete response
+          // body. A header-only timeout leaves heartbeat/mutation promises
+          // pinned forever when a proxy stalls mid-JSON.
+          if (!response.ok) await throwResponseError(response, requestSignal);
+          const value = await readJson(
+            response,
+            options.maxResponseBytes ?? MAX_RESPONSE_JSON_BYTES,
+            requestSignal,
+          );
+          const parsed = options.parser(value);
+          if (parsed === null) throw new ProRoomApiError('INVALID_RESPONSE', response.status);
+          return parsed;
+        },
+        {
+          signal: options.signal,
+          timeoutMs: DEFAULT_CONTROL_REQUEST_TIMEOUT_MS,
+          timeoutReason: 'PRO_ROOM_REQUEST_TIMEOUT',
+        },
+      );
+    } catch (error) {
+      if (error instanceof ProRoomApiError) throw error;
+      throw new ProRoomApiError(options.signal?.aborted ? 'ABORTED' : 'NETWORK_ERROR');
+    }
+  }
+
+  #bindPresenceIdentity(code: string, snapshot: ProRoomSnapshot): ProRoomSnapshot {
+    const viewer = snapshot.viewer;
+    if (
+      snapshot.roomCode !== code ||
+      !viewer ||
+      !OPAQUE_ID_RE.test(viewer.participantId) ||
+      !OPAQUE_ID_RE.test(viewer.presenceIncarnationId)
+    ) {
+      throw new ProRoomApiError('INVALID_RESPONSE');
+    }
+    this.#presenceIdentities.set(code, {
+      participantId: viewer.participantId,
+      presenceIncarnationId: viewer.presenceIncarnationId,
+    });
+    return snapshot;
+  }
+
+  /**
+   * Forget only this tab's in-memory lease. This never revokes a cookie or
+   * mutates server state, so terminal supersession cannot affect a newer tab.
+   */
+  clearPresenceIdentity(code: string, expected?: ProRoomPresenceIdentity): void {
+    if (!isProRoomCode(code)) return;
+    const current = this.#presenceIdentities.get(code);
+    if (!current) return;
+    if (
+      expected &&
+      (current.participantId !== expected.participantId ||
+        current.presenceIncarnationId !== expected.presenceIncarnationId)
+    ) {
+      return;
+    }
+    this.#presenceIdentities.delete(code);
+  }
+
+  presenceIdentity(code: string): Readonly<ProRoomPresenceIdentity> | null {
+    const identity = this.#presenceIdentities.get(code);
+    return identity ? { ...identity } : null;
+  }
+
+  getBootstrap(code: string, signal?: AbortSignal): Promise<ProRoomBootstrap> {
+    const path = roomPath(code);
+    return this.#request(`${path}/bootstrap`, {
+      signal,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: (value) => parseBootstrap(value, code),
+    });
+  }
+
+  activate(input: ActivateProRoomInput, signal?: AbortSignal): Promise<ProRoomSnapshot> {
+    const path = roomPath(input.code);
+    if (!parseProRoomClaimToken(input.claimToken)) {
+      throw new ProRoomApiError('INVALID_CLAIM_TOKEN');
+    }
+    const ownerName =
+      input.ownerName === undefined
+        ? undefined
+        : parseBoundedString(input.ownerName, MAX_DISPLAY_NAME_LENGTH);
+    if (
+      input.ownerName !== undefined &&
+      (ownerName === null || !isSafeVisibleDisplayName(ownerName))
+    ) {
+      throw new ProRoomApiError('INVALID_DISPLAY_NAME');
+    }
+    return this.#request(`${path}/activation`, {
+      method: 'POST',
+      body: {
+        claimToken: input.claimToken,
+        temporaryPin: validatePin(input.temporaryPin),
+        newPin: validatePin(input.newPin),
+        ...(ownerName === undefined ? {} : { ownerName }),
+      },
+      signal,
+      parser: (value) => parseSnapshotEnvelope(value, input.code),
+    }).then((snapshot) => this.#bindPresenceIdentity(input.code, snapshot));
+  }
+
+  recoverOwner(input: RecoverProRoomOwnerInput, signal?: AbortSignal): Promise<ProRoomSnapshot> {
+    const path = roomPath(input.code);
+    if (!parseProRoomOwnerRecoveryClaimToken(input.claimToken)) {
+      throw new ProRoomApiError('INVALID_RECOVERY_CLAIM_TOKEN');
+    }
+    return this.#request(`${path}/owner-recovery`, {
+      method: 'POST',
+      body: { claimToken: input.claimToken },
+      signal,
+      parser: (value) => parseSnapshotEnvelope(value, input.code),
+    }).then((snapshot) => this.#bindPresenceIdentity(input.code, snapshot));
+  }
+
+  transferOwner(input: TransferProRoomOwnerInput, signal?: AbortSignal): Promise<ProRoomSnapshot> {
+    const path = roomPath(input.code);
+    if (!parseProRoomOwnerTransferClaimToken(input.claimToken)) {
+      throw new ProRoomApiError('INVALID_TRANSFER_CLAIM_TOKEN');
+    }
+    return this.#request(`${path}/owner-transfer`, {
+      method: 'POST',
+      body: {
+        claimToken: input.claimToken,
+        newPin: validatePin(input.newPin),
+        requestId: validateOwnerTransferRequestId(input.requestId),
+      },
+      signal,
+      parser: (value) => parseSnapshotEnvelope(value, input.code),
+    }).then((snapshot) => this.#bindPresenceIdentity(input.code, snapshot));
+  }
+
+  createSession(input: CreateProRoomSessionInput, signal?: AbortSignal): Promise<ProRoomSnapshot> {
+    const path = roomPath(input.code);
+    const requestId = validateIdempotencyKey(input.requestId ?? createProRoomIdempotencyKey());
+    return this.#request(`${path}/sessions`, {
+      method: 'POST',
+      body: { pin: validatePin(input.pin), requestId },
+      signal,
+      parser: (value) => parseSessionEnvelope(value, input.code),
+    }).then((snapshot) => this.#bindPresenceIdentity(input.code, snapshot));
+  }
+
+  getSnapshot(code: string, signal?: AbortSignal): Promise<ProRoomSnapshot> {
+    const path = roomPath(code);
+    return this.#request(`${path}/snapshot`, {
+      signal,
+      activeRoomCode: code,
+      parser: (value) => parseSnapshotEnvelope(value, code),
+    });
+  }
+
+  async enterPresence(
+    code: string,
+    options: EnterProRoomPresenceOptions = {},
+  ): Promise<ProRoomSnapshot> {
+    const path = roomPath(code);
+    const snapshot = await this.#request(`${path}/presence/enter`, {
+      method: 'POST',
+      ...(options.takeover === true ? { body: { takeover: true } } : {}),
+      signal: options.signal,
+      parser: (value) => parseSnapshotEnvelope(value, code),
+    });
+    return this.#bindPresenceIdentity(code, snapshot);
+  }
+
+  async attachCurrentAccount(code: string, signal?: AbortSignal): Promise<ProRoomSnapshot> {
+    const path = roomPath(code);
+    const snapshot = await this.#request(`${path}/sessions/current/account`, {
+      method: 'POST',
+      signal,
+      activeRoomCode: code,
+      parser: (value) => parseSnapshotEnvelope(value, code),
+      maxResponseBytes: MAX_RESPONSE_JSON_BYTES,
+    });
+    return this.#bindPresenceIdentity(code, snapshot);
+  }
+
+  renewCurrentAccountLease(code: string, signal?: AbortSignal): Promise<ProRoomAccountLease> {
+    const path = roomPath(code);
+    return this.#request(`${path}/sessions/current/account/lease`, {
+      method: 'POST',
+      signal,
+      parser: parseAccountLease,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+    });
+  }
+
+  async detachCurrentAccount(
+    code: string,
+    signal?: AbortSignal,
+  ): Promise<ProRoomAccountDetachResult> {
+    const path = roomPath(code);
+    // Account detachment is session-cookie scoped rather than presence scoped.
+    // A backgrounded tab must be able to shed account authority even after its
+    // live presence has expired, so do not attach the active-presence headers.
+    return this.#request(`${path}/sessions/current/account`, {
+      method: 'DELETE',
+      signal,
+      parser: (value) => parseAccountDetachResult(value, code),
+      maxResponseBytes: MAX_RESPONSE_JSON_BYTES,
+    });
+  }
+
+  kickPresence(
+    code: string,
+    targetParticipantId: string,
+    signal?: AbortSignal,
+  ): Promise<ProRoomSnapshot> {
+    const path = roomPath(code);
+    // A distinct endpoint keeps rolling deploys fail-closed: an older Worker
+    // returns 404 instead of applying the legacy account-wide kick semantics
+    // to a participant-shaped body.
+    return this.#request(`${path}/presence/kick-device`, {
+      method: 'POST',
+      body: {
+        targetParticipantId: validateOpaqueId(targetParticipantId, 'INVALID_PARTICIPANT_ID'),
+      },
+      signal,
+      activeRoomCode: code,
+      parser: (value) => parseSnapshotEnvelope(value, code),
+    });
+  }
+
+  kickMember(code: string, targetMemberId: string, signal?: AbortSignal): Promise<ProRoomSnapshot> {
+    const path = roomPath(code);
+    return this.#request(`${path}/presence/kick`, {
+      method: 'POST',
+      body: {
+        targetMemberId: validateOpaqueId(targetMemberId, 'INVALID_MEMBER_ID'),
+      },
+      signal,
+      activeRoomCode: code,
+      parser: (value) => parseSnapshotEnvelope(value, code),
+    });
+  }
+
+  getAdministrators(code: string, signal?: AbortSignal): Promise<ProRoomAdministratorDirectory> {
+    const path = roomPath(code);
+    return this.#request(`${path}/administrators`, {
+      signal,
+      activeRoomCode: code,
+      parser: parseAdministratorDirectory,
+      maxResponseBytes: MAX_ADMINISTRATOR_JSON_BYTES,
+    });
+  }
+
+  updateAdministrator(
+    code: string,
+    memberId: string,
+    permissions: ProRoomPermissionSet,
+    signal?: AbortSignal,
+  ): Promise<ProRoomAdministratorDirectory> {
+    const path = roomPath(code);
+    const targetMemberId = validateOpaqueId(memberId, 'INVALID_MEMBER_ID');
+    return this.#request(`${path}/administrators/${encodeURIComponent(targetMemberId)}`, {
+      method: 'PUT',
+      body: { permissions: validateAdministratorPermissions(permissions) },
+      signal,
+      activeRoomCode: code,
+      parser: parseAdministratorDirectory,
+      maxResponseBytes: MAX_ADMINISTRATOR_JSON_BYTES,
+    });
+  }
+
+  revokeAdministrator(
+    code: string,
+    memberId: string,
+    signal?: AbortSignal,
+  ): Promise<ProRoomAdministratorDirectory> {
+    const path = roomPath(code);
+    const targetMemberId = validateOpaqueId(memberId, 'INVALID_MEMBER_ID');
+    return this.#request(`${path}/administrators/${encodeURIComponent(targetMemberId)}`, {
+      method: 'DELETE',
+      signal,
+      activeRoomCode: code,
+      parser: parseAdministratorDirectory,
+      maxResponseBytes: MAX_ADMINISTRATOR_JSON_BYTES,
+    });
+  }
+
+  executePlaybackCommand(
+    input: ExecuteProRoomPlaybackCommandInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomPlaybackCommandResult> {
+    const path = roomPath(input.code);
+    const command = validatePlaybackCommand(input.command);
+    return this.#request(`${path}/playback/commands`, {
+      method: 'POST',
+      body: command,
+      idempotencyKey: input.idempotencyKey,
+      signal,
+      activeRoomCode: input.code,
+      parser: (value) => parsePlaybackCommandResult(value, input.code),
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+    });
+  }
+
+  async reportPlaybackTransitionReady(
+    input: ReportProRoomPlaybackReadyInput,
+    signal?: AbortSignal,
+  ): Promise<'waiting' | 'committed'> {
+    if (!PLAYBACK_TRANSITION_ID_RE.test(input.transitionId)) {
+      throw new ProRoomApiError('INVALID_PLAYBACK_TRANSITION_ID');
+    }
+    if (!isSafeNonNegativeInteger(input.basePlaybackRevision)) {
+      throw new ProRoomApiError('INVALID_PLAYBACK_REVISION');
+    }
+    const path = roomPath(input.code);
+    const transitionId = input.transitionId;
+    return this.#request(`${path}/playback/transitions/${encodeURIComponent(transitionId)}/ready`, {
+      method: 'POST',
+      body: {
+        basePlaybackRevision: input.basePlaybackRevision,
+        status: input.status,
+      },
+      signal,
+      activeRoomCode: input.code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: (value) => {
+        if (
+          !isRecord(value) ||
+          !hasExactKeys(value, ['ok', 'transitionId', 'status', 'playbackRevision']) ||
+          value.ok !== true ||
+          value.transitionId !== transitionId ||
+          (value.status !== 'waiting' && value.status !== 'committed') ||
+          !isSafeNonNegativeInteger(value.playbackRevision)
+        ) {
+          return null;
+        }
+        return value.status;
+      },
+    });
+  }
+
+  async closeSession(code: string, signal?: AbortSignal): Promise<void> {
+    const path = roomPath(code);
+    await this.#request(`${path}/sessions/current`, {
+      method: 'DELETE',
+      signal,
+      activeRoomCode: code,
+      parser: parseOk,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+    });
+    this.clearPresenceIdentity(code);
+  }
+
+  /**
+   * Revoke only the server session that still owns the captured presence
+   * incarnation. The endpoint deliberately emits no cookie tombstone: a
+   * delayed response must not erase a newer same-name cookie from another tab.
+   */
+  async closeSessionFenced(
+    input: CloseProRoomSessionFencedInput,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const path = roomPath(input.code);
+    await this.#request(`${path}/sessions/current/close`, {
+      method: 'POST',
+      body: {
+        expectedParticipantId: validateOpaqueId(
+          input.expectedParticipantId,
+          'INVALID_PARTICIPANT_ID',
+        ),
+        expectedPresenceIncarnationId: validateOpaqueId(
+          input.expectedPresenceIncarnationId,
+          'INVALID_PRESENCE_INCARNATION_ID',
+        ),
+      },
+      simpleTextBody: true,
+      signal,
+      parser: parseOk,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+    });
+    this.clearPresenceIdentity(input.code, {
+      participantId: input.expectedParticipantId,
+      presenceIncarnationId: input.expectedPresenceIncarnationId,
+    });
+  }
+
+  async changePin(code: string, pin: string, signal?: AbortSignal): Promise<void> {
+    const path = roomPath(code);
+    await this.#request(`${path}/pin`, {
+      method: 'POST',
+      body: { pin: validatePin(pin) },
+      signal,
+      activeRoomCode: code,
+      parser: parseOk,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+    });
+  }
+
+  async heartbeat(
+    code: string,
+    signal?: AbortSignal,
+    knownSnapshot?: ProRoomSnapshot,
+  ): Promise<ProRoomSnapshot> {
+    const path = roomPath(code);
+    return this.#request(`${path}/presence/heartbeat`, {
+      method: 'POST',
+      ...(knownSnapshot === undefined
+        ? {}
+        : {
+            body: {
+              revision: knownSnapshot.revision,
+              playlistRevision: knownSnapshot.playlistRevision,
+              presenceRevision: knownSnapshot.presence.revision,
+              playbackRevision: knownSnapshot.playback.revision,
+              coordinatorEpoch: knownSnapshot.presence.coordinatorEpoch,
+            },
+          }),
+      signal,
+      activeRoomCode: code,
+      parser: (value) => parseHeartbeatEnvelope(value, code, knownSnapshot ?? null),
+    });
+  }
+
+  getEffects(code: string, signal?: AbortSignal): Promise<ProRoomEffectsSnapshot> {
+    const path = roomPath(code);
+    return this.#request(`${path}/effects`, {
+      signal,
+      headers: { 'X-MXQR-Pro-Effects-Version': '2' },
+      activeRoomCode: code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: (value) => parseProRoomEffectsSnapshot(value, code),
+    });
+  }
+
+  updateEffects(
+    input: UpdateProRoomEffectsInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomEffectsSnapshot> {
+    const path = roomPath(input.code);
+    if (!Number.isSafeInteger(input.coordinatorEpoch) || input.coordinatorEpoch < 1) {
+      throw new ProRoomApiError('INVALID_COORDINATOR_EPOCH');
+    }
+    if (!Number.isSafeInteger(input.baseRevision) || input.baseRevision < 0) {
+      throw new ProRoomApiError('INVALID_REVISION');
+    }
+    const effects = parseRoomEffectsState(input.effects);
+    if (!effects) throw new ProRoomApiError('INVALID_EFFECTS');
+    return this.#request(`${path}/effects`, {
+      method: 'PUT',
+      headers: { 'X-MXQR-Pro-Effects-Version': '2' },
+      body: { coordinatorEpoch: input.coordinatorEpoch, baseRevision: input.baseRevision, effects },
+      signal,
+      activeRoomCode: input.code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: (value) => parseProRoomEffectsSnapshot(value, input.code),
+    });
+  }
+
+  getSettingsSync(code: string, signal?: AbortSignal): Promise<ProRoomSettingsSyncSnapshot> {
+    const path = roomPath(code);
+    return this.#request(`${path}/settings-sync`, {
+      signal,
+      activeRoomCode: code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: (value) => parseProRoomSettingsSyncSnapshot(value, code),
+    });
+  }
+
+  updateSettingsSync(
+    input: UpdateProRoomSettingsSyncInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomSettingsSyncSnapshot> {
+    const path = roomPath(input.code);
+    if (!Number.isSafeInteger(input.coordinatorEpoch) || input.coordinatorEpoch < 1) {
+      throw new ProRoomApiError('INVALID_COORDINATOR_EPOCH');
+    }
+    if (!Number.isSafeInteger(input.baseRevision) || input.baseRevision < 0) {
+      throw new ProRoomApiError('INVALID_REVISION');
+    }
+    if (!Number.isFinite(input.masterVolume) || input.masterVolume < 0 || input.masterVolume > 1) {
+      throw new ProRoomApiError('INVALID_VOLUME');
+    }
+    const effects = parseRoomEffectsState(input.effects);
+    if (!effects) throw new ProRoomApiError('INVALID_EFFECTS');
+    return this.#request(`${path}/settings-sync`, {
+      method: 'PUT',
+      body: {
+        coordinatorEpoch: input.coordinatorEpoch,
+        baseRevision: input.baseRevision,
+        masterVolume: input.masterVolume,
+        effects,
+      },
+      signal,
+      activeRoomCode: input.code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: (value) => parseProRoomSettingsSyncSnapshot(value, input.code),
+    });
+  }
+
+  getQueueMode(code: string, signal?: AbortSignal): Promise<ProRoomQueueModeSnapshot> {
+    const path = roomPath(code);
+    return this.#request(`${path}/queue-mode`, {
+      signal,
+      activeRoomCode: code,
+      maxResponseBytes: 128 * 1024,
+      parser: (value) => parseProRoomQueueModeSnapshot(value, code),
+    });
+  }
+
+  updateQueueMode(
+    input: UpdateProRoomQueueModeInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomQueueModeSnapshot> {
+    const path = roomPath(input.code);
+    if (!Number.isSafeInteger(input.coordinatorEpoch) || input.coordinatorEpoch < 1) {
+      throw new ProRoomApiError('INVALID_COORDINATOR_EPOCH');
+    }
+    if (!Number.isSafeInteger(input.baseRevision) || input.baseRevision < 0) {
+      throw new ProRoomApiError('INVALID_REVISION');
+    }
+    if (!Number.isSafeInteger(input.playlistRevision) || input.playlistRevision < 0) {
+      throw new ProRoomApiError('INVALID_PLAYLIST_REVISION');
+    }
+    if (input.repeatMode !== 0 && input.repeatMode !== 1 && input.repeatMode !== 2) {
+      throw new ProRoomApiError('INVALID_REPEAT_MODE');
+    }
+    return this.#request(`${path}/queue-mode`, {
+      method: 'PUT',
+      body: {
+        coordinatorEpoch: input.coordinatorEpoch,
+        baseRevision: input.baseRevision,
+        playlistRevision: input.playlistRevision,
+        repeatMode: input.repeatMode,
+        shuffleEnabled: input.shuffleEnabled,
+        shuffleOrder: input.shuffleOrder,
+      },
+      signal,
+      activeRoomCode: input.code,
+      maxResponseBytes: 128 * 1024,
+      parser: (value) => parseProRoomQueueModeSnapshot(value, input.code),
+    });
+  }
+
+  getSystemAudioState(code: string, signal?: AbortSignal): Promise<ProRoomSystemAudioState> {
+    const path = roomPath(code);
+    return this.#request(`${path}/system-audio`, {
+      signal,
+      activeRoomCode: code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: parseSystemAudioEnvelope,
+    });
+  }
+
+  acquireSystemAudioLease(
+    code: string,
+    signal?: AbortSignal,
+  ): Promise<ProRoomSystemAudioLeaseGrant> {
+    const path = roomPath(code);
+    return this.#request(`${path}/system-audio/acquire`, {
+      method: 'POST',
+      body: {},
+      signal,
+      activeRoomCode: code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: parseSystemAudioLeaseGrant,
+    });
+  }
+
+  commitSystemAudioPublication(
+    input: CommitProRoomSystemAudioInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomSystemAudioState> {
+    const path = roomPath(input.code);
+    return this.#request(`${path}/system-audio/commit`, {
+      method: 'POST',
+      body: {
+        generation: validateSystemAudioGeneration(input.generation),
+        leaseId: validateSystemAudioLeaseId(input.leaseId),
+        publication: validateSystemAudioPublication(input.publication),
+      },
+      signal,
+      activeRoomCode: input.code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: parseSystemAudioEnvelope,
+    });
+  }
+
+  heartbeatSystemAudioLease(
+    input: UpdateProRoomSystemAudioLeaseInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomSystemAudioState> {
+    const path = roomPath(input.code);
+    return this.#request(`${path}/system-audio/heartbeat`, {
+      method: 'POST',
+      body: {
+        generation: validateSystemAudioGeneration(input.generation),
+        leaseId: validateSystemAudioLeaseId(input.leaseId),
+      },
+      signal,
+      activeRoomCode: input.code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: parseSystemAudioEnvelope,
+    });
+  }
+
+  releaseSystemAudioLease(
+    input: UpdateProRoomSystemAudioLeaseInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomSystemAudioState> {
+    const path = roomPath(input.code);
+    return this.#request(`${path}/system-audio/release`, {
+      method: 'POST',
+      body: {
+        generation: validateSystemAudioGeneration(input.generation),
+        leaseId: validateSystemAudioLeaseId(input.leaseId),
+      },
+      signal,
+      activeRoomCode: input.code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser: parseSystemAudioEnvelope,
+    });
+  }
+
+  async leavePresence(code: string, signal?: AbortSignal): Promise<ProRoomSnapshot> {
+    const path = roomPath(code);
+    const snapshot = await this.#request(`${path}/presence/current`, {
+      method: 'DELETE',
+      signal,
+      activeRoomCode: code,
+      parser: (value) => parseSnapshotEnvelope(value, code),
+    });
+    this.clearPresenceIdentity(code);
+    return snapshot;
+  }
+
+  /**
+   * Release the exact presence incarnation in one keepalive request. This
+   * intentionally does not close the cookie session:
+   * unlike the explicit leave flow, a tab close has no reliable opportunity
+   * to consume a Set-Cookie response and the retained session makes a later
+   * resume deterministic.
+   */
+  async closePresenceOnUnload(input: CloseProRoomPresenceInput): Promise<void> {
+    const path = roomPath(input.code);
+    if (!isSafeNonNegativeInteger(input.baseRevision)) {
+      throw new ProRoomApiError('INVALID_REVISION');
+    }
+    if (input.currentQueueItemId !== null && !isProRoomQueueItemId(input.currentQueueItemId)) {
+      throw new ProRoomApiError('INVALID_QUEUE_ITEM_ID');
+    }
+    await this.#request(`${path}/presence/close`, {
+      method: 'POST',
+      body: {
+        idempotencyKey: validateIdempotencyKey(input.idempotencyKey),
+        expectedParticipantId: validateOpaqueId(
+          input.expectedParticipantId,
+          'INVALID_PARTICIPANT_ID',
+        ),
+        expectedPresenceIncarnationId: validateOpaqueId(
+          input.expectedPresenceIncarnationId,
+          'INVALID_PRESENCE_INCARNATION_ID',
+        ),
+        baseRevision: input.baseRevision,
+        currentQueueItemId: input.currentQueueItemId,
+        playback: input.playback,
+      },
+      keepalive: true,
+      simpleTextBody: true,
+      parser: parseOk,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+    });
+  }
+
+  async createSignalingTicket(code: string, signal?: AbortSignal): Promise<ProRoomSignalingAccess> {
+    const path = roomPath(code);
+    const parser = (value: unknown): ProRoomSignalingAccess | null => {
+      if (
+        !isRecord(value) ||
+        !hasExactKeys(value, [
+          'ticket',
+          'expiresAtMs',
+          'role',
+          'coordinatorEpoch',
+          'presenceIncarnationId',
+          'ticketSequence',
+          'pendingPlaybackTransition',
+        ])
+      ) {
+        return null;
+      }
+      const ticket = parseProRoomSignalingTicket(value.ticket);
+      if (
+        !ticket ||
+        !isSafeNonNegativeInteger(value.expiresAtMs) ||
+        value.role !== 'member' ||
+        !isSafeNonNegativeInteger(value.coordinatorEpoch) ||
+        typeof value.presenceIncarnationId !== 'string' ||
+        !OPAQUE_ID_RE.test(value.presenceIncarnationId) ||
+        !Number.isSafeInteger(value.ticketSequence) ||
+        (value.ticketSequence as number) < 1
+      ) {
+        return null;
+      }
+      const pendingPlaybackTransition =
+        value.pendingPlaybackTransition === null
+          ? null
+          : parseProRoomPlaybackPrepareEvent(value.pendingPlaybackTransition);
+      if (value.pendingPlaybackTransition !== null && pendingPlaybackTransition === null) {
+        return null;
+      }
+      return {
+        ticket,
+        expiresAtMs: value.expiresAtMs,
+        role: value.role,
+        coordinatorEpoch: value.coordinatorEpoch,
+        presenceIncarnationId: value.presenceIncarnationId,
+        ticketSequence: value.ticketSequence as number,
+        pendingPlaybackTransition,
+      };
+    };
+    return this.#request(`${path}/signaling-tickets`, {
+      method: 'POST',
+      signal,
+      activeRoomCode: code,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+      parser,
+    });
+  }
+
+  async ackDeveloperCommand(
+    input: AckProRoomDeveloperCommandInput,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const path = roomPath(input.code);
+    if (!DEVELOPER_COMMAND_ID_RE.test(input.commandId)) {
+      throw new ProRoomApiError('INVALID_DEVELOPER_COMMAND_ID');
+    }
+    const commandId = input.commandId;
+    await this.#request(`${path}/developer-commands/${encodeURIComponent(commandId)}/ack`, {
+      method: 'POST',
+      body: { resultCode: validateDeveloperCommandResultCode(input.resultCode) },
+      signal,
+      activeRoomCode: input.code,
+      parser: parseOk,
+      maxResponseBytes: MAX_BOOTSTRAP_JSON_BYTES,
+    });
+  }
+
+  runBotCommand(
+    input: ProRoomBotCommandInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomBotCommandResult> {
+    const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : '';
+    if (!prompt || prompt.length > MAX_BOT_PROMPT_LENGTH) {
+      throw new ProRoomApiError('INVALID_BOT_PROMPT');
+    }
+    const requestId = validateIdempotencyKey(input.requestId);
+    const path = roomPath(input.code);
+    return this.#request(`${path}/bot/commands`, {
+      method: 'POST',
+      body: { prompt, requestId },
+      idempotencyKey: requestId,
+      signal,
+      activeRoomCode: input.code,
+      parser: parseBotCommandResult,
+      maxResponseBytes: MAX_BOT_RESPONSE_JSON_BYTES,
+    });
+  }
+
+  updateCompactSnapshot(
+    input: UpdateProRoomCompactSnapshotInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomSnapshot> {
+    const path = roomPath(input.code);
+    if (!isSafeNonNegativeInteger(input.baseRevision)) {
+      throw new ProRoomApiError('INVALID_REVISION');
+    }
+    if (input.currentQueueItemId !== null && !isProRoomQueueItemId(input.currentQueueItemId)) {
+      throw new ProRoomApiError('INVALID_QUEUE_ITEM_ID');
+    }
+    if (
+      input.playlistOrder !== null &&
+      (input.playlistOrder.some((queueItemId) => !isProRoomQueueItemId(queueItemId)) ||
+        new Set(input.playlistOrder).size !== input.playlistOrder.length)
+    ) {
+      throw new ProRoomApiError('INVALID_PLAYLIST');
+    }
+    return this.#request(`${path}/snapshot/compact`, {
+      method: 'POST',
+      idempotencyKey: input.idempotencyKey,
+      body: {
+        baseRevision: input.baseRevision,
+        playlistOrder: input.playlistOrder,
+        upserts: input.upserts,
+        currentQueueItemId: input.currentQueueItemId,
+        playback: input.playback,
+      },
+      signal,
+      activeRoomCode: input.code,
+      parser: (value) => parseSnapshotEnvelope(value, input.code),
+    });
+  }
+
+  createMediaReservation(
+    input: CreateProRoomMediaReservationInput,
+    signal?: AbortSignal,
+  ): Promise<ProRoomMediaReservation> {
+    const path = roomPath(input.code);
+    const name = parseBoundedString(input.name, MAX_NAME_LENGTH);
+    if (name === null) throw new ProRoomApiError('INVALID_MEDIA_NAME');
+    if (
+      !Number.isSafeInteger(input.byteLength) ||
+      input.byteLength <= 0 ||
+      input.byteLength > PRO_ROOM_MAX_ASSET_BYTES
+    ) {
+      throw new ProRoomApiError('INVALID_MEDIA_SIZE');
+    }
+    if (!MIME_RE.test(input.mime)) throw new ProRoomApiError('INVALID_MEDIA_TYPE');
+    if (input.sha256 !== undefined && !SHA256_RE.test(input.sha256)) {
+      throw new ProRoomApiError('INVALID_MEDIA_HASH');
+    }
+    return this.#request(`${path}/media/reservations`, {
+      method: 'POST',
+      idempotencyKey: input.idempotencyKey,
+      body: {
+        byteLength: input.byteLength,
+        name,
+        mime: input.mime,
+        ...(input.sha256 === undefined ? {} : { sha256: input.sha256 }),
+      },
+      signal,
+      activeRoomCode: input.code,
+      parser: (value) => {
+        if (!isRecord(value) || !hasExactKeys(value, ['reservation', 'quota'])) return null;
+        const quota = parseQuota(value.quota);
+        if (!quota || !isRecord(value.reservation)) return null;
+        const reservation = value.reservation;
+        if (
+          !hasExactKeys(reservation, [
+            'assetId',
+            'version',
+            'byteLength',
+            'expiresAtMs',
+            'upload',
+          ]) ||
+          typeof reservation.assetId !== 'string' ||
+          !OPAQUE_ID_RE.test(reservation.assetId) ||
+          !Number.isSafeInteger(reservation.version) ||
+          (reservation.version as number) <= 0 ||
+          reservation.byteLength !== input.byteLength ||
+          !isSafeNonNegativeInteger(reservation.expiresAtMs) ||
+          !isRecord(reservation.upload) ||
+          !hasExactKeys(reservation.upload, ['method', 'url', 'headers']) ||
+          reservation.upload.method !== 'PUT'
+        ) {
+          return null;
+        }
+        const url = parseProRoomMediaTransferUrl(reservation.upload.url, this.endpoint);
+        const headers = parseUploadHeaders(reservation.upload.headers);
+        if (!url || !headers) return null;
+        return {
+          assetId: reservation.assetId,
+          version: reservation.version as number,
+          byteLength: input.byteLength,
+          expiresAtMs: reservation.expiresAtMs,
+          upload: { method: 'PUT', url, headers },
+          quota,
+        };
+      },
+    });
+  }
+
+  completeMedia(
+    input: CompleteProRoomMediaInput,
+    signal?: AbortSignal,
+  ): Promise<{ asset: ProRoomR2Source; quota: ProRoomQuotaSnapshot }> {
+    const path = roomPath(input.code);
+    const assetId = validateOpaqueId(input.assetId, 'INVALID_ASSET_ID');
+    return this.#request(`${path}/media/${encodeURIComponent(assetId)}/complete`, {
+      method: 'POST',
+      idempotencyKey: input.idempotencyKey,
+      signal,
+      activeRoomCode: input.code,
+      parser: (value) => {
+        if (!isRecord(value) || !hasExactKeys(value, ['asset', 'quota'])) return null;
+        const asset = parseR2Asset(value.asset);
+        const quota = parseQuota(value.quota);
+        return asset && quota ? { asset, quota } : null;
+      },
+    });
+  }
+
+  getMediaDownload(
+    code: string,
+    assetId: string,
+    signal?: AbortSignal,
+  ): Promise<ProRoomMediaDownload> {
+    const path = roomPath(code);
+    const safeAssetId = validateOpaqueId(assetId, 'INVALID_ASSET_ID');
+    return this.#request(`${path}/media/${encodeURIComponent(safeAssetId)}/download`, {
+      signal,
+      activeRoomCode: code,
+      parser: (value) => {
+        if (!isRecord(value) || !hasExactKeys(value, ['asset', 'download'])) return null;
+        const asset = parseR2Asset(value.asset);
+        if (
+          !asset ||
+          !isRecord(value.download) ||
+          !hasExactKeys(value.download, ['url', 'expiresAtMs']) ||
+          !isSafeNonNegativeInteger(value.download.expiresAtMs)
+        ) {
+          return null;
+        }
+        const url = parseProRoomMediaTransferUrl(value.download.url, this.endpoint);
+        return url ? { asset, url, expiresAtMs: value.download.expiresAtMs } : null;
+      },
+    });
+  }
+
+  deleteMedia(
+    input: DeleteProRoomMediaInput,
+    signal?: AbortSignal,
+  ): Promise<{ assetId: string; quota: ProRoomQuotaSnapshot }> {
+    const path = roomPath(input.code);
+    const assetId = validateOpaqueId(input.assetId, 'INVALID_ASSET_ID');
+    return this.#request(`${path}/media/${encodeURIComponent(assetId)}`, {
+      method: 'DELETE',
+      idempotencyKey: input.idempotencyKey,
+      signal,
+      activeRoomCode: input.code,
+      parser: (value) => {
+        if (!isRecord(value) || !hasExactKeys(value, ['ok', 'assetId', 'quota'])) return null;
+        const quota = parseQuota(value.quota);
+        return value.ok === true && value.assetId === assetId && quota ? { assetId, quota } : null;
+      },
+    });
+  }
+}

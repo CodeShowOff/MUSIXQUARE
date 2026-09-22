@@ -1,0 +1,283 @@
+/**
+ * @vitest-environment jsdom
+ *
+ * Dispatch-boundary tests for the operator handlers that may opt into the
+ * zero-start path. The controller itself is covered separately; these tests
+ * pin which user actions are allowed to enter it and which must retain the
+ * established legacy rendezvous behavior.
+ */
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { resetState, setState } from '../../core/state.ts';
+import { bus } from '../../core/events.ts';
+
+const QUEUE_ITEM_ID = '22222222-2222-4222-8222-222222222222';
+const PREVIOUS_QUEUE_ITEM_ID = '11111111-1111-4111-8111-111111111111';
+const VIDEO_ID = 'M7lc1UVf-VE';
+
+const playerFacade = vi.hoisted(() => ({
+  currentTime: 0,
+  duration: 300,
+  state: 2,
+  videoId: 'M7lc1UVf-VE',
+  loadVideoById: vi.fn(),
+}));
+const queueFacade = vi.hoisted(() => ({
+  currentQueueItemId: '22222222-2222-4222-8222-222222222222',
+}));
+const zeroStartFacade = vi.hoisted(() => ({ accepted: false }));
+const queueItemFacade = vi.hoisted(() => ({ playlistId: null as string | null }));
+const scheduleYtAutoSync = vi.hoisted(() => vi.fn());
+const cancelYtAutoSync = vi.hoisted(() => vi.fn());
+const tryBeginYouTubeZeroStart = vi.hoisted(() => vi.fn(() => zeroStartFacade.accepted));
+const setYouTubeSubIndex = vi.hoisted(() => vi.fn());
+
+vi.mock('../../core/log.ts', () => ({
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+vi.mock('../../network/peer.ts', () => ({ safeSend: vi.fn(() => true) }));
+vi.mock('../../network/protocol.ts', () => ({ verifyOperator: vi.fn(() => true) }));
+
+vi.mock('../_state.ts', () => ({
+  getYouTubePlayer: vi.fn(() => ({
+    getCurrentTime: () => playerFacade.currentTime,
+    getDuration: () => playerFacade.duration,
+    getPlayerState: () => playerFacade.state,
+    getVideoData: () => ({ video_id: playerFacade.videoId }),
+    loadVideoById: playerFacade.loadVideoById,
+    pauseVideo: vi.fn(),
+  })),
+  setLocalYouTubePaused: vi.fn(),
+  setYouTubeSubIndex,
+}));
+
+vi.mock('../iframe.ts', () => ({
+  adoptResidentYouTubeOccurrence: vi.fn(),
+  loadYouTubeVideo: vi.fn(),
+}));
+vi.mock('../local-offset.ts', () => ({
+  toCanonicalYouTubeTime: vi.fn((seconds: number) => seconds),
+}));
+vi.mock('../../storage/transfer-receive.ts', () => ({ cancelIncomingFileTransfer: vi.fn() }));
+vi.mock('../../share/remote-share.ts', () => ({ cancelRemoteShareWait: vi.fn() }));
+vi.mock('../../player/ownership.ts', () => ({
+  getPlaybackSelectionTrackMeta: vi.fn((meta) => meta),
+  isPlaybackModeYouTube: vi.fn(() => true),
+  setPlaybackTrackMeta: vi.fn(),
+  updatePlaybackTrackDetails: vi.fn(),
+}));
+vi.mock('../../player/queue-model.ts', () => ({
+  getCurrentQueueItemId: vi.fn(() => queueFacade.currentQueueItemId),
+  getQueueItemById: vi.fn(() => ({
+    queueItemId: QUEUE_ITEM_ID,
+    type: 'youtube',
+    name: 'Test video',
+    videoId: VIDEO_ID,
+    playlistId: queueItemFacade.playlistId,
+  })),
+  selectQueueItemById: vi.fn((queueItemId: string) => {
+    queueFacade.currentQueueItemId = queueItemId;
+    return true;
+  }),
+}));
+
+import {
+  configureYouTubeHandlerRuntimeHooks,
+  handleYouTubePlay,
+  handleRequestYouTubePause,
+  handleRequestYouTubePlay,
+  handleRequestYouTubeSubSeek,
+  handleRequestYouTubeToggle,
+} from '../handlers.ts';
+import { adoptResidentYouTubeOccurrence, loadYouTubeVideo } from '../iframe.ts';
+import { updatePlaybackTrackDetails } from '../../player/ownership.ts';
+
+const operatorConnection = { peer: 'operator-peer', open: true } as never;
+const request = { queueItemId: QUEUE_ITEM_ID };
+
+describe('YouTube operator handler zero-start dispatch', () => {
+  beforeEach(() => {
+    resetState();
+    vi.clearAllMocks();
+    queueFacade.currentQueueItemId = QUEUE_ITEM_ID;
+    playerFacade.currentTime = 0;
+    playerFacade.duration = 300;
+    playerFacade.state = 2;
+    playerFacade.videoId = VIDEO_ID;
+    zeroStartFacade.accepted = false;
+    queueItemFacade.playlistId = null;
+    bus.clear();
+    configureYouTubeHandlerRuntimeHooks({
+      cancelYtAutoSync,
+      scheduleYtAutoSync,
+      tryBeginYouTubeZeroStart,
+    });
+    setState('youtube.currentSubIndex', 0);
+    vi.stubGlobal('YT', { PlayerState: { PLAYING: 1 } });
+  });
+
+  it('restarts guest playlist titles after the physical iframe load', () => {
+    queueItemFacade.playlistId = 'PL_GUEST';
+    const hostConnection = { peer: 'host-peer', open: true } as never;
+    setState('network.hostConn', hostConnection);
+    const populate = vi.fn();
+    bus.on('youtube:populate-sub-items', populate);
+
+    handleYouTubePlay(
+      {
+        videoId: VIDEO_ID,
+        playlistId: null,
+        queueItemId: QUEUE_ITEM_ID,
+        autoplay: false,
+        subIndex: 0,
+      },
+      hostConnection,
+    );
+
+    expect(loadYouTubeVideo).toHaveBeenCalledWith(VIDEO_ID, null, false, 0);
+    expect(populate).toHaveBeenCalledWith('PL_GUEST', QUEUE_ITEM_ID);
+    expect(vi.mocked(loadYouTubeVideo).mock.invocationCallOrder.at(-1)!).toBeLessThan(
+      populate.mock.invocationCallOrder.at(-1)!,
+    );
+  });
+
+  it('retains the guest iframe when a different queue occurrence resolves to the resident video', () => {
+    const hostConnection = { peer: 'host-peer', open: true } as never;
+    setState('network.hostConn', hostConnection);
+    queueFacade.currentQueueItemId = PREVIOUS_QUEUE_ITEM_ID;
+    playerFacade.videoId = VIDEO_ID;
+
+    handleYouTubePlay(
+      {
+        videoId: VIDEO_ID,
+        playlistId: null,
+        queueItemId: QUEUE_ITEM_ID,
+        autoplay: false,
+        subIndex: 0,
+      },
+      hostConnection,
+    );
+
+    expect(queueFacade.currentQueueItemId).toBe(QUEUE_ITEM_ID);
+    expect(loadYouTubeVideo).not.toHaveBeenCalled();
+    expect(cancelYtAutoSync).toHaveBeenCalledOnce();
+    expect(adoptResidentYouTubeOccurrence).toHaveBeenCalledWith(VIDEO_ID);
+    expect(setYouTubeSubIndex).toHaveBeenCalledWith(0);
+  });
+
+  it('still loads when the next queue occurrence resolves to a different video', () => {
+    const hostConnection = { peer: 'host-peer', open: true } as never;
+    setState('network.hostConn', hostConnection);
+    queueFacade.currentQueueItemId = PREVIOUS_QUEUE_ITEM_ID;
+    playerFacade.videoId = 'different-video';
+
+    handleYouTubePlay(
+      {
+        videoId: VIDEO_ID,
+        playlistId: null,
+        queueItemId: QUEUE_ITEM_ID,
+        autoplay: false,
+        subIndex: 0,
+      },
+      hostConnection,
+    );
+
+    expect(loadYouTubeVideo).toHaveBeenCalledWith(VIDEO_ID, null, false, 0);
+  });
+
+  it.each([false, true].flatMap((capable) => [1, 2].map((state) => ({ capable, state }))))(
+    'hands current OP sub-selection to canonical loading with capable=$capable and state=$state',
+    ({ capable, state }) => {
+      queueItemFacade.playlistId = 'PL_OPERATOR';
+      zeroStartFacade.accepted = capable;
+      playerFacade.state = state;
+      setState('youtube.subItemsMap', {
+        PL_OPERATOR: { ids: [VIDEO_ID, 'next-video-id'], titles: ['First', 'Next'] },
+      });
+      const selectTrack = vi.fn();
+      bus.on('playlist:play-track', selectTrack);
+
+      handleRequestYouTubeSubSeek({ queueItemId: QUEUE_ITEM_ID, subIdx: 1 }, operatorConnection);
+
+      expect(selectTrack).toHaveBeenCalledWith(QUEUE_ITEM_ID, 1, { navigateToPlay: false });
+      expect(tryBeginYouTubeZeroStart).not.toHaveBeenCalled();
+      expect(scheduleYtAutoSync).not.toHaveBeenCalled();
+      expect(playerFacade.loadVideoById).not.toHaveBeenCalled();
+      expect(setYouTubeSubIndex).not.toHaveBeenCalled();
+      expect(updatePlaybackTrackDetails).not.toHaveBeenCalled();
+    },
+  );
+
+  it('retains canonical lazy resolution for an OP sub-row in another queue item', () => {
+    queueFacade.currentQueueItemId = PREVIOUS_QUEUE_ITEM_ID;
+    queueItemFacade.playlistId = 'PL_OPERATOR';
+    const selectTrack = vi.fn();
+    bus.on('playlist:play-track', selectTrack);
+
+    handleRequestYouTubeSubSeek({ queueItemId: QUEUE_ITEM_ID, subIdx: 2 }, operatorConnection);
+
+    expect(selectTrack).toHaveBeenCalledWith(QUEUE_ITEM_ID, 2, { navigateToPlay: true });
+    expect(playerFacade.loadVideoById).not.toHaveBeenCalled();
+  });
+
+  it.each([-1, 0.5, 99, Number.NaN])('rejects an invalid current OP sub-index %s', (subIdx) => {
+    queueItemFacade.playlistId = 'PL_OPERATOR';
+    setState('youtube.subItemsMap', { PL_OPERATOR: { ids: [VIDEO_ID], titles: ['First'] } });
+    const selectTrack = vi.fn();
+    bus.on('playlist:play-track', selectTrack);
+
+    handleRequestYouTubeSubSeek({ queueItemId: QUEUE_ITEM_ID, subIdx }, operatorConnection);
+
+    expect(selectTrack).not.toHaveBeenCalled();
+    expect(playerFacade.loadVideoById).not.toHaveBeenCalled();
+  });
+
+  it('retains same-subvideo replay in the canonical selection path', () => {
+    queueItemFacade.playlistId = 'PL_OPERATOR';
+    setState('youtube.subItemsMap', { PL_OPERATOR: { ids: [VIDEO_ID], titles: ['First'] } });
+    const selectTrack = vi.fn();
+    bus.on('playlist:play-track', selectTrack);
+
+    handleRequestYouTubeSubSeek({ queueItemId: QUEUE_ITEM_ID, subIdx: 0 }, operatorConnection);
+
+    expect(selectTrack).toHaveBeenCalledWith(QUEUE_ITEM_ID, 0, { navigateToPlay: false });
+    expect(updatePlaybackTrackDetails).not.toHaveBeenCalled();
+  });
+  it('lets a zero-second operator resume use zero-start when the cohort accepts it', () => {
+    zeroStartFacade.accepted = true;
+
+    handleRequestYouTubePlay(request, operatorConnection);
+
+    expect(tryBeginYouTubeZeroStart).toHaveBeenCalledWith(VIDEO_ID, 0);
+    expect(scheduleYtAutoSync).not.toHaveBeenCalled();
+  });
+
+  it('keeps an ordinary non-zero operator resume on legacy rendezvous', () => {
+    playerFacade.currentTime = 12;
+    zeroStartFacade.accepted = true;
+
+    handleRequestYouTubePlay(request, operatorConnection);
+
+    expect(tryBeginYouTubeZeroStart).not.toHaveBeenCalled();
+    expect(scheduleYtAutoSync).toHaveBeenCalledWith(12);
+  });
+
+  it('falls back atomically to legacy when zero-second capability negotiation declines', () => {
+    handleRequestYouTubeToggle(request, operatorConnection);
+
+    expect(tryBeginYouTubeZeroStart).toHaveBeenCalledWith(VIDEO_ID, 0);
+    expect(scheduleYtAutoSync).toHaveBeenCalledWith(0);
+  });
+
+  it('never sends an ordinary pause through zero-start', () => {
+    playerFacade.currentTime = 27;
+    playerFacade.state = 1;
+    zeroStartFacade.accepted = true;
+
+    handleRequestYouTubePause(request, operatorConnection);
+
+    expect(tryBeginYouTubeZeroStart).not.toHaveBeenCalled();
+    expect(scheduleYtAutoSync).toHaveBeenCalledWith(27, { state: 2 });
+  });
+});

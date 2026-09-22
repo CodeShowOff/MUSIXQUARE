@@ -1,0 +1,152 @@
+/**
+ * MUSIXQUARE — EventBus (Singleton)
+ * Type-safe inter-module communication.
+ * Same-domain modules use direct imports; cross-domain uses this bus.
+ */
+
+import { log } from './log.ts';
+import type { EventMap } from '../types/index.ts';
+
+// ── Type-level helpers ──────────────────────────────────────────
+
+// Only declared EventMap keys and state:${StatePath} events are valid.
+// Typos like bus.emit('audo:ready') → compile error.
+type EventKey = keyof EventMap;
+
+type EventArgs<K extends EventKey> = EventMap[K];
+
+// Listener results are intentionally observable: emit() attaches a rejection
+// handler to every returned thenable while preserving synchronous fan-out.
+// Keeping this as `unknown` (rather than `void`) makes that ownership contract
+// visible to both TypeScript and type-aware Promise lint rules.
+type TypedListener<K extends EventKey> = (...args: EventArgs<K>) => unknown;
+
+type AnyListener = (...args: unknown[]) => unknown;
+
+const _onceOriginals = new WeakMap<AnyListener, AnyListener>();
+
+class EventBusImpl {
+  private _listeners = new Map<string, Set<AnyListener>>();
+
+  /**
+   * Subscribe to an event. Returns an unsubscribe function.
+   */
+  on<K extends EventKey>(event: K, fn: TypedListener<K>): () => void {
+    let set = this._listeners.get(event as string);
+    if (!set) {
+      set = new Set();
+      this._listeners.set(event as string, set);
+    }
+    set.add(fn as AnyListener);
+    return () => this.off(event, fn);
+  }
+
+  /**
+   * Subscribe once — auto-removes after first invocation.
+   */
+  once<K extends EventKey>(event: K, fn: TypedListener<K>): () => void {
+    const wrapper: AnyListener = (...args) => {
+      this.off(event, wrapper as TypedListener<K>);
+      return (fn as AnyListener)(...args);
+    };
+    _onceOriginals.set(wrapper, fn as AnyListener);
+    return this.on(event, wrapper as TypedListener<K>);
+  }
+
+  /**
+   * Unsubscribe a specific listener.
+   */
+  off<K extends EventKey>(event: K, fn: TypedListener<K>): void {
+    const set = this._listeners.get(event as string);
+    if (set) {
+      // Direct match
+      if (set.delete(fn as AnyListener)) {
+        if (set.size === 0) this._listeners.delete(event as string);
+        return;
+      }
+      // Match by original fn (for once() wrappers)
+      for (const listener of set) {
+        if (_onceOriginals.get(listener) === (fn as AnyListener)) {
+          set.delete(listener);
+          if (set.size === 0) this._listeners.delete(event as string);
+          return;
+        }
+      }
+    }
+  }
+
+  /**
+   * Emit an event with payload.
+   */
+  emit<K extends EventKey>(event: K, ...args: EventArgs<K>): void {
+    const set = this._listeners.get(event as string);
+    if (!set) return;
+    const snapshot = [...set];
+    for (const fn of snapshot) {
+      try {
+        const result = fn(...args);
+        if (
+          result !== null &&
+          (typeof result === 'object' || typeof result === 'function') &&
+          typeof (result as PromiseLike<unknown>).then === 'function'
+        ) {
+          void Promise.resolve(result).catch((error) => {
+            log.error(`[EventBus] Async handler for "${event as string}" rejected:`, error);
+          });
+        }
+      } catch (e) {
+        log.error(`[EventBus] Error in handler for "${event as string}":`, e);
+      }
+    }
+  }
+
+  /**
+   * Remove all listeners for a specific event, or all events if none specified.
+   */
+  clear(event?: EventKey): void {
+    if (event) {
+      this._listeners.delete(event as string);
+    } else {
+      this._listeners.clear();
+    }
+  }
+
+  /**
+   * Debug: list registered events and listener counts.
+   */
+  debug(): Record<string, number> {
+    const result: Record<string, number> = {};
+    for (const [key, set] of this._listeners) {
+      result[key] = set.size;
+    }
+    return result;
+  }
+}
+
+/** Singleton EventBus instance */
+export const bus = new EventBusImpl();
+
+// ── Bus Scope ──────────────────────────────────────────────────
+
+/**
+ * Group-unsubscribe helper for modules that re-initialize.
+ * Wraps `bus.on` and collects cleanups so a single `dispose()`
+ * drops every subscription registered through this scope.
+ */
+export interface BusScope {
+  on<K extends EventKey>(event: K, fn: TypedListener<K>): void;
+  dispose(): void;
+}
+
+export function createBusScope(): BusScope {
+  const cleanups: Array<() => void> = [];
+  return {
+    on(event, fn) {
+      cleanups.push(bus.on(event, fn));
+    },
+    dispose() {
+      for (const u of cleanups) u();
+      cleanups.length = 0;
+    },
+  };
+}

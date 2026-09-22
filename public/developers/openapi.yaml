@@ -1,0 +1,1126 @@
+openapi: 3.1.0
+info:
+  title: MUSIXQUARE Developer API
+  version: 1.0.0
+  description: |
+    Server-to-server API for one room-bound MUSIXQUARE PRO room.
+    The API can read and control persistent room-wide audio effects as well as playback and the playlist.
+    API keys must never be embedded in browser code or other public clients.
+    Treat every key as a highest-privilege room credential within its assigned scopes. API actions are
+    room-authoritative automation, not actions whose human requester MUSIXQUARE has verified. Integrations must
+    separately identify the requesting user, the executing integration, and the user's exact intent, and require
+    explicit confirmation for destructive or broadly scoped actions.
+  contact:
+    name: MUSIXQUARE
+    email: contact@musixquare.com
+servers:
+  - url: https://api.musixquare.com
+security:
+  - developerApiKey: []
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Developer API Worker health.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, service]
+                properties:
+                  ok: { const: true }
+                  service: { const: musixquare-developer-api }
+                  workerVersionId: { type: string }
+  /v1/rooms/{roomCode}:
+    get:
+      operationId: getRoom
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: Sanitized room status.
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Room' }
+        '304': { description: Representation is unchanged. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/playback:
+    get:
+      operationId: getPlayback
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: Canonical playback snapshot at observedAtMs.
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Playback' }
+        '304': { description: Representation is unchanged. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/effects:
+    get:
+      operationId: getEffects
+      description: |
+        Returns the canonical full room-wide audio-effect state. Requires effects:read. The state remains
+        readable while the PRO room is sleeping and persists across sleep/wake cycles and client reconnects.
+        X-MXQR-Effects-Version: 2 is required. The version 2 representation includes virtualTreble.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - $ref: '#/components/parameters/EffectsVersion'
+      responses:
+        '200':
+          description: Canonical full room-wide audio-effect state.
+          headers:
+            ETag: { schema: { type: string } }
+            Vary: { schema: { const: X-MXQR-Effects-Version } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EffectsState' }
+        '304':
+          description: Representation is unchanged.
+          headers:
+            Vary: { schema: { const: X-MXQR-Effects-Version } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/queue-mode:
+    get:
+      operationId: getQueueMode
+      description: |
+        Returns the canonical repeat and shuffle settings. Requires playback:read. The state remains readable
+        while the PRO room is sleeping and persists across sleep/wake cycles and client reconnects. The
+        server-owned exact shuffle order is intentionally not exposed.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: Canonical repeat and shuffle settings.
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueueModeState' }
+        '304': { description: Representation is unchanged. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    put:
+      operationId: updateQueueMode
+      description: |
+        Replaces the repeat and shuffle settings with one explicit desired state. Requires playback:control and
+        a unique Idempotency-Key. Read this resource first and send its revision as baseRevision. This is not a
+        toggle operation: all three request fields are required. A stale baseRevision returns 409
+        QUEUE_MODE_REVISION_CONFLICT; read the latest state, decide the desired state again, and retry with the new
+        revision and a new Idempotency-Key. The update is available while the room is sleeping and applies when it
+        next wakes. The server preserves its hidden exact order while shuffle remains enabled, generates one when
+        shuffle changes from disabled to enabled, and clears it when shuffle is disabled.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueModeUpdate' }
+      responses:
+        '200':
+          description: Updated canonical settings, including an idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueueModeState' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            The supplied queue-mode revision is stale, or the idempotency key conflicts with another request.
+            For QUEUE_MODE_REVISION_CONFLICT, GET the latest queue mode before retrying.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/queue:
+    get:
+      operationId: getQueue
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: Sanitized persistent playlist.
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Queue' }
+        '304': { description: Representation is unchanged. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/commands:
+    post:
+      operationId: createRoomCommand
+      description: |
+        Creates one fenced playback or room-wide audio-effect intent. Playback commands require
+        playback:control; set_effects requires effects:control. next behaves like the app's Next button: it advances
+        inside the current YouTube playlist aggregate first, then advances to the next top-level queue item using
+        the room's repeat and shuffle settings. play_item force-selects the exact top-level queueItemId. When that
+        item is a YouTube playlist aggregate with a complete manifest, optional youtubeSubIndex selects an exact
+        zero-based item inside the aggregate; the server derives and validates the video ID.
+        Playback and effect commands are authorized and applied by the PRO room server, including while the runtime is
+        sleeping. An applied play_item command means the server committed the canonical selection; connected or
+        returning devices may still be loading it. There is no browser coordinator. The sleeping timeline remains
+        frozen until participants return, and canonical state remains readable across sleep/wake cycles.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RoomCommand' }
+      responses:
+        '202':
+          description: Command accepted, including an idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommandStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/commands/{commandId}:
+    get:
+      operationId: getRoomCommand
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/CommandId'
+      responses:
+        '200':
+          description: Current command state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommandStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/queue/items:
+    post:
+      operationId: addYouTubeQueueItem
+      description: |
+        Adds one canonical YouTube item to the end of the playlist without starting playback. Without playlistId,
+        the item is an independent top-level video. With playlistId, the item is one top-level playlist aggregate
+        keyed by that ID and videoId is the aggregate's entry video. A complete ordered videoIds manifest may be
+        supplied for deterministic server-side navigation; it must contain videoId, which may be a non-first entry.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/YouTubeQueueItemCreate' }
+      responses:
+        '201':
+          description: Item appended, including an idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Queue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    delete:
+      operationId: clearQueue
+      description: |
+        Atomically stops current playback, clears the current selection, and removes every item from the
+        persistent playlist. This collection operation has no request body and returns one updated sanitized
+        queue snapshot with currentQueueItemId set to null and items set to an empty array. Media references
+        released by the clear become eligible for later cleanup. Warning: this includes items added directly
+        by participants and items added through every Developer API credential.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The current sanitized queue after the accepted clear or an idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Queue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/queue/items/batch:
+    post:
+      operationId: addYouTubeQueueItemsBatch
+      description: |
+        Atomically appends between 1 and 100 canonical YouTube items in the supplied order without starting
+        playback. Each distinct playlistId creates exactly one top-level playlist aggregate. When a playlistId
+        repeats, its first occurrence supplies the aggregate's position, entry videoId, and display metadata; later
+        occurrences with that same ID do not create extra top-level items and their metadata is ignored. Repeated
+        manifest-less entries form one manifest from their videoIds in request order. Repeated entries carrying an
+        identical full videoIds manifest preserve that manifest once. Mixing manifest and manifest-less entries, or
+        supplying different full manifests for one playlistId, is rejected atomically. Duplicate IDs are preserved. Entries
+        without playlistId remain independent top-level videos, even when videoId repeats. Every supplied item is
+        still validated atomically, and playlist-capacity checks cover the canonical top-level result: if any item
+        is invalid or that result does not fit, no item is appended. The appended count can therefore be smaller
+        than items.length. One successful batch advances the playlist revision once. The effective limit is
+        whichever is reached first: 100 items or a 128 KiB complete public JSON request.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/YouTubeQueueItemBatchCreate' }
+      responses:
+        '201':
+          description: The full batch was appended, including an idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Queue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/queue/items/owned:
+    delete:
+      operationId: deleteQueueItemsOwnedByCurrentApiKey
+      description: |
+        Atomically removes only queue items added by the Developer API credential making this request. The
+        operation has no request body, requires queue:write and a unique Idempotency-Key, and succeeds as a
+        no-op when there are no matching items. Current playback stops and the selection clears only when the
+        selected item belongs to this credential. Released media references become eligible for later R2
+        garbage collection. Items added directly by participants or by another API credential remain untouched.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The current sanitized queue after the accepted owned cleanup or an idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Queue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/queue/items/{queueItemId}:
+    delete:
+      operationId: deleteQueueItem
+      description: Removes only the queue item identified by queueItemId without stopping unrelated playback.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/QueueItemId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Item removed, including an idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Queue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/queue/order:
+    put:
+      operationId: reorderQueue
+      description: Replaces the order with an exact permutation of the current queue item IDs.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueOrderReplace' }
+      responses:
+        '200':
+          description: Queue reordered, including an idempotent replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Queue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/media/uploads:
+    post:
+      operationId: createMediaUpload
+      description: Reserves room capacity and returns a short-lived direct R2 PUT request.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaUploadCreate' }
+      responses:
+        '201':
+          description: Upload reserved, including an idempotent replay.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+            Referrer-Policy: { schema: { const: no-referrer } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaUploadReservation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/rooms/{roomCode}/media/uploads/{assetId}/complete:
+    post:
+      operationId: completeMediaUpload
+      description: Verifies and finalizes the object, then appends one paused, non-autoplaying queue item.
+      parameters:
+        - $ref: '#/components/parameters/RoomCode'
+        - $ref: '#/components/parameters/AssetId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: Upload finalized and attached, including an idempotent replay.
+          headers:
+            Cache-Control: { schema: { const: no-store } }
+            Referrer-Policy: { schema: { const: no-referrer } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaUploadCompleted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+components:
+  securitySchemes:
+    developerApiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: mxqr_live_<key-id>.<secret>
+      description: |
+        Highest-privilege room credential within its assigned scopes. MUSIXQUARE does not verify the human requester
+        behind an API action. The integration must authenticate and distinguish the requesting user, the executing
+        integration, and the user's exact intent, and must confirm destructive or broadly scoped actions explicitly.
+  parameters:
+    RoomCode:
+      name: roomCode
+      in: path
+      required: true
+      schema: { type: string, pattern: '^0[0-9]{5}$' }
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      schema: { type: string, maxLength: 128 }
+    EffectsVersion:
+      name: X-MXQR-Effects-Version
+      in: header
+      required: true
+      description: Required effects read representation. Only version 2 is supported.
+      schema:
+        type: string
+        const: '2'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Reuse the same value only when retrying the same mutation. MUSIXQUARE retains a bounded
+        24-hour replay receipt and never evicts a live receipt to admit a newer request. If a room
+        exhausts that bounded window, a new mutation fails without being applied with
+        ROOM_STATE_CAPACITY_EXCEEDED; previously accepted keys remain replayable.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{14,126}[A-Za-z0-9]$'
+    CommandId:
+      name: commandId
+      in: path
+      required: true
+      schema: { type: string, pattern: '^cmd_[A-Za-z0-9_-]{22}$' }
+    QueueItemId:
+      name: queueItemId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/QueueItemId' }
+    AssetId:
+      name: assetId
+      in: path
+      required: true
+      schema: { type: string, minLength: 16, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+  schemas:
+    RoomCommand:
+      oneOf:
+        - $ref: '#/components/schemas/PlaybackCommand'
+        - $ref: '#/components/schemas/SetEffectsCommand'
+    PlaybackCommand:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type]
+          properties: { type: { const: play } }
+        - type: object
+          additionalProperties: false
+          required: [type]
+          properties: { type: { const: pause } }
+        - type: object
+          additionalProperties: false
+          required: [type]
+          properties:
+            type:
+              const: next
+              description: |
+                Behaves like the app's Next button: advances within the current YouTube playlist aggregate first,
+                then advances to the next top-level item under the room's repeat and shuffle settings.
+        - type: object
+          additionalProperties: false
+          required: [type, positionSeconds]
+          properties:
+            type: { const: seek }
+            positionSeconds: { type: number, minimum: 0, maximum: 604800 }
+        - type: object
+          additionalProperties: false
+          required: [type, queueItemId]
+          properties:
+            type: { const: play_item }
+            queueItemId: { $ref: '#/components/schemas/QueueItemId' }
+            youtubeSubIndex:
+              type: integer
+              minimum: 0
+              maximum: 4999
+              description: |
+                Optional zero-based item inside a YouTube playlist aggregate. The target queue item must expose a
+                complete manifest summary and the index must be smaller than youtubeSubItemCount. Omit this field
+                to select the aggregate's canonical entry video, preserving the original play_item behavior.
+    SetEffectsCommand:
+      type: object
+      additionalProperties: false
+      required: [type, effects]
+      properties:
+        type: { const: set_effects }
+        effects: { $ref: '#/components/schemas/EffectsPatch' }
+    EffectsPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        reverb: { $ref: '#/components/schemas/ReverbEffectsPatch' }
+        equalizer: { $ref: '#/components/schemas/EqualizerEffectsPatch' }
+        virtualBass: { $ref: '#/components/schemas/VirtualBassEffectsPatch' }
+        virtualSurround: { $ref: '#/components/schemas/VirtualSurroundEffectsPatch' }
+        virtualTreble: { $ref: '#/components/schemas/VirtualTrebleEffectsPatch' }
+    ReverbEffectsPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        mixPercent: { type: number, minimum: 0, maximum: 100 }
+        decaySeconds: { type: number, minimum: 0.1, maximum: 30 }
+        preDelaySeconds: { type: number, minimum: 0, maximum: 1 }
+        lowCutPercent: { type: number, minimum: 0, maximum: 100 }
+        highCutPercent: { type: number, minimum: 0, maximum: 100 }
+    EqualizerEffectsPatch:
+      type: object
+      additionalProperties: false
+      required: [bandsDb]
+      properties:
+        bandsDb:
+          type: array
+          minItems: 5
+          maxItems: 5
+          items: { type: number, minimum: -12, maximum: 12 }
+    VirtualBassEffectsPatch:
+      type: object
+      additionalProperties: false
+      required: [strengthPercent]
+      properties:
+        strengthPercent: { type: number, minimum: 0, maximum: 100 }
+    VirtualSurroundEffectsPatch:
+      type: object
+      additionalProperties: false
+      required: [widthPercent]
+      properties:
+        widthPercent: { type: number, minimum: 0, maximum: 200 }
+    VirtualTrebleEffectsPatch:
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
+    EffectsState:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, view, roomCode, revision, updatedAtMs, effects]
+      properties:
+        schemaVersion: { const: 2 }
+        view: { const: effects }
+        roomCode: { type: string, pattern: '^0[0-9]{5}$' }
+        revision: { type: integer, minimum: 0 }
+        updatedAtMs: { type: integer, minimum: 0 }
+        effects: { $ref: '#/components/schemas/RoomEffects' }
+    QueueModeState:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          schemaVersion,
+          view,
+          roomCode,
+          revision,
+          playlistRevision,
+          updatedAtMs,
+          repeatMode,
+          shuffleEnabled,
+        ]
+      properties:
+        schemaVersion: { const: 1 }
+        view: { const: queue-mode }
+        roomCode: { type: string, pattern: '^0[0-9]{5}$' }
+        revision: { type: integer, minimum: 0 }
+        playlistRevision: { type: integer, minimum: 0 }
+        updatedAtMs: { type: integer, minimum: 0 }
+        repeatMode: { enum: [off, all, one] }
+        shuffleEnabled: { type: boolean }
+    QueueModeUpdate:
+      type: object
+      additionalProperties: false
+      required: [baseRevision, repeatMode, shuffleEnabled]
+      properties:
+        baseRevision: { type: integer, minimum: 0 }
+        repeatMode: { enum: [off, all, one] }
+        shuffleEnabled: { type: boolean }
+    RoomEffects:
+      type: object
+      additionalProperties: false
+      required: [reverb, equalizer, virtualBass, virtualSurround, virtualTreble]
+      properties:
+        reverb: { $ref: '#/components/schemas/ReverbEffects' }
+        equalizer: { $ref: '#/components/schemas/EqualizerEffects' }
+        virtualBass: { $ref: '#/components/schemas/VirtualBassEffects' }
+        virtualSurround: { $ref: '#/components/schemas/VirtualSurroundEffects' }
+        virtualTreble: { $ref: '#/components/schemas/VirtualTrebleEffects' }
+    ReverbEffects:
+      type: object
+      additionalProperties: false
+      required: [mixPercent, decaySeconds, preDelaySeconds, lowCutPercent, highCutPercent]
+      properties:
+        mixPercent: { type: number, minimum: 0, maximum: 100 }
+        decaySeconds: { type: number, minimum: 0.1, maximum: 30 }
+        preDelaySeconds: { type: number, minimum: 0, maximum: 1 }
+        lowCutPercent: { type: number, minimum: 0, maximum: 100 }
+        highCutPercent: { type: number, minimum: 0, maximum: 100 }
+    EqualizerEffects:
+      type: object
+      additionalProperties: false
+      required: [bandsDb]
+      properties:
+        bandsDb:
+          type: array
+          minItems: 5
+          maxItems: 5
+          items: { type: number, minimum: -12, maximum: 12 }
+    VirtualBassEffects:
+      type: object
+      additionalProperties: false
+      required: [strengthPercent]
+      properties:
+        strengthPercent: { type: number, minimum: 0, maximum: 100 }
+    VirtualSurroundEffects:
+      type: object
+      additionalProperties: false
+      required: [widthPercent]
+      properties:
+        widthPercent: { type: number, minimum: 0, maximum: 200 }
+    VirtualTrebleEffects:
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
+    CommandStatus:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, roomCode, commandId, status, createdAtMs, expiresAtMs]
+      properties:
+        schemaVersion: { const: 1 }
+        roomCode: { type: string, pattern: '^0[0-9]{5}$' }
+        commandId: { type: string, pattern: '^cmd_[A-Za-z0-9_-]{22}$' }
+        status: { enum: [pending, dispatched, applied, rejected, expired] }
+        createdAtMs: { type: integer, minimum: 0 }
+        expiresAtMs: { type: integer, minimum: 0 }
+        completedAtMs: { type: integer, minimum: 0 }
+        resultCode: { $ref: '#/components/schemas/CommandResultCode' }
+    CommandResultCode:
+      type: string
+      description: |
+        Terminal result for a command that was already accepted with HTTP 202. These lowercase values are not
+        immediate HTTP error codes. applied and already_applied are successful; all other values require the client
+        to read canonical playback and queue state before deciding whether to submit a new intent. The three
+        coordinator_* values remain in v1 only for wire compatibility; current server-authoritative PRO rooms do not
+        elect a browser coordinator.
+      enum:
+        - applied
+        - already_applied
+        - busy
+        - no_media
+        - stale_queue
+        - unsupported_mode
+        - expired
+        - execution_failed
+        - coordinator_changed
+        - coordinator_incompatible
+        - coordinator_unavailable
+      x-legacy-values: [coordinator_changed, coordinator_incompatible, coordinator_unavailable]
+      x-result-catalog:
+        applied: { terminalStatus: applied, successful: true }
+        already_applied: { terminalStatus: applied, successful: true }
+        busy: { terminalStatus: rejected, successful: false }
+        no_media: { terminalStatus: rejected, successful: false }
+        stale_queue: { terminalStatus: rejected, successful: false }
+        unsupported_mode: { terminalStatus: rejected, successful: false }
+        expired: { terminalStatus: expired, successful: false }
+        execution_failed: { terminalStatus: rejected, successful: false }
+        coordinator_changed: { terminalStatus: rejected, successful: false }
+        coordinator_incompatible: { terminalStatus: rejected, successful: false }
+        coordinator_unavailable: { terminalStatus: rejected, successful: false }
+    QueueItemId:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
+    QueueItemAddedBy:
+      type: string
+      description: |
+        Required privacy-preserving creation provenance relative to the credential reading this response.
+        participant means the item was added directly in the app;
+        current_api_key means this credential added it; another_api_key means a different Developer API
+        credential added it. Raw API key IDs are never exposed.
+      enum: [participant, current_api_key, another_api_key]
+    QueueItem:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [queueItemId, kind, name, addedBy]
+          properties:
+            queueItemId: { $ref: '#/components/schemas/QueueItemId' }
+            kind: { const: youtube }
+            name: { type: string, minLength: 1, maxLength: 512 }
+            title: { type: string, minLength: 1, maxLength: 512 }
+            artist: { type: string, minLength: 1, maxLength: 512 }
+            thumbnail: { type: string, minLength: 1, maxLength: 512 }
+            addedBy: { $ref: '#/components/schemas/QueueItemAddedBy' }
+            youtubeSubItemCount:
+              type: integer
+              minimum: 1
+              maximum: 5000
+              description: Present only when this aggregate has a complete server-validated YouTube manifest.
+            youtubeEntrySubIndex:
+              type: integer
+              minimum: 0
+              maximum: 4999
+              description: Zero-based canonical entry item used when play_item omits youtubeSubIndex.
+        - type: object
+          additionalProperties: false
+          required: [queueItemId, kind, name, byteLength, addedBy]
+          properties:
+            queueItemId: { $ref: '#/components/schemas/QueueItemId' }
+            kind: { const: audio }
+            name: { type: string, minLength: 1, maxLength: 512 }
+            title: { type: string, minLength: 1, maxLength: 512 }
+            artist: { type: string, minLength: 1, maxLength: 512 }
+            thumbnail: { type: string, minLength: 1, maxLength: 512 }
+            byteLength: { type: integer, minimum: 1, maximum: 209715200 }
+            addedBy: { $ref: '#/components/schemas/QueueItemAddedBy' }
+    Room:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          schemaVersion,
+          view,
+          roomCode,
+          status,
+          runtime,
+          revision,
+          participantCount,
+          controlAvailable,
+          quota,
+        ]
+      properties:
+        schemaVersion: { const: 1 }
+        view: { const: room }
+        roomCode: { type: string, pattern: '^0[0-9]{5}$' }
+        status: { enum: [unactivated, active, suspended] }
+        runtime: { enum: [awake, sleeping] }
+        revision: { type: integer, minimum: 0 }
+        participantCount: { type: integer, minimum: 0 }
+        controlAvailable:
+          type: boolean
+          description: True for an active PRO room, independent of whether its participant runtime is awake or sleeping.
+        quota:
+          $ref: '#/components/schemas/Quota'
+    Playback:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          schemaVersion,
+          view,
+          roomCode,
+          revision,
+          playlistRevision,
+          state,
+          queueItemId,
+          positionSeconds,
+          observedAtMs,
+          item,
+        ]
+      properties:
+        schemaVersion: { const: 1 }
+        view: { const: playback }
+        roomCode: { type: string, pattern: '^0[0-9]{5}$' }
+        revision: { type: integer, minimum: 0 }
+        playlistRevision: { type: integer, minimum: 0 }
+        state: { enum: [idle, playing, paused] }
+        queueItemId: { oneOf: [{ $ref: '#/components/schemas/QueueItemId' }, { type: 'null' }] }
+        positionSeconds: { type: number, minimum: 0 }
+        youtubeVideoId:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{11}$'
+          description: Present while a YouTube item is selected.
+        youtubeSubIndex:
+          type: integer
+          minimum: 0
+          maximum: 100000
+          description: Present with youtubeVideoId; zero-based within the selected YouTube aggregate.
+        observedAtMs: { type: integer, minimum: 0 }
+        item: { oneOf: [{ $ref: '#/components/schemas/QueueItem' }, { type: 'null' }] }
+    Queue:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, view, roomCode, playlistRevision, currentQueueItemId, items]
+      properties:
+        schemaVersion: { const: 1 }
+        view: { const: queue }
+        roomCode: { type: string, pattern: '^0[0-9]{5}$' }
+        playlistRevision: { type: integer, minimum: 0 }
+        currentQueueItemId:
+          { oneOf: [{ $ref: '#/components/schemas/QueueItemId' }, { type: 'null' }] }
+        items:
+          type: array
+          maxItems: 1000
+          items: { $ref: '#/components/schemas/QueueItem' }
+    Quota:
+      type: object
+      additionalProperties: false
+      required: [limitBytes, perAssetLimitBytes, usedBytes, reservedBytes]
+      properties:
+        limitBytes: { type: integer, minimum: 0 }
+        perAssetLimitBytes: { type: integer, minimum: 0 }
+        usedBytes: { type: integer, minimum: 0 }
+        reservedBytes: { type: integer, minimum: 0 }
+    YouTubeQueueItemCreate:
+      type: object
+      additionalProperties: false
+      required: [videoId, name]
+      dependentRequired:
+        videoIds: [playlistId]
+      properties:
+        videoId:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{11}$'
+          description: The independent video ID, or the entry video when playlistId creates a playlist aggregate.
+        playlistId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9_-]+$'
+          description: |
+            When present, creates one top-level YouTube playlist aggregate keyed by this ID. When omitted, this
+            request creates one independent top-level video.
+        videoIds:
+          type: array
+          minItems: 1
+          maxItems: 5000
+          items: { type: string, pattern: '^[A-Za-z0-9_-]{11}$' }
+          description: |
+            Optional complete ordered manifest for playlistId. Duplicates are significant and preserved. The array
+            must contain videoId, which identifies the requested entry point and need not be first. This field is
+            invalid when playlistId is omitted.
+        name: { type: string, minLength: 1, maxLength: 512 }
+        title: { type: string, minLength: 1, maxLength: 512 }
+        artist: { type: string, minLength: 1, maxLength: 512 }
+        thumbnail: { type: string, minLength: 1, maxLength: 512 }
+    YouTubeQueueItemBatchCreate:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: |
+            Supplied order is preserved after canonicalization. For repeated non-empty playlistId values, only the
+            first occurrence creates the top-level aggregate. Repeated manifest-less entries contribute videoId in
+            request order; repeated full manifests must be byte-for-byte identical and are preserved once. Mixed or
+            conflicting manifest forms are rejected. Entries without playlistId always remain independent.
+          items: { $ref: '#/components/schemas/YouTubeQueueItemCreate' }
+    QueueOrderReplace:
+      type: object
+      additionalProperties: false
+      required: [basePlaylistRevision, queueItemIds]
+      properties:
+        basePlaylistRevision: { type: integer, minimum: 0 }
+        queueItemIds:
+          type: array
+          maxItems: 1000
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/QueueItemId' }
+    MediaUploadCreate:
+      type: object
+      additionalProperties: false
+      required: [name, byteLength, mime]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 512 }
+        byteLength: { type: integer, minimum: 1, maximum: 209715200 }
+        mime: { type: string, minLength: 1, maxLength: 255 }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        title: { type: string, minLength: 1, maxLength: 512 }
+        artist: { type: string, minLength: 1, maxLength: 512 }
+        thumbnail: { type: string, minLength: 1, maxLength: 512 }
+    MediaUploadReservation:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          schemaVersion,
+          roomCode,
+          assetId,
+          queueItemId,
+          byteLength,
+          uploadExpiresAtMs,
+          completionExpiresAtMs,
+          upload,
+          quota,
+        ]
+      properties:
+        schemaVersion: { const: 1 }
+        roomCode: { type: string, pattern: '^0[0-9]{5}$' }
+        assetId: { type: string, minLength: 16, maxLength: 128 }
+        queueItemId: { $ref: '#/components/schemas/QueueItemId' }
+        byteLength: { type: integer, minimum: 1, maximum: 209715200 }
+        uploadExpiresAtMs:
+          type: integer
+          minimum: 0
+          description: The signed PUT must begin before this timestamp.
+        completionExpiresAtMs:
+          type: integer
+          minimum: 0
+          description: Completion may be requested through this timestamp after an in-time upload begins.
+        upload:
+          type: object
+          additionalProperties: false
+          required: [method, url, headers]
+          properties:
+            method: { const: PUT }
+            url: { type: string, format: uri }
+            headers:
+              type: object
+              additionalProperties: { type: string }
+        quota: { $ref: '#/components/schemas/Quota' }
+    ProAsset:
+      type: object
+      additionalProperties: false
+      required: [kind, assetId, version, byteLength, mime]
+      properties:
+        kind: { const: pro-r2 }
+        assetId: { type: string, minLength: 16, maxLength: 128 }
+        version: { const: 1 }
+        byteLength: { type: integer, minimum: 1, maximum: 209715200 }
+        mime: { type: string, minLength: 3, maxLength: 255 }
+        sha256:
+          type: string
+          oneOf:
+            - { pattern: '^[0-9a-f]{64}$' }
+            - { pattern: '^[A-Za-z0-9_-]{43}$' }
+    MediaUploadCompleted:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, roomCode, asset, queueItem, playlistRevision, quota]
+      properties:
+        schemaVersion: { const: 1 }
+        roomCode: { type: string, pattern: '^0[0-9]{5}$' }
+        asset: { $ref: '#/components/schemas/ProAsset' }
+        queueItem: { $ref: '#/components/schemas/QueueItem' }
+        playlistRevision: { type: integer, minimum: 0 }
+        quota: { $ref: '#/components/schemas/Quota' }
+    ApiErrorCode:
+      type: string
+      description: |
+        Stable code returned inside error.code for an immediate non-2xx HTTP response. The associated HTTP status
+        and retryable flag are part of the public contract below. Honor Retry-After for RATE_LIMITED and
+        UPLOAD_INCOMPLETE. COORDINATOR_INCOMPATIBLE and ROOM_SLEEPING remain in v1 only as legacy compatibility
+        values; current server-authoritative PRO rooms do not require a browser coordinator and accept canonical
+        playback/effect commands while sleeping. DEVELOPER_API_AUTHORITY_STALE means the room authority advanced
+        beyond this key's issuance epoch; ask the operator to issue a new key for the current room authority.
+        Repeating the request with the stale key cannot restore authority. Full remediation guidance is published at
+        https://musixquare.com/developers#errors.
+      enum:
+        - API_DISABLED
+        - API_NOT_CONFIGURED
+        - ASSET_CAPACITY_EXCEEDED
+        - BACKEND_UNAVAILABLE
+        - BROWSER_ORIGIN_FORBIDDEN
+        - COMMAND_CAPACITY_EXCEEDED
+        - COORDINATOR_INCOMPATIBLE
+        - DEVELOPER_API_AUTHORITY_STALE
+        - FORBIDDEN
+        - IDEMPOTENCY_CONFLICT
+        - IDEMPOTENCY_KEY_REQUIRED
+        - INTERNAL_RESPONSE_INVALID
+        - INVALID_REQUEST
+        - NOT_FOUND
+        - NO_MEDIA
+        - PLAYLIST_CAPACITY_EXCEEDED
+        - PLAYLIST_REVISION_CONFLICT
+        - QUEUE_MODE_REVISION_CONFLICT
+        - RATE_LIMITED
+        - RESERVATION_CAPACITY_EXCEEDED
+        - ROOM_QUOTA_EXCEEDED
+        - ROOM_SLEEPING
+        - ROOM_STATE_CAPACITY_EXCEEDED
+        - UNAUTHORIZED
+        - UPLOAD_INCOMPLETE
+        - UPLOAD_MISMATCH
+      x-legacy-values: [COORDINATOR_INCOMPATIBLE, ROOM_SLEEPING]
+      x-error-catalog:
+        API_DISABLED: { httpStatus: 503, retryable: true }
+        API_NOT_CONFIGURED: { httpStatus: 503, retryable: true }
+        ASSET_CAPACITY_EXCEEDED: { httpStatus: 409, retryable: false }
+        BACKEND_UNAVAILABLE: { httpStatus: 503, retryable: true }
+        BROWSER_ORIGIN_FORBIDDEN: { httpStatus: 403, retryable: false }
+        COMMAND_CAPACITY_EXCEEDED: { httpStatus: 409, retryable: false }
+        COORDINATOR_INCOMPATIBLE: { httpStatus: 409, retryable: false }
+        DEVELOPER_API_AUTHORITY_STALE: { httpStatus: 409, retryable: false }
+        FORBIDDEN: { httpStatus: 403, retryable: false }
+        IDEMPOTENCY_CONFLICT: { httpStatus: 409, retryable: false }
+        IDEMPOTENCY_KEY_REQUIRED: { httpStatus: 400, retryable: false }
+        INTERNAL_RESPONSE_INVALID: { httpStatus: 503, retryable: true }
+        INVALID_REQUEST: { httpStatus: 400, retryable: false }
+        NOT_FOUND: { httpStatus: 404, retryable: false }
+        NO_MEDIA: { httpStatus: 409, retryable: false }
+        PLAYLIST_CAPACITY_EXCEEDED: { httpStatus: 409, retryable: false }
+        PLAYLIST_REVISION_CONFLICT: { httpStatus: 409, retryable: false }
+        QUEUE_MODE_REVISION_CONFLICT: { httpStatus: 409, retryable: false }
+        RATE_LIMITED: { httpStatus: 429, retryable: true }
+        RESERVATION_CAPACITY_EXCEEDED: { httpStatus: 409, retryable: false }
+        ROOM_QUOTA_EXCEEDED: { httpStatus: 409, retryable: false }
+        ROOM_SLEEPING: { httpStatus: 409, retryable: false }
+        ROOM_STATE_CAPACITY_EXCEEDED: { httpStatus: 409, retryable: false }
+        UNAUTHORIZED: { httpStatus: 401, retryable: false }
+        UPLOAD_INCOMPLETE: { httpStatus: 409, retryable: true }
+        UPLOAD_MISMATCH: { httpStatus: 409, retryable: false }
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, requestId, retryable]
+          properties:
+            code: { $ref: '#/components/schemas/ApiErrorCode' }
+            message: { type: string }
+            requestId: { type: string }
+            retryable: { type: boolean }
+  responses:
+    BadRequest:
+      description: Request shape, idempotency key, or value is invalid.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: Unknown, malformed, expired, or revoked key.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Key lacks the required scope or the request came from a browser origin.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: Idempotency conflict, stale room authority or queue revision, quota conflict, or incompatible room state.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Route, room, item, or upload is unavailable to this key.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    RateLimited:
+      description: Per-key, per-room, or ingress limit exceeded.
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unavailable:
+      description: API disabled, misconfigured, or temporarily unavailable.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

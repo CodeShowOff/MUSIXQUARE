@@ -1,0 +1,22 @@
+# Keep text files on LF across contributor Git configurations.
+* text=auto eol=lf
+
+# Binary assets must not receive line-ending conversion or text diffs.
+*.ico  binary
+*.png  binary
+*.mp3  binary
+*.ttf  binary
+*.woff binary
+*.woff2 binary
+*.otf  binary
+*.eot  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.avif binary
+*.wasm binary
+*.pdf  binary
+
+# Wrangler-generated declarations are byte-checked against the generator output.
+cloudflare/types/*.generated.d.ts -whitespace

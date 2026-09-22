@@ -1,0 +1,94 @@
+name = "musixquare-pro-room"
+main = "pro-room-worker.ts"
+compatibility_date = "2026-07-16"
+workers_dev = false
+preview_urls = false
+upload_source_maps = true
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+[observability]
+enabled = true
+
+# Keep automatic request-URL events disabled across the public Worker fleet;
+# sampled application logs use explicit credential-free fields.
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.1
+invocation_logs = false
+
+[observability.traces]
+enabled = false
+
+[vars]
+R2_BUCKET_NAME = "musixquare-pro-media"
+ALLOWED_ORIGINS = "https://musixquare.com,https://www.musixquare.com,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173"
+SESSION_TTL_SECONDS = "2592000"
+PRESENCE_TTL_SECONDS = "45"
+RESERVATION_TTL_SECONDS = "900"
+ASSET_GC_GRACE_SECONDS = "900"
+PRESIGN_TTL_SECONDS = "600"
+[[durable_objects.bindings]]
+name = "PRO_ROOMS"
+class_name = "MusixquareProRoom"
+
+[[durable_objects.bindings]]
+name = "MUSIXQUARE_SERVICE_CONTROL"
+class_name = "MusixquareServiceControl"
+
+[[durable_objects.bindings]]
+name = "PRO_SIGNALING_ROOMS"
+class_name = "MusixquareRoom"
+script_name = "musixquare-signaling"
+
+[[durable_objects.bindings]]
+name = "DEVELOPER_API_LIMITERS"
+class_name = "DeveloperApiRateLimiter"
+script_name = "musixquare-developer-api"
+
+[[r2_buckets]]
+binding = "PRO_MEDIA_BUCKET"
+bucket_name = "musixquare-pro-media"
+
+# Shared with the admin Worker for the bounded front-door registry and the
+# permanent-deletion completion tombstone.
+[[d1_databases]]
+binding = "MUSIXQUARE_ADMIN_DB"
+database_name = "musixquare-admin-metrics"
+database_id = "d6cc9ceb-f0b6-40e4-99aa-8f28bec412ed"
+
+[[d1_databases]]
+binding = "DEVELOPER_API_DB"
+database_name = "musixquare-developer-api"
+database_id = "237d63d2-6eea-4b01-b396-7784b5b8b6f0"
+
+# Exact account-to-incarnation reverse edges are retired by the room Durable
+# Object before it publishes decommission completion.
+[[d1_databases]]
+binding = "MUSIXQUARE_AUTH_DB"
+database_name = "musixquare-auth"
+database_id = "a1284975-2dac-4dbb-b1cb-ff60375833ae"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MusixquareProRoom"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["MusixquareServiceControl"]
+
+# Required secrets (never commit their values):
+# The first six values below are random HMAC/signing/pepper secrets of at least
+# 32 characters. Share only the two explicitly named cross-Worker pairs.
+# npm run wrangler -- secret put PRO_ROOM_ACTIVATION_SECRET --config cloudflare/wrangler.pro-room.toml
+# npm run wrangler -- secret put PRO_ROOM_PIN_PEPPER --config cloudflare/wrangler.pro-room.toml
+# npm run wrangler -- secret put PRO_ROOM_SESSION_SECRET --config cloudflare/wrangler.pro-room.toml
+# npm run wrangler -- secret put PRO_SIGNALING_SECRET --config cloudflare/wrangler.pro-room.toml
+# npm run wrangler -- secret put PRO_ROOM_RATE_LIMIT_SECRET --config cloudflare/wrangler.pro-room.toml
+# npm run wrangler -- secret put MXQR_PRO_ROOM_ACCOUNT_ASSERTION_SECRET --config cloudflare/wrangler.pro-room.toml
+# npm run wrangler -- secret put R2_ACCOUNT_ID --config cloudflare/wrangler.pro-room.toml
+# npm run wrangler -- secret put R2_ACCESS_KEY_ID --config cloudflare/wrangler.pro-room.toml
+# npm run wrangler -- secret put R2_SECRET_ACCESS_KEY --config cloudflare/wrangler.pro-room.toml
+# Apply the private bucket's explicit browser CORS policy before deployment:
+# npm run wrangler -- r2 bucket cors set musixquare-pro-media --file cloudflare/r2-cors.pro-media.json --config cloudflare/wrangler.pro-room.toml

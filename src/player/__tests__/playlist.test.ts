@@ -1,0 +1,3351 @@
+/**
+ * @vitest-environment jsdom
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { resetState, getState, setState } from '../../core/state.ts';
+import { bus } from '../../core/events.ts';
+import { log } from '../../core/log.ts';
+import * as audioContext from '../../audio/context.ts';
+import * as audioEngine from '../../audio/engine.ts';
+import { MSG, PLAYBACK_STATE } from '../../core/constants.ts';
+import { clearAllManagedTimers, getManagedTimer } from '../../core/timers.ts';
+import { handleData } from '../../network/protocol.ts';
+import {
+  consumePendingAutoSyncOnReady,
+  getPendingAutoSyncOnReadyForTests as getPendingAutoSyncOnReady,
+  setPendingAutoSyncOnReady,
+  stopYouTubeMode,
+} from '../../youtube/player.ts';
+import * as youtubeIframe from '../../youtube/iframe.ts';
+import { markYtPlayerReady, setYouTubePlayer } from '../../youtube/_state.ts';
+import { setPlaybackTrackMeta, setPlaybackYouTubePlaying } from '../ownership.ts';
+import {
+  applyPlaylistQueueModeState,
+  capturePlaylistQueueModeState,
+  setRepeatMode,
+  setShuffle,
+  toggleRepeat,
+  toggleShuffle,
+  getShuffleNextPlayableQueueItemId,
+  advanceToShuffleNextQueueItemId,
+  advanceToShufflePreviousQueueItemId,
+  clearPreloadState,
+  initPlaylist,
+  playNextTrack,
+  playPrevTrack,
+  playTrack,
+  reconcileShuffleOrderForCurrentPlaylist,
+} from '../playlist.ts';
+import { broadcastFileDebounced } from '../../storage/transfer.ts';
+import {
+  getCurrentAudioBuffer,
+  getCurrentLoadEpoch,
+  newLoadEpoch,
+  setCurrentAudioBuffer,
+} from '../_state.ts';
+import { initDecodeHandlers } from '../decode.ts';
+import type {
+  ConnectedPeer,
+  DataConnection,
+  PlaylistItem,
+  PlaylistWireItem,
+  QueueItemId,
+  ResidentFile,
+} from '../../types/index.ts';
+import { findQueueItemIndex } from '../queue-model.ts';
+import { t } from '../../i18n/index.ts';
+import * as transport from '../transport.ts';
+import { transition } from '../lifecycle.ts';
+import { hasQueueAuthority } from '../../network/queue-authority.ts';
+import { registerProRoomMediaHooks, type ProRoomMediaHooks } from '../../pro-room/media-hooks.ts';
+import { ProRoomAssetCache } from '../../pro-room/media-cache.ts';
+import { PRO_ROOM_MAX_ASSET_BYTES } from '../../pro-room/contracts.ts';
+import {
+  cancelProPlaybackPreparation,
+  createProPlaybackAuthorityToken,
+  prepareProPlaybackAuthority,
+  registerProPlaybackCommandHandler,
+  registerProPlaybackMediaEndpoint,
+  resetProPlaybackAuthorityHooks,
+} from '../../pro-room/playback-authority-hooks.ts';
+
+const decodeMocks = vi.hoisted(() => ({
+  loadPreloadedTrack: vi.fn<(queueItemId: QueueItemId, epoch?: number) => Promise<boolean>>(),
+  loadAndBroadcastFile: vi.fn(),
+}));
+const standardHostManualOffsetFacade = vi.hoisted(() => {
+  const facade = {
+    pending: false,
+    listeners: [] as Array<() => void>,
+    settle() {
+      facade.pending = false;
+      const listeners = facade.listeners.splice(0);
+      for (const listener of listeners) listener();
+    },
+  };
+  return facade;
+});
+
+vi.mock('../../youtube/standard-host-manual-offset-gate.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../youtube/standard-host-manual-offset-gate.ts')>()),
+  isStandardHostManualOffsetTransactionPending: vi.fn(() => standardHostManualOffsetFacade.pending),
+  afterStandardHostManualOffsetTransaction: vi.fn((listener: () => void) => {
+    if (!standardHostManualOffsetFacade.pending) return false;
+    standardHostManualOffsetFacade.listeners.push(listener);
+    return true;
+  }),
+}));
+
+vi.mock('../decode.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../decode.ts')>();
+  return {
+    ...actual,
+    loadPreloadedTrack: decodeMocks.loadPreloadedTrack,
+    loadAndBroadcastFile: decodeMocks.loadAndBroadcastFile,
+  };
+});
+
+beforeEach(() => {
+  vi.restoreAllMocks();
+  decodeMocks.loadPreloadedTrack.mockReset();
+  decodeMocks.loadPreloadedTrack.mockResolvedValue(false);
+  decodeMocks.loadAndBroadcastFile.mockReset();
+  standardHostManualOffsetFacade.pending = false;
+  standardHostManualOffsetFacade.listeners.length = 0;
+  resetState();
+  bus.clear();
+  setPendingAutoSyncOnReady(false);
+  registerProRoomMediaHooks(null);
+  registerProPlaybackCommandHandler(null);
+  registerProPlaybackMediaEndpoint(null);
+  resetProPlaybackAuthorityHooks();
+  setYouTubePlayer(null);
+});
+
+afterEach(() => {
+  setYouTubePlayer(null);
+  registerProRoomMediaHooks(null);
+  registerProPlaybackCommandHandler(null);
+  registerProPlaybackMediaEndpoint(null);
+  resetProPlaybackAuthorityHooks();
+  clearAllManagedTimers();
+  vi.useRealTimers();
+});
+
+function proMediaHooks(overrides: Partial<ProRoomMediaHooks> = {}): ProRoomMediaHooks {
+  return {
+    addFiles: () => false,
+    addYouTube: () => false,
+    updateTrackMetadata: () => false,
+    removeTracks: () => false,
+    reorderTrack: () => false,
+    resolveFile: () => null,
+    ...overrides,
+  };
+}
+
+function enterProRoom(
+  capabilities: Array<'asset.upload' | 'queue.mutate' | 'playback.control'>,
+  role: 'member' | 'coordinator' = 'member',
+): void {
+  setState('room.context', {
+    kind: 'pro',
+    roomId: '000001',
+    role,
+    coordinatorId: 'coordinator-1',
+    epoch: 1,
+    snapshotRevision: 1,
+    capabilities,
+  });
+}
+
+function makeConnection(peer: string): DataConnection {
+  return { peer } as DataConnection;
+}
+
+function makeConnectedPeer(id: string, isOp: boolean): ConnectedPeer {
+  return {
+    id,
+    slot: 0,
+    label: id,
+    conn: null,
+    isOp,
+    preloadedQueueItemIds: new Set<QueueItemId>(),
+    status: 'connected',
+    isDataTarget: true,
+    joinOrder: 0,
+    connectionType: 'unknown',
+    lastHeartbeat: 0,
+  };
+}
+
+function mountToastMessage(): HTMLElement {
+  document.body.innerHTML = '<div id="toast"><span id="toast-msg"></span></div>';
+  return document.getElementById('toast-msg') as HTMLElement;
+}
+
+let nextQueueItemIdValue = 1;
+function nextQueueItemId(): QueueItemId {
+  const suffix = String(nextQueueItemIdValue++).padStart(12, '0');
+  return `10000000-0000-4000-8000-${suffix}`;
+}
+
+function fileItem(name: string, file?: File): PlaylistItem {
+  return {
+    queueItemId: nextQueueItemId(),
+    type: 'file',
+    name,
+    ...(file ? { file } : {}),
+    videoId: null,
+    playlistId: null,
+  };
+}
+
+function wireItem(item: PlaylistItem): PlaylistWireItem {
+  return {
+    queueItemId: item.queueItemId,
+    type: item.type,
+    name: item.name,
+    ...(item.title === undefined ? {} : { title: item.title }),
+    ...(item.artist === undefined ? {} : { artist: item.artist }),
+    ...(item.thumbnail === undefined ? {} : { thumbnail: item.thumbnail }),
+    videoId: item.videoId,
+    playlistId: item.playlistId,
+  };
+}
+
+function youtubeItem(
+  name: string,
+  videoId: string,
+  playlistId: string | null = null,
+): PlaylistItem {
+  return {
+    queueItemId: nextQueueItemId(),
+    type: 'youtube',
+    name,
+    videoId,
+    playlistId,
+  };
+}
+
+function selectIndex(index: number): QueueItemId | null {
+  const queueItemId = getState('playlist.items')[index]?.queueItemId ?? null;
+  setState('playlist.currentQueueItemId', queueItemId);
+  return queueItemId;
+}
+
+function currentIndex(): number {
+  return findQueueItemIndex(getState('playlist.currentQueueItemId'));
+}
+
+function residentFor(item: PlaylistItem, blob: Blob, sessionId = 7): ResidentFile {
+  return {
+    queueItemId: item.queueItemId,
+    indexHint: findQueueItemIndex(item.queueItemId),
+    name: item.name,
+    sessionId,
+    blob,
+    mime: blob.type || 'audio/mpeg',
+    size: blob.size,
+  };
+}
+
+describe('coordinator-free PRO playback routing', () => {
+  it('routes a queue occurrence selection without mutating local playback first', async () => {
+    const item = youtubeItem('Server-owned selection', 'dQw4w9WgXcQ');
+    setState('playlist.items', [item]);
+    enterProRoom(['playback.control']);
+    const handler = vi.fn();
+    registerProPlaybackCommandHandler(handler);
+
+    await playTrack(item.queueItemId);
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'select',
+        queueItemId: item.queueItemId,
+        youtubeSubIndex: 0,
+        youtubeVideoId: 'dQw4w9WgXcQ',
+      }),
+    );
+    expect(getState('playlist.currentQueueItemId')).toBeNull();
+    expect(decodeMocks.loadAndBroadcastFile).not.toHaveBeenCalled();
+  });
+
+  it('routes a PRO playlist row from its stored selected manifest video', async () => {
+    const item = youtubeItem('Server-owned playlist', 'secondVideo', 'playlist-pro');
+    setState('playlist.items', [item]);
+    setState('youtube.subItemsMap', {
+      'playlist-pro': {
+        ids: ['firstVideo', 'secondVideo'],
+        titles: ['First', 'Second'],
+        manifestComplete: true,
+      },
+    });
+    enterProRoom(['playback.control']);
+    const handler = vi.fn();
+    registerProPlaybackCommandHandler(handler);
+
+    await playTrack(item.queueItemId);
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'select',
+        queueItemId: item.queueItemId,
+        youtubeSubIndex: 1,
+        youtubeVideoId: 'secondVideo',
+      }),
+    );
+  });
+
+  it('reuses the exact resident YouTube video during server preparation', async () => {
+    const item = youtubeItem('Resident video', 'RESIDENT_VIDEO_01');
+    setState('playlist.items', [item]);
+    selectIndex(0);
+    setPlaybackYouTubePlaying();
+    enterProRoom(['playback.control']);
+    const player = {
+      getVideoData: () => ({ video_id: 'RESIDENT_VIDEO_01' }),
+    };
+    setYouTubePlayer(player as never);
+    markYtPlayerReady(player as never);
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+    vi.spyOn(youtubeIframe, 'prepareYouTubeAuthorityOccurrence').mockResolvedValue({
+      ready: true,
+      durationSeconds: 120,
+      videoId: 'RESIDENT_VIDEO_01',
+      subIndex: 0,
+    });
+    initPlaylist();
+    const authority = createProPlaybackAuthorityToken({
+      roomId: '000001',
+      roomEpoch: 1,
+      basePlaybackRevision: 4,
+      transitionId: 'resident-resume',
+    });
+
+    await expect(
+      prepareProPlaybackAuthority({
+        authority,
+        queueItemId: item.queueItemId,
+        positionSeconds: 42,
+        youtubeSubIndex: 0,
+        youtubeVideoId: 'RESIDENT_VIDEO_01',
+      }),
+    ).resolves.toMatchObject({ status: 'ready', mediaKind: 'youtube' });
+
+    expect(load).not.toHaveBeenCalled();
+    expect(youtubeIframe.prepareYouTubeAuthorityOccurrence).toHaveBeenCalledWith({
+      authorityKey: expect.any(String),
+      queueItemId: item.queueItemId,
+      videoId: 'RESIDENT_VIDEO_01',
+      subIndex: 0,
+      positionSeconds: 42,
+    });
+  });
+
+  it('loads a different YouTube identity exactly once during server preparation', async () => {
+    const previous = youtubeItem('Previous video', 'PREVIOUS_VIDEO_01');
+    const next = youtubeItem('Next video', 'NEXT_VIDEO_01');
+    setState('playlist.items', [previous, next]);
+    selectIndex(0);
+    setPlaybackYouTubePlaying();
+    enterProRoom(['playback.control']);
+    const player = {
+      getVideoData: () => ({ video_id: 'PREVIOUS_VIDEO_01' }),
+    };
+    setYouTubePlayer(player as never);
+    markYtPlayerReady(player as never);
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+    vi.spyOn(youtubeIframe, 'prepareYouTubeAuthorityOccurrence').mockResolvedValue({
+      ready: true,
+      durationSeconds: 120,
+      videoId: 'NEXT_VIDEO_01',
+      subIndex: 0,
+    });
+    initPlaylist();
+    const authority = createProPlaybackAuthorityToken({
+      roomId: '000001',
+      roomEpoch: 1,
+      basePlaybackRevision: 5,
+      transitionId: 'different-video',
+    });
+
+    await expect(
+      prepareProPlaybackAuthority({
+        authority,
+        queueItemId: next.queueItemId,
+        positionSeconds: 0,
+        youtubeSubIndex: 0,
+        youtubeVideoId: 'NEXT_VIDEO_01',
+      }),
+    ).resolves.toMatchObject({ status: 'ready', mediaKind: 'youtube' });
+
+    expect(load).toHaveBeenCalledOnce();
+    expect(load).toHaveBeenCalledWith('NEXT_VIDEO_01', null, next.queueItemId, false, 0);
+  });
+
+  it('does not let an older YouTube PREPARE resume after a newer authority wins the prime wait', async () => {
+    const first = youtubeItem('First video', 'FIRST_VIDEO_01');
+    const second = youtubeItem('Second video', 'SECOND_VIDEO_01');
+    setState('playlist.items', [first, second]);
+    enterProRoom(['playback.control']);
+    let releaseFirstPrime!: (primed: boolean) => void;
+    const firstPrime = new Promise<boolean>((resolve) => {
+      releaseFirstPrime = resolve;
+    });
+    vi.spyOn(youtubeIframe, 'waitForPendingYouTubePrimeBounce')
+      .mockReturnValueOnce(firstPrime)
+      .mockResolvedValueOnce(true);
+    vi.spyOn(youtubeIframe, 'prepareYouTubeAuthorityOccurrence').mockResolvedValue({
+      ready: true,
+      durationSeconds: 120,
+      videoId: 'SECOND_VIDEO_01',
+      subIndex: 0,
+    });
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+    initPlaylist();
+    const firstAuthority = createProPlaybackAuthorityToken({
+      roomId: '000001',
+      roomEpoch: 1,
+      basePlaybackRevision: 10,
+      transitionId: 'first-prime-wait',
+    });
+    const secondAuthority = createProPlaybackAuthorityToken({
+      roomId: '000001',
+      roomEpoch: 1,
+      basePlaybackRevision: 11,
+      transitionId: 'second-prime-wait',
+    });
+
+    const stalePreparation = prepareProPlaybackAuthority({
+      authority: firstAuthority,
+      queueItemId: first.queueItemId,
+      positionSeconds: 0,
+      youtubeVideoId: 'FIRST_VIDEO_01',
+    });
+    await vi.waitFor(() =>
+      expect(youtubeIframe.waitForPendingYouTubePrimeBounce).toHaveBeenCalledTimes(1),
+    );
+    await expect(
+      prepareProPlaybackAuthority({
+        authority: secondAuthority,
+        queueItemId: second.queueItemId,
+        positionSeconds: 0,
+        youtubeVideoId: 'SECOND_VIDEO_01',
+      }),
+    ).resolves.toMatchObject({ status: 'ready', queueItemId: second.queueItemId });
+
+    releaseFirstPrime(true);
+    await expect(stalePreparation).resolves.toMatchObject({
+      status: 'superseded',
+      queueItemId: first.queueItemId,
+      reason: 'superseded',
+    });
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(load).toHaveBeenCalledWith('SECOND_VIDEO_01', null, second.queueItemId, false, 0);
+    expect(getState('playlist.currentQueueItemId')).toBe(second.queueItemId);
+  });
+
+  it('does not let a cancelled YouTube PREPARE touch the iframe when its prime wait resolves', async () => {
+    const item = youtubeItem('Cancelled video', 'CANCELLED_VIDEO_01');
+    setState('playlist.items', [item]);
+    enterProRoom(['playback.control']);
+    let releasePrime!: (primed: boolean) => void;
+    const pendingPrime = new Promise<boolean>((resolve) => {
+      releasePrime = resolve;
+    });
+    vi.spyOn(youtubeIframe, 'waitForPendingYouTubePrimeBounce').mockReturnValue(pendingPrime);
+    const prepareOccurrence = vi.spyOn(youtubeIframe, 'prepareYouTubeAuthorityOccurrence');
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+    initPlaylist();
+    const authority = createProPlaybackAuthorityToken({
+      roomId: '000001',
+      roomEpoch: 1,
+      basePlaybackRevision: 12,
+      transitionId: 'cancelled-prime-wait',
+    });
+
+    const preparation = prepareProPlaybackAuthority({
+      authority,
+      queueItemId: item.queueItemId,
+      positionSeconds: 0,
+      youtubeVideoId: 'CANCELLED_VIDEO_01',
+    });
+    await vi.waitFor(() =>
+      expect(youtubeIframe.waitForPendingYouTubePrimeBounce).toHaveBeenCalledOnce(),
+    );
+    expect(cancelProPlaybackPreparation(authority)).toBe(true);
+
+    releasePrime(true);
+    await expect(preparation).resolves.toMatchObject({
+      status: 'superseded',
+      queueItemId: item.queueItemId,
+      reason: 'superseded',
+    });
+    expect(load).not.toHaveBeenCalled();
+    expect(prepareOccurrence).not.toHaveBeenCalled();
+    expect(getState('playlist.currentQueueItemId')).toBeNull();
+  });
+});
+
+describe('server preparation native decode lifetime', () => {
+  it.each(['ready', 'failed'] as const)(
+    'keeps a current PRO native decode %s result and its own cleanup',
+    async (status) => {
+      const actualDecode = await vi.importActual<typeof import('../decode.ts')>('../decode.ts');
+      decodeMocks.loadAndBroadcastFile.mockImplementation(actualDecode.loadAndBroadcastFile);
+      vi.spyOn(audioEngine, 'initAudio').mockResolvedValue();
+      const buffer = { duration: 120 } as AudioBuffer;
+      const decodeAudioData = vi.fn();
+      if (status === 'ready') decodeAudioData.mockResolvedValue(buffer);
+      else decodeAudioData.mockRejectedValue(new Error('Unsupported current codec'));
+      vi.spyOn(audioContext, 'getAudioContext').mockReturnValue({
+        state: 'running',
+        currentTime: 100,
+        sampleRate: 48_000,
+        decodeAudioData,
+      } as unknown as AudioContext);
+      const item = fileItem(
+        'current-pro.mp3',
+        new File(['a'], 'current-pro.mp3', { type: 'audio/mpeg' }),
+      );
+      const next = fileItem('following-pro.mp3');
+      setCurrentAudioBuffer(null);
+      setState('playlist.items', [item, next]);
+      enterProRoom(['playback.control']);
+      initPlaylist();
+      const authority = createProPlaybackAuthorityToken({
+        roomId: '000001',
+        roomEpoch: 1,
+        basePlaybackRevision: 1,
+        transitionId: 'current-native',
+      });
+      await expect(
+        prepareProPlaybackAuthority({
+          authority,
+          queueItemId: item.queueItemId,
+          positionSeconds: 0,
+        }),
+      ).resolves.toMatchObject({ status, queueItemId: item.queueItemId });
+      expect(decodeAudioData).toHaveBeenCalledOnce();
+      expect(getManagedTimer('decode-fail-advance')).toBeNull();
+      expect(getState('playlist.currentQueueItemId')).toBe(item.queueItemId);
+      if (status === 'ready') {
+        expect(getCurrentAudioBuffer()).toBe(buffer);
+        expect(getState('files.current')?.queueItemId).toBe(item.queueItemId);
+      }
+    },
+  );
+
+  it.each(['resolve', 'reject'] as const)(
+    'keeps the successor Standard decode recovery when the cancelled PRO decoder later %s',
+    async (settlement) => {
+      vi.useFakeTimers();
+      const actualDecode = await vi.importActual<typeof import('../decode.ts')>('../decode.ts');
+      decodeMocks.loadAndBroadcastFile.mockImplementation(actualDecode.loadAndBroadcastFile);
+      vi.spyOn(audioEngine, 'initAudio').mockResolvedValue();
+      let resolveOld!: (buffer: AudioBuffer) => void;
+      let rejectOld!: (error: Error) => void;
+      const oldNativeDecode = new Promise<AudioBuffer>((resolve, reject) => {
+        resolveOld = resolve;
+        rejectOld = reject;
+      });
+      const decodeAudioData = vi
+        .fn()
+        .mockReturnValueOnce(oldNativeDecode)
+        .mockRejectedValueOnce(new Error('Unsupported successor codec'))
+        .mockResolvedValue({ duration: 120 } as AudioBuffer);
+      vi.spyOn(audioContext, 'getAudioContext').mockReturnValue({
+        state: 'running',
+        currentTime: 100,
+        sampleRate: 48_000,
+        decodeAudioData,
+      } as unknown as AudioContext);
+      const first = fileItem('old-pro.mp3', new File(['a'], 'old-pro.mp3', { type: 'audio/mpeg' }));
+      const failed = fileItem(
+        'failed-standard.mp3',
+        new File(['b'], 'failed-standard.mp3', { type: 'audio/mpeg' }),
+      );
+      const successor = fileItem(
+        'next-standard.mp3',
+        new File(['c'], 'next-standard.mp3', { type: 'audio/mpeg' }),
+      );
+      setCurrentAudioBuffer(null);
+      setState('playlist.items', [first]);
+      enterProRoom(['playback.control']);
+      initPlaylist();
+      const authority = createProPlaybackAuthorityToken({
+        roomId: '000001',
+        roomEpoch: 1,
+        basePlaybackRevision: 1,
+        transitionId: 'native-wait',
+      });
+      const oldPreparation = prepareProPlaybackAuthority({
+        authority,
+        queueItemId: first.queueItemId,
+        positionSeconds: 0,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(decodeAudioData).toHaveBeenCalledTimes(1);
+
+      // Room teardown invalidates the PRO preparation but cannot abort the
+      // browser's decodeAudioData promise. A new Standard host can load files.
+      expect(cancelProPlaybackPreparation(authority)).toBe(true);
+      resetState();
+      setState('network.appRole', 'host');
+      setState('setup.sessionStarted', true);
+      setState('playlist.items', [failed, successor]);
+      await playTrack(failed.queueItemId);
+      expect(decodeAudioData).toHaveBeenCalledTimes(2);
+      const recovery = getManagedTimer('decode-fail-advance');
+      expect(recovery).toBeTruthy();
+
+      if (settlement === 'resolve') resolveOld({ duration: 120 } as AudioBuffer);
+      else rejectOld(new Error('Old native decode failed'));
+      await expect(oldPreparation).resolves.toMatchObject({ status: 'superseded' });
+      expect(getManagedTimer('decode-fail-advance')).toBe(recovery);
+      await vi.advanceTimersByTimeAsync(601);
+      expect(getState('playlist.currentQueueItemId')).toBe(successor.queueItemId);
+      expect(decodeAudioData).toHaveBeenCalledTimes(3);
+    },
+  );
+});
+
+describe('setRepeatMode', () => {
+  it('sets repeat mode 0 (off)', () => {
+    setRepeatMode(0, false);
+    expect(getState('playlist.repeatMode')).toBe(0);
+  });
+
+  it('sets repeat mode 1 (all)', () => {
+    setRepeatMode(1, false);
+    expect(getState('playlist.repeatMode')).toBe(1);
+  });
+
+  it('sets repeat mode 2 (one)', () => {
+    setRepeatMode(2, false);
+    expect(getState('playlist.repeatMode')).toBe(2);
+  });
+
+  it('keeps visual repeat variants under one pressed-state contract', () => {
+    document.body.innerHTML = '<button id="btn-repeat"></button>';
+    const button = document.getElementById('btn-repeat')!;
+
+    setRepeatMode(1, false);
+    expect(button.getAttribute('aria-pressed')).toBe('true');
+    expect(button.classList).toContain('active');
+    expect(button.classList).not.toContain('active-one');
+
+    setRepeatMode(2, false);
+    expect(button.getAttribute('aria-pressed')).toBe('true');
+    expect(button.classList).not.toContain('active');
+    expect(button.classList).toContain('active-one');
+
+    setRepeatMode(0, false);
+    expect(button.getAttribute('aria-pressed')).toBe('false');
+    expect(button.classList).not.toContain('active-one');
+  });
+});
+
+describe('setShuffle', () => {
+  it('enables shuffle', () => {
+    setShuffle(true, false);
+    expect(getState('playlist.isShuffle')).toBe(true);
+  });
+
+  it('disables shuffle', () => {
+    setShuffle(false, false);
+    expect(getState('playlist.isShuffle')).toBe(false);
+  });
+
+  it('mirrors shuffle state to aria-pressed', () => {
+    document.body.innerHTML = '<button id="btn-shuffle"></button>';
+    const button = document.getElementById('btn-shuffle')!;
+
+    setShuffle(true, false);
+    expect(button.getAttribute('aria-pressed')).toBe('true');
+    expect(button.classList).toContain('active');
+
+    setShuffle(false, false);
+    expect(button.getAttribute('aria-pressed')).toBe('false');
+    expect(button.classList).not.toContain('active');
+  });
+});
+
+describe('media-manager queue mode', () => {
+  it('lets queue.mutate toggle repeat and shuffle without playback.control', () => {
+    enterProRoom(['queue.mutate']);
+    setState('playlist.repeatMode', 0);
+    setState('playlist.isShuffle', false);
+
+    toggleRepeat();
+    toggleShuffle();
+
+    expect(getState('playlist.repeatMode')).toBe(1);
+    expect(getState('playlist.isShuffle')).toBe(true);
+  });
+});
+
+describe('playlist navigation context', () => {
+  it('keeps the current queue identity immutable while a Standard-host edit is pending', async () => {
+    const first = fileItem('first.mp3');
+    const second = fileItem('second.mp3');
+    setState('playlist.items', [first, second]);
+    setState('playlist.currentQueueItemId', first.queueItemId);
+    standardHostManualOffsetFacade.pending = true;
+    initPlaylist();
+
+    playNextTrack();
+    await playTrack(second.queueItemId);
+    bus.emit('playlist:remove-tracks', [first.queueItemId]);
+
+    expect(getState('playlist.currentQueueItemId')).toBe(first.queueItemId);
+    expect(getState('playlist.items').map((item) => item.queueItemId)).toEqual([
+      first.queueItemId,
+      second.queueItemId,
+    ]);
+  });
+
+  it('replays one natural next intent exactly once after the Standard-host edit settles', async () => {
+    vi.useFakeTimers();
+    const first = youtubeItem('First video', 'FIRST_VIDEO_01');
+    const second = youtubeItem('Second video', 'SECOND_VIDEO_02');
+    setState('network.appRole', 'host');
+    setState('playlist.items', [first, second]);
+    setState('playlist.currentQueueItemId', first.queueItemId);
+    setState('youtube.currentSubIndex', 0);
+    setPlaybackYouTubePlaying();
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+    bus.on('youtube:try-next-internal', (done: (success: boolean) => void) => done(false));
+    initPlaylist();
+
+    standardHostManualOffsetFacade.pending = true;
+    bus.emit('playlist:next-track');
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(getState('playlist.currentQueueItemId')).toBe(first.queueItemId);
+    expect(load).not.toHaveBeenCalled();
+
+    standardHostManualOffsetFacade.settle();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(getState('playlist.currentQueueItemId')).toBe(second.queueItemId);
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(load).toHaveBeenCalledWith('SECOND_VIDEO_02', null, second.queueItemId, false, 0);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps only the latest deferred selection and drops it if the source identity changes', async () => {
+    vi.useFakeTimers();
+    const first = youtubeItem('First video', 'FIRST_VIDEO_01');
+    const second = youtubeItem('Second video', 'SECOND_VIDEO_02');
+    const third = youtubeItem('Third video', 'THIRD_VIDEO_03');
+    setState('network.appRole', 'host');
+    setState('playlist.items', [first, second, third]);
+    setState('playlist.currentQueueItemId', first.queueItemId);
+    setState('youtube.currentSubIndex', 0);
+    setPlaybackYouTubePlaying();
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+
+    standardHostManualOffsetFacade.pending = true;
+    await playTrack(second.queueItemId);
+    await playTrack(third.queueItemId);
+    standardHostManualOffsetFacade.settle();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(getState('playlist.currentQueueItemId')).toBe(third.queueItemId);
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(load).toHaveBeenCalledWith('THIRD_VIDEO_03', null, third.queueItemId, false, 0);
+
+    standardHostManualOffsetFacade.pending = true;
+    await playTrack(second.queueItemId);
+    setState('youtube.currentSubIndex', 1);
+    standardHostManualOffsetFacade.settle();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(getState('playlist.currentQueueItemId')).toBe(third.queueItemId);
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not force a Play-tab switch when advancing to the next track', () => {
+    const first = fileItem('first.mp3');
+    const second = fileItem('second.mp3');
+    setState('playlist.items', [first, second]);
+    setState('playlist.currentQueueItemId', first.queueItemId);
+    const switchTab = vi.fn();
+    bus.on('ui:switch-tab', switchTab);
+
+    playNextTrack();
+
+    expect(switchTab).not.toHaveBeenCalled();
+  });
+});
+
+describe('local file admission', () => {
+  it('rejects unsupported files that bypass the native picker hint', async () => {
+    initPlaylist();
+    const toastMessage = mountToastMessage();
+
+    bus.emit('app:files-selected', [
+      new File(['p'], 'document.pdf', { type: 'application/pdf' }),
+      new File(['i'], 'cover.png', { type: 'image/png' }),
+    ]);
+
+    await vi.waitFor(() => expect(getState('playlist.items')).toHaveLength(0));
+    expect(toastMessage.innerText).toBe(t('toast.no_supported_audio_files'));
+  });
+
+  it('adds only audio candidates from a mixed selection', async () => {
+    setState('network.appRole', 'host');
+    setState('network.myDeviceLabel', 'Studio Host');
+    initPlaylist();
+    const toastMessage = mountToastMessage();
+    const systemMessages: string[] = [];
+    bus.on('chat:system-message', (text) => systemMessages.push(text));
+    const declaredAudio = new File(['a'], 'track.unknown', { type: 'audio/opus' });
+    const extensionFallback = new File(['b'], 'archive.caf', {
+      type: 'application/octet-stream',
+    });
+
+    bus.emit('app:files-selected', [
+      declaredAudio,
+      new File(['p'], 'document.pdf', { type: 'application/pdf' }),
+      extensionFallback,
+    ]);
+
+    await vi.waitFor(() => {
+      expect(getState('playlist.items').map((item) => item.file)).toEqual([
+        declaredAudio,
+        extensionFallback,
+      ]);
+    });
+    expect(toastMessage.innerText).toBe(
+      `${t('toast.added_tracks', { count: 2 })}\n${t('toast.unsupported_files_excluded', {
+        count: 1,
+      })}`,
+    );
+    expect(systemMessages).toEqual([
+      t('chat.tracks_added_named', {
+        name: 'Studio Host',
+        count: 2,
+        title: 'track.unknown',
+      }),
+    ]);
+  });
+
+  it('delegates filtered PRO uploads without mutating the legacy queue', async () => {
+    const addFiles = vi.fn(() => true);
+    registerProRoomMediaHooks(proMediaHooks({ addFiles }));
+    enterProRoom(['asset.upload', 'queue.mutate']);
+    setState('network.hostConn', null);
+    initPlaylist();
+
+    const audio = new File(['a'], 'track.flac', { type: 'audio/flac' });
+    bus.emit('app:files-selected', [audio, new File(['x'], 'cover.png', { type: 'image/png' })]);
+
+    await vi.waitFor(() => expect(addFiles).toHaveBeenCalledWith([audio], 1));
+    expect(getState('playlist.items')).toEqual([]);
+  });
+
+  it('fails closed when a PRO file selection outlives media-management authority', async () => {
+    const addFiles = vi.fn(() => true);
+    registerProRoomMediaHooks(proMediaHooks({ addFiles }));
+    enterProRoom([]);
+    setState('network.hostConn', null);
+    initPlaylist();
+    const toastMessage = mountToastMessage();
+
+    bus.emit('app:files-selected', [new File(['a'], 'track.flac', { type: 'audio/flac' })]);
+
+    await vi.waitFor(() => {
+      expect(toastMessage.innerText).toBe(t('toast.media_management_required'));
+    });
+    expect(addFiles).not.toHaveBeenCalled();
+    expect(getState('playlist.items')).toEqual([]);
+  });
+
+  it('fails closed when the PRO upload bridge is unavailable', async () => {
+    const addFiles = vi.fn(() => false);
+    registerProRoomMediaHooks(proMediaHooks({ addFiles }));
+    enterProRoom(['asset.upload']);
+    setState('network.hostConn', null);
+    initPlaylist();
+    const toastMessage = mountToastMessage();
+    const audio = new File(['a'], 'track.flac', { type: 'audio/flac' });
+
+    bus.emit('app:files-selected', [audio]);
+
+    await vi.waitFor(() => expect(addFiles).toHaveBeenCalledWith([audio], 0));
+    expect(getState('playlist.items')).toEqual([]);
+    expect(toastMessage.innerText).toBe(t('error.network_generic'));
+  });
+});
+
+describe('PRO playlist mutation bridge', () => {
+  it('delegates removal and reorder without applying local legacy revisions', () => {
+    const removeTracks = vi.fn(() => true);
+    const reorderTrack = vi.fn(() => true);
+    registerProRoomMediaHooks(proMediaHooks({ removeTracks, reorderTrack }));
+    enterProRoom(['queue.mutate']);
+    setState('network.hostConn', null);
+    const a = fileItem('a.flac');
+    const b = fileItem('b.flac');
+    setState('playlist.items', [a, b]);
+    setState('playlist.revision', 7);
+    initPlaylist();
+
+    bus.emit('playlist:remove-tracks', [a.queueItemId]);
+    bus.emit('playlist:reorder-track', b.queueItemId, a.queueItemId, 7);
+
+    expect(removeTracks).toHaveBeenCalledWith([a.queueItemId]);
+    expect(reorderTrack).toHaveBeenCalledWith(b.queueItemId, a.queueItemId, 7);
+    expect(getState('playlist.items')).toEqual([a, b]);
+    expect(getState('playlist.revision')).toBe(7);
+  });
+
+  it('fails closed when revoked PRO queue mutations arrive through stale UI events', () => {
+    const removeTracks = vi.fn(() => true);
+    const reorderTrack = vi.fn(() => true);
+    registerProRoomMediaHooks(proMediaHooks({ removeTracks, reorderTrack }));
+    enterProRoom([]);
+    setState('network.hostConn', null);
+    const a = fileItem('a.flac');
+    const b = fileItem('b.flac');
+    setState('playlist.items', [a, b]);
+    setState('playlist.revision', 7);
+    initPlaylist();
+    const toastMessage = mountToastMessage();
+
+    bus.emit('playlist:remove-tracks', [a.queueItemId]);
+    bus.emit('playlist:reorder-track', b.queueItemId, a.queueItemId, 7);
+
+    expect(removeTracks).not.toHaveBeenCalled();
+    expect(reorderTrack).not.toHaveBeenCalled();
+    expect(getState('playlist.items')).toEqual([a, b]);
+    expect(getState('playlist.revision')).toBe(7);
+    expect(toastMessage.innerText).toBe(t('toast.media_management_required'));
+  });
+
+  it('fails closed when capable PRO queue mutation bridges are unavailable', () => {
+    const removeTracks = vi.fn(() => false);
+    const reorderTrack = vi.fn(() => false);
+    registerProRoomMediaHooks(proMediaHooks({ removeTracks, reorderTrack }));
+    enterProRoom(['queue.mutate']);
+    setState('network.hostConn', null);
+    const a = fileItem('a.flac');
+    const b = fileItem('b.flac');
+    setState('playlist.items', [a, b]);
+    setState('playlist.revision', 7);
+    initPlaylist();
+    const toastMessage = mountToastMessage();
+
+    bus.emit('playlist:remove-tracks', [a.queueItemId]);
+    bus.emit('playlist:reorder-track', b.queueItemId, a.queueItemId, 7);
+
+    expect(removeTracks).toHaveBeenCalledWith([a.queueItemId]);
+    expect(reorderTrack).toHaveBeenCalledWith(b.queueItemId, a.queueItemId, 7);
+    expect(getState('playlist.items')).toEqual([a, b]);
+    expect(getState('playlist.revision')).toBe(7);
+    expect(toastMessage.innerText).toBe(t('error.network_generic'));
+  });
+
+  it('retries a selected unloaded PRO row only after its verified File is published', async () => {
+    const unloaded = fileItem('private.flac');
+    const downloaded = new File(['audio'], 'private.flac', { type: 'audio/flac' });
+    setState('playlist.items', [unloaded]);
+    decodeMocks.loadAndBroadcastFile.mockResolvedValue(false);
+    const resolveFile = vi.fn(async () => {
+      setState('playlist.items', [{ ...unloaded, file: downloaded }]);
+      return downloaded;
+    });
+    registerProRoomMediaHooks(proMediaHooks({ resolveFile }));
+
+    await playTrack(unloaded.queueItemId);
+
+    expect(resolveFile).toHaveBeenCalledWith(unloaded.queueItemId);
+    expect(decodeMocks.loadAndBroadcastFile).toHaveBeenCalledWith(
+      downloaded,
+      unloaded.queueItemId,
+      expect.any(Number),
+      expect.any(Number),
+      expect.objectContaining({ queueItemId: unloaded.queueItemId, mime: 'audio/flac' }),
+    );
+  });
+
+  it('releases the old encoded resident before a cold PRO selection enters its R2 receive budget', async () => {
+    const current = fileItem('large-old.flac');
+    const next = fileItem('next.flac');
+    setState('playlist.items', [current, next]);
+    setState('playlist.currentQueueItemId', current.queueItemId);
+    setState('files.current', {
+      queueItemId: current.queueItemId,
+      indexHint: 0,
+      name: current.name,
+      sessionId: 16,
+      blob: { size: PRO_ROOM_MAX_ASSET_BYTES } as Blob,
+      size: PRO_ROOM_MAX_ASSET_BYTES,
+      mime: 'audio/flac',
+    });
+    enterProRoom(['playback.control']);
+    const admitted = vi.fn();
+    const resolveFile = vi.fn(async () => {
+      // The runtime resolves its canonical R2 source before taking this exact
+      // retained-encoded snapshot. Exercise the real receive-budget guard.
+      await Promise.resolve();
+      new ProRoomAssetCache().prepareForIncoming(4, getState('files.current')?.blob.size ?? 0);
+      admitted();
+      return null;
+    });
+    registerProRoomMediaHooks(
+      proMediaHooks({
+        resolveFile,
+        handlesPersistentFile: (id) => id === next.queueItemId,
+      }),
+    );
+    initPlaylist();
+    await prepareProPlaybackAuthority({
+      authority: createProPlaybackAuthorityToken({
+        roomId: '000001',
+        roomEpoch: 1,
+        basePlaybackRevision: 0,
+        transitionId: 'cold-file-budget',
+      }),
+      queueItemId: next.queueItemId,
+      positionSeconds: 0,
+    });
+    expect(resolveFile).toHaveBeenCalledOnce();
+    expect(admitted).toHaveBeenCalledOnce();
+  });
+
+  it('adopts an in-flight PRO preload resolver during server PREPARE without a second download', async () => {
+    const currentFile = new File(['current'], 'current.flac', { type: 'audio/flac' });
+    const current = fileItem(currentFile.name, currentFile);
+    const next = fileItem('next.flac');
+    const downloaded = new File(['next'], next.name, { type: 'audio/flac' });
+    setState('playlist.items', [current, next]);
+    setState('playlist.currentQueueItemId', current.queueItemId);
+    setState('files.current', {
+      queueItemId: current.queueItemId,
+      indexHint: 0,
+      name: currentFile.name,
+      sessionId: 16,
+      blob: currentFile,
+      mime: currentFile.type,
+      size: currentFile.size,
+    });
+    const currentBuffer = { duration: 60 } as AudioBuffer;
+    setCurrentAudioBuffer(currentBuffer);
+    setState('preload.nextQueueItemId', next.queueItemId);
+    setState('preload.isPreloading', true);
+    setState('preload.activeTarget', {
+      queueItemId: next.queueItemId,
+      indexHint: 1,
+      name: next.name,
+      sessionId: 17,
+      mime: 'audio/flac',
+      size: downloaded.size,
+    });
+    enterProRoom(['playback.control']);
+
+    let finish!: (file: File) => void;
+    const inFlight = new Promise<File>((resolve) => {
+      finish = resolve;
+    });
+    let residentAtResolution: ResidentFile | null | undefined;
+    let bufferAtResolution: AudioBuffer | null | undefined;
+    const resolveFile = vi.fn(() => {
+      residentAtResolution = getState('files.current');
+      bufferAtResolution = getCurrentAudioBuffer();
+      return inFlight.then((file) => {
+        setState('playlist.items', [current, { ...next, file }]);
+        return file;
+      });
+    });
+    registerProRoomMediaHooks(
+      proMediaHooks({
+        resolveFile,
+        handlesPersistentFile: (queueItemId) => queueItemId === next.queueItemId,
+      }),
+    );
+    decodeMocks.loadPreloadedTrack.mockResolvedValue(false);
+
+    initPlaylist();
+    const authority = createProPlaybackAuthorityToken({
+      roomId: '000001',
+      roomEpoch: 1,
+      basePlaybackRevision: 0,
+      transitionId: 'transition-preload-promotion',
+    });
+    const preparation = prepareProPlaybackAuthority({
+      authority,
+      queueItemId: next.queueItemId,
+      positionSeconds: 0,
+    });
+    await vi.waitFor(() => expect(resolveFile).toHaveBeenCalledOnce());
+    finish(downloaded);
+    // The mocked decoder deliberately reports no AudioBuffer, so preparation
+    // fails after the download seam. The assertion below is about adopting the
+    // existing preload promise rather than end-to-end decode success.
+    await expect(preparation).resolves.toMatchObject({
+      status: 'failed',
+      reason: 'decode-failed',
+    });
+
+    expect(resolveFile).toHaveBeenCalledOnce();
+    // Server PREPARE is silent: the currently audible resident remains owned
+    // until a canonical COMMIT replaces it.
+    expect(residentAtResolution).toMatchObject({ queueItemId: current.queueItemId });
+    expect(bufferAtResolution).toBe(currentBuffer);
+    // Server PREPARE owns the foreground decode lane, but it adopts the same
+    // runtime resolver/promise rather than issuing another R2 request.
+    expect(decodeMocks.loadPreloadedTrack).not.toHaveBeenCalled();
+    expect(decodeMocks.loadAndBroadcastFile).toHaveBeenCalledOnce();
+    expect(decodeMocks.loadAndBroadcastFile).toHaveBeenCalledWith(
+      downloaded,
+      next.queueItemId,
+      expect.any(Number),
+      expect.any(Number),
+      expect.objectContaining({ queueItemId: next.queueItemId, mime: 'audio/flac' }),
+    );
+  });
+
+  it('enters the existing file busy lifecycle before awaiting a persistent download', async () => {
+    const unloaded = fileItem('slow.flac');
+    setState('playlist.items', [unloaded]);
+    setPlaybackYouTubePlaying();
+    setCurrentAudioBuffer({ duration: 120 } as AudioBuffer);
+    let settleDownload!: (file: File | null) => void;
+    const pendingDownload = new Promise<File | null>((resolve) => {
+      settleDownload = resolve;
+    });
+    const resolveFile = vi.fn(() => pendingDownload);
+    registerProRoomMediaHooks(proMediaHooks({ resolveFile }));
+
+    const playPromise = playTrack(unloaded.queueItemId);
+    await vi.waitFor(() => expect(resolveFile).toHaveBeenCalledWith(unloaded.queueItemId));
+
+    expect(getState('playlist.currentQueueItemId')).toBe(unloaded.queueItemId);
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.DOWNLOADING);
+    expect(getState('playback.mode')).toBe('file');
+    expect(getState('playback.activity')).toBe('pending');
+    expect(getCurrentAudioBuffer()).toBeNull();
+
+    settleDownload(null);
+    await playPromise;
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.FAILED);
+  });
+
+  it('does not let a superseded persistent fetch clear the newer file selection', async () => {
+    const second = fileItem('second.flac');
+    const third = fileItem('third.flac');
+    setState('playlist.items', [second, third]);
+    let settleSecond!: (file: File | null) => void;
+    let settleThird!: (file: File | null) => void;
+    const secondDownload = new Promise<File | null>((resolve) => {
+      settleSecond = resolve;
+    });
+    const thirdDownload = new Promise<File | null>((resolve) => {
+      settleThird = resolve;
+    });
+    registerProRoomMediaHooks(
+      proMediaHooks({
+        resolveFile: (queueItemId) =>
+          queueItemId === second.queueItemId ? secondDownload : thirdDownload,
+      }),
+    );
+
+    const secondPlay = playTrack(second.queueItemId);
+    await vi.waitFor(() => expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.DOWNLOADING));
+    const thirdPlay = playTrack(third.queueItemId);
+    await vi.waitFor(() => expect(getState('playlist.currentQueueItemId')).toBe(third.queueItemId));
+
+    settleSecond(null);
+    await secondPlay;
+    expect(getState('playlist.currentQueueItemId')).toBe(third.queueItemId);
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.DOWNLOADING);
+
+    settleThird(null);
+    await thirdPlay;
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.FAILED);
+  });
+
+  it('releases the file spinner when YouTube supersedes a persistent fetch', async () => {
+    const video = youtubeItem('First video', 'VIDEO_ID_01');
+    const unloaded = fileItem('second.flac');
+    setState('playlist.items', [video, unloaded]);
+    setPlaybackYouTubePlaying();
+    let settleDownload!: (file: File | null) => void;
+    const pendingDownload = new Promise<File | null>((resolve) => {
+      settleDownload = resolve;
+    });
+    registerProRoomMediaHooks(proMediaHooks({ resolveFile: () => pendingDownload }));
+
+    const filePlay = playTrack(unloaded.queueItemId);
+    await vi.waitFor(() => expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.DOWNLOADING));
+
+    await playTrack(video.queueItemId);
+    expect(getState('playlist.currentQueueItemId')).toBe(video.queueItemId);
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.IDLE);
+
+    settleDownload(null);
+    await filePlay;
+    expect(getState('playlist.currentQueueItemId')).toBe(video.queueItemId);
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.IDLE);
+  });
+
+  it('cancels a pending PRO resolver during an authoritative in-flight teardown', () => {
+    const cancelFileResolution = vi.fn();
+    registerProRoomMediaHooks(proMediaHooks({ cancelFileResolution }));
+    transition({
+      type: 'FILE_PREPARE',
+      variant: 'fresh',
+      queueItemId: nextQueueItemId(),
+      name: 'pending.flac',
+    });
+
+    transport.stopAllMedia({ silent: true, cancelInFlight: true });
+
+    expect(cancelFileResolution).toHaveBeenCalledOnce();
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.IDLE);
+  });
+
+  it('releases the download spinner into FAILED when the selected persistent fetch fails', async () => {
+    const unloaded = fileItem('offline.flac');
+    const downloaded = new File(['audio'], unloaded.name, { type: 'audio/flac' });
+    setState('playlist.items', [unloaded]);
+    setState('network.appRole', 'host');
+    const resolveFile = vi
+      .fn<() => Promise<File | null>>()
+      .mockRejectedValueOnce(new Error('R2 unavailable'))
+      .mockImplementationOnce(async () => {
+        setState('playlist.items', [{ ...unloaded, file: downloaded }]);
+        return downloaded;
+      });
+    registerProRoomMediaHooks(proMediaHooks({ resolveFile }));
+    decodeMocks.loadAndBroadcastFile.mockResolvedValue(false);
+
+    await playTrack(unloaded.queueItemId);
+
+    expect(getState('playlist.currentQueueItemId')).toBe(unloaded.queueItemId);
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.FAILED);
+    expect(getState('playback.activity')).toBe('pending');
+
+    transport.togglePlay();
+    await vi.waitFor(() => expect(resolveFile).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => {
+      expect(decodeMocks.loadAndBroadcastFile).toHaveBeenCalledWith(
+        downloaded,
+        unloaded.queueItemId,
+        expect.any(Number),
+        expect.any(Number),
+        expect.objectContaining({ queueItemId: unloaded.queueItemId }),
+      );
+    });
+  });
+});
+
+describe('shuffle row order helpers', () => {
+  beforeEach(() => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    setState('playlist.items', [fileItem('a.mp3'), fileItem('b.mp3'), fileItem('c.mp3')]);
+  });
+
+  it('finds the next playable row without falling back to a fresh random pick', () => {
+    selectIndex(1);
+    setRepeatMode(0, false);
+    setShuffle(true, false);
+
+    const itemC = getState('playlist.items')[2]!;
+    expect(
+      getShuffleNextPlayableQueueItemId((queueItemId) => queueItemId !== itemC.queueItemId),
+    ).toBeNull();
+
+    setRepeatMode(1, false);
+    expect(
+      getShuffleNextPlayableQueueItemId((queueItemId) => queueItemId !== itemC.queueItemId),
+    ).toBe(getState('playlist.items')[0]?.queueItemId);
+  });
+
+  it('wraps previous row navigation through the same shuffle order', () => {
+    selectIndex(0);
+    setRepeatMode(1, false);
+    setShuffle(true, false);
+
+    expect(advanceToShufflePreviousQueueItemId()).toBe(getState('playlist.items')[2]?.queueItemId);
+  });
+
+  it('advances next row and reshuffles at repeat-all pass end', () => {
+    selectIndex(2);
+    setRepeatMode(1, false);
+    setShuffle(true, false);
+
+    expect(advanceToShuffleNextQueueItemId()).toBe(getState('playlist.items')[0]?.queueItemId);
+  });
+
+  it('restores the exact persisted shuffle permutation and repeat mode', () => {
+    const items = getState('playlist.items');
+    selectIndex(0);
+    const persistedOrder = [items[2]!.queueItemId, items[0]!.queueItemId, items[1]!.queueItemId];
+
+    expect(
+      applyPlaylistQueueModeState({
+        repeatMode: 1,
+        shuffleEnabled: true,
+        shuffleOrder: persistedOrder,
+      }),
+    ).toBe(true);
+
+    expect(capturePlaylistQueueModeState()).toEqual({
+      repeatMode: 1,
+      shuffleEnabled: true,
+      shuffleOrder: persistedOrder,
+    });
+    expect(advanceToShuffleNextQueueItemId()).toBe(items[1]!.queueItemId);
+  });
+
+  it('preserves surviving shuffle order across removal and rejects stale permutations', () => {
+    const items = getState('playlist.items');
+    const persistedOrder = [items[2]!.queueItemId, items[0]!.queueItemId, items[1]!.queueItemId];
+    expect(
+      applyPlaylistQueueModeState({
+        repeatMode: 2,
+        shuffleEnabled: true,
+        shuffleOrder: persistedOrder,
+      }),
+    ).toBe(true);
+
+    setState('playlist.items', [items[0]!, items[2]!]);
+    reconcileShuffleOrderForCurrentPlaylist();
+    expect(capturePlaylistQueueModeState().shuffleOrder).toEqual([
+      items[2]!.queueItemId,
+      items[0]!.queueItemId,
+    ]);
+    expect(
+      applyPlaylistQueueModeState({
+        repeatMode: 1,
+        shuffleEnabled: true,
+        shuffleOrder: persistedOrder,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('playNext/playPrev mode-branch parity', () => {
+  function setupModeBranch(owner: 'file' | 'youtube', currentIndex: number): void {
+    resetState();
+    bus.clear();
+    setState('network.appRole', 'host');
+    setPendingAutoSyncOnReady(false);
+    setState('player.isFirstTrackLoad', false);
+    const items =
+      owner === 'youtube'
+        ? [
+            youtubeItem('A', 'VIDEO_AAAAA'),
+            youtubeItem('B', 'VIDEO_BBBBB'),
+            youtubeItem('C', 'VIDEO_CCCCC'),
+          ]
+        : [fileItem('a.mp3'), fileItem('b.mp3'), fileItem('c.mp3')];
+    setState('playlist.items', items);
+    selectIndex(currentIndex);
+    setRepeatMode(1, false);
+    setShuffle(true, false);
+
+    if (owner === 'youtube') {
+      setPlaybackYouTubePlaying();
+      bus.on('youtube:try-next-internal', (done: (success: boolean) => void) => done(false));
+      bus.on('youtube:try-prev-internal', (done: (success: boolean) => void) => done(false));
+      bus.on('youtube:load', () => {});
+    }
+  }
+
+  it('shuffle Next chooses the same next row in local and YouTube fallback branches', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+
+    setupModeBranch('file', 1);
+    playNextTrack();
+    const localNext = currentIndex();
+
+    setupModeBranch('youtube', 1);
+    playNextTrack();
+    const youtubeNext = currentIndex();
+
+    expect(localNext).toBe(2);
+    expect(youtubeNext).toBe(localNext);
+  });
+
+  it('shuffle Prev wraps the same previous row in local and YouTube fallback branches', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+
+    setupModeBranch('file', 0);
+    playPrevTrack();
+    const localPrev = currentIndex();
+
+    setupModeBranch('youtube', 0);
+    playPrevTrack();
+    const youtubePrev = currentIndex();
+
+    expect(localPrev).toBe(2);
+    expect(youtubePrev).toBe(localPrev);
+  });
+});
+
+describe('clearPreloadState', () => {
+  it('clears the next queue occurrence', () => {
+    setRepeatMode(0, false);
+    clearPreloadState();
+    expect(getState('preload.nextQueueItemId')).toBeNull();
+  });
+});
+
+describe('playTrack YouTube auto-rendezvous', () => {
+  it('keeps an ordinary first YouTube selection paused for the manual play tap', async () => {
+    const video = youtubeItem('First Video', 'FIRST_VIDEO_01');
+    setState('playlist.items', [video]);
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+
+    await playTrack(video.queueItemId);
+
+    expect(load).toHaveBeenCalledWith('FIRST_VIDEO_01', null, video.queueItemId, false, 0);
+    expect(getPendingAutoSyncOnReady()).toBe(false);
+    expect(getState('player.isFirstTrackLoad')).toBe(false);
+  });
+
+  it('arms paused-load zero-start for an explicit first YouTube play intent', async () => {
+    const video = youtubeItem('First Video', 'FIRST_VIDEO_01');
+    setState('playlist.items', [video]);
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+
+    await playTrack(video.queueItemId, undefined, { explicitPlaybackIntent: true });
+
+    expect(load).toHaveBeenCalledWith('FIRST_VIDEO_01', null, video.queueItemId, false, 0);
+    expect(consumePendingAutoSyncOnReady()).toMatchObject({
+      isTrackTransition: false,
+      zeroStart: true,
+      targetTime: 0,
+      subIndex: 0,
+      videoId: 'FIRST_VIDEO_01',
+      skipSeek: true,
+    });
+    expect(getState('player.isFirstTrackLoad')).toBe(false);
+  });
+
+  it('stops the outgoing YouTube occurrence before selecting a persistent PRO file', async () => {
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', true), conn }]);
+    setState('player.isFirstTrackLoad', false);
+
+    const oldVideo = youtubeItem('Old Video', 'OLD_VIDEO_01');
+    const file = new File(['persistent'], 'persistent.flac', { type: 'audio/flac' });
+    const persistentFile = fileItem(file.name, file);
+    setState('playlist.items', [oldVideo, persistentFile]);
+    selectIndex(0);
+    setPlaybackTrackMeta(oldVideo);
+    setPlaybackYouTubePlaying();
+    registerProRoomMediaHooks(
+      proMediaHooks({
+        handlesPersistentFile: (queueItemId) => queueItemId === persistentFile.queueItemId,
+      }),
+    );
+
+    const order: string[] = [];
+    bus.on('youtube:stop-mode', (options) => {
+      order.push(`stop:${getState('playlist.currentQueueItemId')}`);
+      stopYouTubeMode(options);
+    });
+    decodeMocks.loadAndBroadcastFile.mockImplementation(
+      async (_file, queueItemId, _sessionId, _loadEpoch, prepareMsg) => {
+        order.push(`prepare:${queueItemId}`);
+        expect(prepareMsg).toEqual(
+          expect.objectContaining({
+            type: MSG.FILE_PREPARE,
+            queueItemId: persistentFile.queueItemId,
+          }),
+        );
+        return false;
+      },
+    );
+
+    await playTrack(persistentFile.queueItemId);
+
+    expect(order).toEqual([
+      `stop:${oldVideo.queueItemId}`,
+      `prepare:${persistentFile.queueItemId}`,
+    ]);
+    expect(send).toHaveBeenCalledWith({
+      type: MSG.YOUTUBE_STOP,
+      queueItemId: oldVideo.queueItemId,
+    });
+    expect(send).not.toHaveBeenCalledWith({
+      type: MSG.YOUTUBE_STOP,
+      queueItemId: persistentFile.queueItemId,
+    });
+    expect(getState('playlist.currentQueueItemId')).toBe(persistentFile.queueItemId);
+  });
+
+  it('keeps pending auto-sync armed after fresh non-YouTube -> YouTube load cleanup', async () => {
+    setState('player.isFirstTrackLoad', false);
+    const local = fileItem('local.mp3');
+    const video = youtubeItem('Video', 'VIDEO_ID_01');
+    setState('playlist.items', [local, video]);
+    selectIndex(0);
+
+    bus.on('youtube:stop-mode', () => setPendingAutoSyncOnReady(false));
+    bus.on('player:stop-all-media', () => {
+      bus.emit('youtube:stop-mode', { silent: false });
+    });
+    bus.on('youtube:load', () => {
+      bus.emit('player:stop-all-media');
+    });
+
+    await playTrack(video.queueItemId);
+
+    expect(getPendingAutoSyncOnReady()).toBe(true);
+    expect(consumePendingAutoSyncOnReady()).toMatchObject({
+      isTrackTransition: false,
+      targetTime: 0,
+      subIndex: 0,
+      videoId: 'VIDEO_ID_01',
+      skipSeek: true,
+    });
+  });
+
+  it.each(
+    [false, true].flatMap((otherItem) =>
+      ['playing', 'paused'].map((activity) => ({ otherItem, activity })),
+    ),
+  )(
+    'prepares canonical OP sub-selection with otherItem=$otherItem from $activity',
+    async ({ otherItem, activity }) => {
+      const { handleRequestYouTubeSubSeek } = await import('../../youtube/handlers.ts');
+      setPlaybackYouTubePlaying();
+      setState('playback.activity', activity as 'playing' | 'paused');
+      setState('player.isFirstTrackLoad', false);
+      setState('network.appRole', 'host');
+      const conn = { peer: 'guest-op', open: true, send: vi.fn() } as unknown as DataConnection;
+      setState('network.activeHostConnByPeerId', new Map([[conn.peer, conn]]));
+      setState('network.connectedPeers', [{ ...makeConnectedPeer(conn.peer, true), conn }]);
+      const current = youtubeItem('Current', 'CURRENT_VIDEO', 'PL_CURRENT');
+      const target = otherItem ? youtubeItem('Target', 'TARGET_FIRST', 'PL_TARGET') : current;
+      setState('playlist.items', otherItem ? [current, target] : [current]);
+      selectIndex(0);
+      setState('youtube.subItemsMap', {
+        [target.playlistId!]: { ids: [target.videoId!, 'TARGET_NEXT'], titles: ['First', 'Next'] },
+      });
+      setState('youtube.currentSubIndex', 0);
+      setYouTubePlayer({
+        getVideoData: () => ({ video_id: 'CURRENT_VIDEO' }),
+        loadVideoById: vi.fn(),
+      } as never);
+      initPlaylist();
+      const load = vi.fn();
+      const switchTab = vi.fn();
+
+      bus.on('youtube:load', load);
+      bus.on('ui:switch-tab', switchTab);
+
+      handleRequestYouTubeSubSeek({ queueItemId: target.queueItemId, subIdx: 1 }, conn);
+
+      expect(load).toHaveBeenCalledWith('TARGET_NEXT', null, target.queueItemId, false, 1);
+      expect(getPendingAutoSyncOnReady()).toBe(true);
+      expect(consumePendingAutoSyncOnReady()).toBeNull();
+      setYouTubePlayer({ getVideoData: () => ({ video_id: 'TARGET_NEXT' }) } as never);
+      expect(consumePendingAutoSyncOnReady()).toMatchObject({
+        isTrackTransition: true,
+        zeroStart: true,
+        targetTime: 0,
+        subIndex: 1,
+        videoId: 'TARGET_NEXT',
+      });
+      expect(conn.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: MSG.YOUTUBE_PLAY,
+          videoId: 'TARGET_NEXT',
+          queueItemId: target.queueItemId,
+          autoplay: false,
+          subIndex: 1,
+        }),
+      );
+      expect(switchTab).toHaveBeenCalledTimes(otherItem ? 1 : 0);
+      expect(getState('playlist.currentQueueItemId')).toBe(target.queueItemId);
+    },
+  );
+  it('marks YouTube-to-YouTube loads as track transitions', async () => {
+    setPlaybackYouTubePlaying();
+    setState('player.isFirstTrackLoad', false);
+    const oldVideo = youtubeItem('Old Video', 'OLD_VIDEO_01');
+    const newVideo = youtubeItem('New Video', 'NEW_VIDEO_01');
+    setState('playlist.items', [oldVideo, newVideo]);
+    selectIndex(0);
+
+    bus.on('youtube:load', () => {});
+
+    await playTrack(newVideo.queueItemId);
+
+    expect(consumePendingAutoSyncOnReady()).toMatchObject({
+      isTrackTransition: true,
+      targetTime: 0,
+      subIndex: 0,
+      videoId: 'NEW_VIDEO_01',
+      skipSeek: true,
+    });
+  });
+
+  it('restarts the current YouTube occurrence without reloading its iframe', async () => {
+    setPlaybackYouTubePlaying();
+    setState('player.isFirstTrackLoad', false);
+    const video = youtubeItem('Current Video', 'CURRENT_VIDEO_01');
+    setState('playlist.items', [video]);
+    selectIndex(0);
+    setState('youtube.currentSubIndex', 0);
+    setYouTubePlayer({
+      getVideoData: () => ({ video_id: 'CURRENT_VIDEO_01' }),
+    } as never);
+    const autoPlay = vi.fn();
+    const load = vi.fn();
+    const outbound = vi.fn();
+    bus.on('youtube:auto-play', autoPlay);
+    bus.on('youtube:load', load);
+    bus.on('network:broadcast', outbound);
+
+    await playTrack(video.queueItemId);
+
+    expect(autoPlay).toHaveBeenCalledOnce();
+    expect(autoPlay).toHaveBeenCalledWith({
+      isTrackTransition: false,
+      zeroStart: true,
+      targetTime: 0,
+      videoId: 'CURRENT_VIDEO_01',
+      subIndex: 0,
+      skipSeek: false,
+    });
+    expect(load).not.toHaveBeenCalled();
+    expect(outbound).not.toHaveBeenCalled();
+    expect(getState('playlist.currentQueueItemId')).toBe(video.queueItemId);
+  });
+
+  it('directly hands off a new queue occurrence of the resident YouTube video', async () => {
+    setPlaybackYouTubePlaying();
+    setState('player.isFirstTrackLoad', false);
+    const firstOccurrence = youtubeItem('First occurrence', 'SAME_VIDEO_1');
+    const secondOccurrence = youtubeItem('Second occurrence', 'SAME_VIDEO_1');
+    setState('playlist.items', [firstOccurrence, secondOccurrence]);
+    selectIndex(0);
+    setPlaybackTrackMeta({
+      ...firstOccurrence,
+      title: 'Resolved resident title',
+      artist: 'Resolved resident channel',
+    });
+
+    bus.on('youtube:load', () => {});
+    const prepareRestart = vi
+      .spyOn(youtubeIframe, 'prepareSameVideoOccurrenceRestart')
+      .mockReturnValue(true);
+    const handoff = vi
+      .spyOn(youtubeIframe, 'handoffSameVideoOccurrenceRestart')
+      .mockReturnValue(true);
+
+    await playTrack(secondOccurrence.queueItemId);
+
+    expect(prepareRestart).toHaveBeenCalledOnce();
+    expect(prepareRestart).toHaveBeenCalledWith(secondOccurrence.queueItemId, 'SAME_VIDEO_1');
+    expect(handoff).toHaveBeenCalledOnce();
+    expect(handoff).toHaveBeenCalledWith(secondOccurrence.queueItemId, 'SAME_VIDEO_1');
+    expect(getState('playlist.currentQueueItemId')).toBe(secondOccurrence.queueItemId);
+    expect(getState('player.currentTrackMeta')).toMatchObject({
+      queueItemId: secondOccurrence.queueItemId,
+      title: 'Resolved resident title',
+      artist: 'Resolved resident channel',
+    });
+    expect(consumePendingAutoSyncOnReady()).toMatchObject({
+      isTrackTransition: true,
+      zeroStart: true,
+      videoId: 'SAME_VIDEO_1',
+      targetTime: 0,
+      skipSeek: false,
+    });
+  });
+
+  it('forces a removed same-video occurrence successor back to zero after selection clears', async () => {
+    setPlaybackYouTubePlaying();
+    setState('player.isFirstTrackLoad', false);
+    const successor = youtubeItem('Surviving occurrence', 'SAME_VIDEO_1');
+    setState('playlist.items', [successor]);
+    setState('playlist.currentQueueItemId', null);
+
+    bus.on('youtube:load', () => {});
+    const prepareRestart = vi
+      .spyOn(youtubeIframe, 'prepareSameVideoOccurrenceRestart')
+      .mockReturnValue(true);
+    const handoff = vi
+      .spyOn(youtubeIframe, 'handoffSameVideoOccurrenceRestart')
+      .mockReturnValue(true);
+
+    await playTrack(successor.queueItemId, undefined, { forceNewYouTubeOccurrence: true });
+
+    expect(prepareRestart).toHaveBeenCalledWith(successor.queueItemId, 'SAME_VIDEO_1');
+    expect(handoff).toHaveBeenCalledWith(successor.queueItemId, 'SAME_VIDEO_1');
+    expect(consumePendingAutoSyncOnReady()).toMatchObject({
+      zeroStart: true,
+      videoId: 'SAME_VIDEO_1',
+      targetTime: 0,
+      skipSeek: false,
+    });
+  });
+
+  it('broadcasts the requested YouTube playlist sub-index on playTrack', async () => {
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', false), conn }]);
+    setState('player.isFirstTrackLoad', false);
+    const playlistItem = {
+      ...youtubeItem('Playlist', 'entryVideo', 'playlist-1'),
+      title: 'Playlist',
+    };
+    setState('playlist.items', [playlistItem]);
+    selectIndex(0);
+    setState('youtube.subItemsMap', {
+      'playlist-1': {
+        ids: ['firstVideo', 'secondVideo'],
+        titles: ['First', 'Second'],
+      },
+    });
+
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+
+    await playTrack(playlistItem.queueItemId, 1);
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.YOUTUBE_PLAY,
+        videoId: 'secondVideo',
+        playlistId: 'playlist-1',
+        queueItemId: playlistItem.queueItemId,
+        subIndex: 1,
+      }),
+    );
+    expect(load).toHaveBeenCalledWith('secondVideo', null, playlistItem.queueItemId, false, 1);
+  });
+
+  it('replays a queued playlist from its stored selected video when no sub-index is supplied', async () => {
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', false), conn }]);
+    setState('player.isFirstTrackLoad', false);
+    const playlistItem = {
+      ...youtubeItem('Playlist', 'secondVideo', 'playlist-selected'),
+      title: 'Playlist',
+    };
+    setState('playlist.items', [playlistItem]);
+    selectIndex(0);
+    setState('youtube.subItemsMap', {
+      'playlist-selected': {
+        ids: ['firstVideo', 'secondVideo'],
+        titles: ['First', 'Second'],
+        manifestComplete: true,
+      },
+    });
+
+    const load = vi.fn();
+    bus.on('youtube:load', load);
+    await playTrack(playlistItem.queueItemId);
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.YOUTUBE_PLAY,
+        videoId: 'secondVideo',
+        subIndex: 1,
+      }),
+    );
+    expect(load).toHaveBeenCalledWith('secondVideo', null, playlistItem.queueItemId, false, 1);
+  });
+
+  it('drops a local-file broadcast parked in the debounce window when switching to YouTube', async () => {
+    // A mode switch within the send debounce must cancel the pending local
+    // transfer; otherwise guests can receive stale file traffic in YouTube mode.
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const conn = {
+      peer: 'guest-1',
+      open: true,
+      send,
+      peerConnection: { connectionState: 'connected' },
+      dataChannel: { readyState: 'open', bufferedAmount: 0 },
+    } as unknown as DataConnection;
+    setState('network.connectedPeers', [
+      { ...makeConnectedPeer('guest-1', false), conn, connectionType: 'local' },
+    ]);
+    setState('player.isFirstTrackLoad', false);
+    const file = new File(['abc'], 'local.mp3', { type: 'audio/mpeg' });
+    const local = fileItem('local.mp3', file);
+    const video = youtubeItem('Video', 'VIDEO_ID_01');
+    setState('playlist.items', [local, video]);
+    selectIndex(0);
+    bus.on('youtube:load', () => {});
+
+    broadcastFileDebounced(file, local.queueItemId, 1, {
+      type: MSG.FILE_PREPARE,
+      name: 'local.mp3',
+      queueItemId: local.queueItemId,
+      sessionId: 1,
+      mime: 'audio/mpeg',
+    });
+
+    await playTrack(video.queueItemId);
+    await vi.advanceTimersByTimeAsync(301);
+
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: MSG.FILE_PREPARE }));
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: MSG.FILE_START }));
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: MSG.YOUTUBE_PLAY }));
+  });
+});
+
+describe('playTrack explicit file playback intent', () => {
+  it('retires the predecessor announcement when activating a ready preload', async () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [
+      { ...makeConnectedPeer('guest-1', false), conn, connectionType: 'local' },
+    ]);
+    const oldFile = new File(['old'], 'old.mp3', { type: 'audio/mpeg' });
+    const nextFile = new File(['next'], 'next.mp3', { type: 'audio/mpeg' });
+    const previous = fileItem(oldFile.name, oldFile);
+    const selected = fileItem(nextFile.name, nextFile);
+    setState('playlist.items', [previous, selected]);
+    selectIndex(0);
+    setState('preload.nextQueueItemId', selected.queueItemId);
+    setState('preload.ready', residentFor(selected, nextFile, 2));
+    broadcastFileDebounced(oldFile, previous.queueItemId, 1, {
+      type: MSG.FILE_PREPARE,
+      queueItemId: previous.queueItemId,
+      name: oldFile.name,
+      mime: oldFile.type,
+      sessionId: 1,
+    });
+
+    await playTrack(selected.queueItemId);
+    await vi.advanceTimersByTimeAsync(301);
+    expect(decodeMocks.loadPreloadedTrack).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.PLAY_PRELOADED,
+        queueItemId: selected.queueItemId,
+      }),
+    );
+    expect(send).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.FILE_PREPARE,
+        queueItemId: previous.queueItemId,
+      }),
+    );
+  });
+
+  it('announces an accepted file selection before its host decode can finish', async () => {
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [
+      { ...makeConnectedPeer('guest-1', false), conn, connectionType: 'local' },
+    ]);
+    const file = new File(['audio'], 'selected.mp3', { type: 'audio/mpeg' });
+    const selected = fileItem(file.name, file);
+    setState('playlist.items', [selected]);
+    let finishDecode!: (loaded: boolean) => void;
+    decodeMocks.loadAndBroadcastFile.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finishDecode = resolve;
+        }),
+    );
+
+    const selection = playTrack(selected.queueItemId);
+    expect(decodeMocks.loadAndBroadcastFile).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.FILE_PREPARE,
+        queueItemId: selected.queueItemId,
+        name: file.name,
+        sessionId: getState('transfer.currentSessionId'),
+      }),
+    );
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: MSG.PLAY }));
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: MSG.FILE_START }));
+    finishDecode(false);
+    await selection;
+  });
+
+  it('retires a parked predecessor announcement while the next file is decoding', async () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [
+      { ...makeConnectedPeer('guest-1', false), conn, connectionType: 'local' },
+    ]);
+    const oldFile = new File(['old'], 'old.mp3', { type: 'audio/mpeg' });
+    const newFile = new File(['new'], 'new.mp3', { type: 'audio/mpeg' });
+    const previous = fileItem(oldFile.name, oldFile);
+    const selected = fileItem(newFile.name, newFile);
+    setState('playlist.items', [previous, selected]);
+    selectIndex(0);
+    broadcastFileDebounced(oldFile, previous.queueItemId, 1, {
+      type: MSG.FILE_PREPARE,
+      queueItemId: previous.queueItemId,
+      name: oldFile.name,
+      mime: oldFile.type,
+      sessionId: 1,
+    });
+    let finishDecode!: (loaded: boolean) => void;
+    decodeMocks.loadAndBroadcastFile.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finishDecode = resolve;
+        }),
+    );
+
+    const selection = playTrack(selected.queueItemId);
+    await vi.advanceTimersByTimeAsync(301);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.FILE_PREPARE,
+        queueItemId: selected.queueItemId,
+      }),
+    );
+    expect(send).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.FILE_PREPARE,
+        queueItemId: previous.queueItemId,
+      }),
+    );
+    finishDecode(false);
+    await selection;
+  });
+
+  it('keeps an ordinary first file ready for the manual play tap', async () => {
+    const file = new File(['audio'], 'first.flac', { type: 'audio/flac' });
+    const item = fileItem(file.name, file);
+    setState('playlist.items', [item]);
+    decodeMocks.loadAndBroadcastFile.mockResolvedValue(true);
+    const startSpy = vi
+      .spyOn(transport, 'startHostFileAndBroadcastPlay')
+      .mockResolvedValueOnce(true);
+
+    await playTrack(item.queueItemId);
+
+    expect(decodeMocks.loadAndBroadcastFile.mock.calls[0]?.[4]).toEqual({
+      type: MSG.FILE_PREPARE,
+      name: file.name,
+      queueItemId: item.queueItemId,
+      sessionId: expect.any(Number),
+      size: file.size,
+      mime: file.type,
+    });
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(getState('player.isFirstTrackLoad')).toBe(false);
+  });
+
+  it('starts an explicitly played first file immediately', async () => {
+    const file = new File(['audio'], 'first.flac', { type: 'audio/flac' });
+    const item = fileItem(file.name, file);
+    setState('playlist.items', [item]);
+    decodeMocks.loadAndBroadcastFile.mockResolvedValue(true);
+    const startSpy = vi
+      .spyOn(transport, 'startHostFileAndBroadcastPlay')
+      .mockResolvedValueOnce(true);
+
+    await playTrack(item.queueItemId, undefined, { explicitPlaybackIntent: true });
+
+    expect(startSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        time: 0,
+        queueItemId: item.queueItemId,
+        name: file.name,
+      }),
+    );
+    expect(getState('player.isFirstTrackLoad')).toBe(false);
+  });
+});
+
+describe('remove-track playlist-empty teardown supersedes in-flight loads', () => {
+  // Removing the final track during its decode window must advance the load
+  // epoch so that a late decode cannot republish or play the deleted track.
+  // decode.test.ts covers the corresponding stale-decode checkpoint.
+  it('bumps the load epoch when the last track is removed', () => {
+    initPlaylist();
+    const only = fileItem('only.mp3');
+    setState('playlist.items', [only]);
+    selectIndex(0);
+
+    const before = getCurrentLoadEpoch();
+    bus.emit('playlist:remove-tracks', [only.queueItemId]);
+
+    expect(getState('playlist.items')).toHaveLength(0);
+    expect(getState('playlist.currentQueueItemId')).toBeNull();
+    expect(getCurrentLoadEpoch()).toBe(before + 1);
+  });
+
+  it('does NOT bump the epoch when a non-current track is removed (live load must survive)', () => {
+    initPlaylist();
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    setState('playlist.items', [a, b]);
+    selectIndex(0);
+
+    const before = getCurrentLoadEpoch();
+    bus.emit('playlist:remove-tracks', [b.queueItemId]);
+
+    expect(getState('playlist.items')).toHaveLength(1);
+    expect(getState('playlist.currentQueueItemId')).toBe(a.queueItemId);
+    expect(getCurrentLoadEpoch()).toBe(before);
+  });
+});
+
+describe('atomic batch playlist removal', () => {
+  it('normalizes duplicate and unknown IDs into one revision and one snapshot', () => {
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', false), conn }]);
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3');
+    const d = fileItem('d.mp3');
+    const unknown = nextQueueItemId();
+    setState('playlist.items', [a, b, c, d]);
+    setState('playlist.currentQueueItemId', b.queueItemId);
+    setState('playlist.revision', 12);
+    initPlaylist();
+
+    bus.emit('playlist:remove-tracks', [a.queueItemId, c.queueItemId, a.queueItemId, unknown]);
+
+    expect(getState('playlist.items')).toEqual([b, d]);
+    expect(getState('playlist.currentQueueItemId')).toBe(b.queueItemId);
+    expect(getState('playlist.revision')).toBe(13);
+    const snapshots = send.mock.calls
+      .map(([message]) => message as { type?: string; revision?: number })
+      .filter((message) => message.type === MSG.PLAYLIST_UPDATE);
+    expect(snapshots).toEqual([expect.objectContaining({ revision: 13 })]);
+  });
+
+  it('skips every selected successor and then falls back to the nearest survivor', () => {
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3');
+    const d = fileItem('d.mp3');
+    const e = fileItem('e.mp3');
+    setState('playlist.items', [a, b, c, d, e]);
+    setState('playlist.currentQueueItemId', b.queueItemId);
+    initPlaylist();
+
+    bus.emit('playlist:remove-tracks', [b.queueItemId, c.queueItemId, d.queueItemId]);
+    expect(getState('playlist.items')).toEqual([a, e]);
+    expect(getState('playlist.currentQueueItemId')).toBe(e.queueItemId);
+
+    bus.emit('playlist:remove-tracks', [e.queueItemId]);
+    expect(getState('playlist.items')).toEqual([a]);
+    expect(getState('playlist.currentQueueItemId')).toBe(a.queueItemId);
+  });
+
+  it('cleans selected asynchronous owners and invalidates stale peer preload caches', () => {
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3');
+    const peer = makeConnectedPeer('guest-1', false);
+    peer.preloadedQueueItemIds = new Set([a.queueItemId, b.queueItemId, c.queueItemId]);
+    setState('network.connectedPeers', [peer]);
+    setState('playlist.items', [a, b, c]);
+    setState('playlist.currentQueueItemId', a.queueItemId);
+    setState('preload.nextQueueItemId', b.queueItemId);
+    setState('preload.activeTarget', {
+      queueItemId: b.queueItemId,
+      indexHint: 1,
+      name: b.name,
+      sessionId: 9,
+    });
+    setState('playback.pendingRecoveryTarget', {
+      queueItemId: c.queueItemId,
+      indexHint: 2,
+      name: c.name,
+    });
+    setState('recovery.pending', true);
+    initPlaylist();
+
+    bus.emit('playlist:remove-tracks', [b.queueItemId, c.queueItemId]);
+
+    expect(getState('preload.nextQueueItemId')).toBeNull();
+    expect(getState('preload.activeTarget')).toBeNull();
+    expect(getState('playback.pendingRecoveryTarget')).toBeNull();
+    expect(getState('recovery.pending')).toBe(false);
+    expect([...getState('network.connectedPeers')[0]!.preloadedQueueItemIds]).toEqual([]);
+  });
+
+  it('ignores batch removal attempts from a guest', () => {
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    setState('playlist.items', [a, b]);
+    setState('playlist.currentQueueItemId', a.queueItemId);
+    setState('network.hostConn', makeConnection('host'));
+    initPlaylist();
+
+    bus.emit('playlist:remove-tracks', [a.queueItemId, b.queueItemId]);
+
+    expect(getState('playlist.items')).toEqual([a, b]);
+    expect(getState('playlist.revision')).toBe(0);
+  });
+
+  it('tears down a multi-item queue once when every item is selected', () => {
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3');
+    setState('playlist.items', [a, b, c]);
+    setState('playlist.currentQueueItemId', b.queueItemId);
+    setState('playlist.revision', 4);
+    initPlaylist();
+    const beforeEpoch = getCurrentLoadEpoch();
+
+    bus.emit('playlist:remove-tracks', [a.queueItemId, b.queueItemId, c.queueItemId]);
+
+    expect(getState('playlist.items')).toEqual([]);
+    expect(getState('playlist.currentQueueItemId')).toBeNull();
+    expect(getState('playlist.revision')).toBe(5);
+    expect(getCurrentLoadEpoch()).toBe(beforeEpoch + 1);
+  });
+
+  it('chooses the first live successor after the removed set in shuffle order', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3');
+    const d = fileItem('d.mp3');
+    setState('playlist.items', [a, b, c, d]);
+    setState('playlist.currentQueueItemId', b.queueItemId);
+    setShuffle(true, false);
+    initPlaylist();
+
+    bus.emit('playlist:remove-tracks', [b.queueItemId, c.queueItemId]);
+
+    expect(getState('playlist.items')).toEqual([a, d]);
+    expect(getState('playlist.currentQueueItemId')).toBe(d.queueItemId);
+  });
+
+  it('leaves YouTube mode once when a selected current video promotes a file', () => {
+    const current = youtubeItem('Video', 'VIDEO_ID_01');
+    const successor = fileItem('next.mp3');
+    const extra = fileItem('extra.mp3');
+    setState('playlist.items', [current, successor, extra]);
+    setState('playlist.currentQueueItemId', current.queueItemId);
+    initPlaylist();
+    const stopYouTube = vi.fn();
+    bus.on('youtube:stop-mode', stopYouTube);
+
+    bus.emit('playlist:remove-tracks', [current.queueItemId, extra.queueItemId]);
+
+    expect(getState('playlist.items')).toEqual([successor]);
+    expect(getState('playlist.currentQueueItemId')).toBe(successor.queueItemId);
+    expect(stopYouTube).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('guest queue authority bootstrap', () => {
+  function setupGuestConnection(peer: string): DataConnection {
+    const conn = { peer, open: true, send: vi.fn() } as unknown as DataConnection;
+    setState('network.appRole', 'guest');
+    setState('network.hostConn', conn);
+    initPlaylist();
+    return conn;
+  }
+
+  it('accepts an empty revision-zero baseline from a new connection and clears old media owners', async () => {
+    const oldFile = new File(['old'], 'old.mp3', { type: 'audio/mpeg' });
+    const old = fileItem('old.mp3', oldFile);
+    const resident = residentFor(old, oldFile, 91);
+    setState('playlist.items', [old]);
+    setState('playlist.currentQueueItemId', old.queueItemId);
+    setState('playlist.revision', 27);
+    setState('transfer.localSessionId', 92);
+    setState('transfer.currentSessionId', 92);
+    setState('files.current', resident);
+    setState('preload.nextQueueItemId', old.queueItemId);
+    setState('preload.activeTarget', resident);
+    setState('preload.ready', resident);
+    setState('transfer.meta', {
+      name: old.name,
+      type: oldFile.type,
+      queueItemId: old.queueItemId,
+      indexHint: 0,
+      size: oldFile.size,
+      mime: oldFile.type,
+      sessionId: resident.sessionId,
+      total: 1,
+    });
+    setState('preload.sessionId', 92);
+    setState(
+      'preload.sessionState',
+      new Map([
+        [
+          92,
+          {
+            skipped: false,
+            progress: 1,
+            total: 1,
+            name: old.name,
+            queueItemId: old.queueItemId,
+            indexHint: 0,
+            size: oldFile.size,
+            mime: oldFile.type,
+            nextExpectedChunk: 1,
+            finalized: true,
+          },
+        ],
+      ]),
+    );
+    setState('preload.ackSent', new Map([[old.queueItemId, 92]]));
+    setState('recovery.pending', true);
+    setState('recovery.retryCount', 3);
+    setState('playback.pendingRecoveryTarget', {
+      queueItemId: old.queueItemId,
+      indexHint: 0,
+      name: old.name,
+    });
+    const conn = setupGuestConnection('host-rebaseline-empty');
+
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [],
+        revision: 0,
+        currentQueueItemId: null,
+        bootstrap: true,
+      },
+      conn,
+    );
+
+    expect(getState('playlist.items')).toEqual([]);
+    expect(getState('playlist.currentQueueItemId')).toBeNull();
+    expect(getState('playlist.revision')).toBe(0);
+    expect(getState('files.current')).toBeNull();
+    expect(getState('preload.ready')).toBeNull();
+    expect(getState('preload.activeTarget')).toBeNull();
+    expect(getState('transfer.meta')).toBeNull();
+    expect(getState('transfer.localSessionId')).toBe(0);
+    expect(getState('transfer.currentSessionId')).toBe(0);
+    expect(getState('preload.sessionId')).toBe(0);
+    expect(getState('preload.sessionState').size).toBe(0);
+    expect(getState('preload.ackSent').size).toBe(0);
+    expect(getState('recovery.pending')).toBe(false);
+    expect(getState('recovery.retryCount')).toBe(0);
+    expect(getState('playback.pendingRecoveryTarget')).toBeNull();
+  });
+
+  it('clears an identical-looking new authority, then preserves its duplicate replay', async () => {
+    const file = new File(['same'], 'same.mp3', { type: 'audio/mpeg' });
+    const item = fileItem('same.mp3', file);
+    const resident = residentFor(item, file, 92);
+    setState('playlist.items', [item]);
+    setState('playlist.currentQueueItemId', item.queueItemId);
+    setState('playlist.revision', 4);
+    setState('files.current', resident);
+    setState('preload.nextQueueItemId', item.queueItemId);
+    setState('preload.activeTarget', resident);
+    setState('preload.ready', resident);
+    const conn = setupGuestConnection('host-identical');
+    const frame = {
+      type: MSG.PLAYLIST_UPDATE,
+      list: [wireItem(item)],
+      revision: 4,
+      currentQueueItemId: item.queueItemId,
+      bootstrap: true as const,
+    };
+    const warn = vi.spyOn(log, 'warn');
+
+    await handleData(frame, conn);
+    expect(getState('playlist.items')[0]).not.toBe(item);
+    expect(getState('files.current')).toBeNull();
+    expect(getState('preload.ready')).toBeNull();
+
+    setState('files.current', resident);
+    setState('preload.nextQueueItemId', item.queueItemId);
+    setState('preload.activeTarget', resident);
+    setState('preload.ready', resident);
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(item)],
+        revision: 4,
+        currentQueueItemId: item.queueItemId,
+      },
+      conn,
+    );
+
+    expect(getState('files.current')).toBe(resident);
+    expect(getState('preload.ready')).toBe(resident);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('drops removed current media as soon as a non-empty successor snapshot arrives', async () => {
+    const oldFile = new File(['old'], 'old.mp3', { type: 'audio/mpeg' });
+    const old = fileItem('old.mp3', oldFile);
+    const successor = fileItem('next.mp3');
+    const conn = setupGuestConnection('host-current-removal');
+
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(old), wireItem(successor)],
+        revision: 0,
+        currentQueueItemId: old.queueItemId,
+        bootstrap: true,
+      },
+      conn,
+    );
+
+    setState('files.current', residentFor(old, oldFile, 101));
+    setCurrentAudioBuffer({} as AudioBuffer);
+    setState('transfer.meta', {
+      name: old.name,
+      type: oldFile.type,
+      queueItemId: old.queueItemId,
+      indexHint: 0,
+      size: oldFile.size,
+      mime: oldFile.type,
+      sessionId: 101,
+      total: 1,
+    });
+    const successorPreload = {
+      queueItemId: successor.queueItemId,
+      indexHint: 1,
+      name: successor.name,
+      sessionId: 102,
+    };
+    setState('preload.nextQueueItemId', successor.queueItemId);
+    setState('preload.activeTarget', successorPreload);
+    setState('preload.isPreloading', true);
+
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(successor)],
+        revision: 1,
+        currentQueueItemId: successor.queueItemId,
+      },
+      conn,
+    );
+
+    expect(getState('playlist.currentQueueItemId')).toBe(successor.queueItemId);
+    expect(getState('files.current')).toBeNull();
+    expect(getState('transfer.meta')).toBeNull();
+    expect(getCurrentAudioBuffer()).toBeNull();
+    expect(getState('preload.nextQueueItemId')).toBe(successor.queueItemId);
+    expect(getState('preload.activeTarget')).toEqual(successorPreload);
+    expect(getState('preload.isPreloading')).toBe(true);
+  });
+
+  it('allows one rebaseline per connection and opens a fresh gate for a replacement connection', async () => {
+    const item = fileItem('new.mp3');
+    const conn = setupGuestConnection('host-one-shot');
+
+    // A regular update cannot establish authority or consume the bootstrap gate.
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(item)],
+        revision: 5,
+        currentQueueItemId: item.queueItemId,
+      },
+      conn,
+    );
+    expect(getState('playlist.items')).toEqual([]);
+    expect(getState('playlist.revision')).toBe(0);
+
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [],
+        revision: 0,
+        currentQueueItemId: null,
+        bootstrap: true,
+      },
+      conn,
+    );
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(item)],
+        revision: 5,
+        currentQueueItemId: item.queueItemId,
+      },
+      conn,
+    );
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [],
+        revision: 0,
+        currentQueueItemId: null,
+        bootstrap: true,
+      },
+      conn,
+    );
+
+    // The bootstrap marker itself is one-shot; even a higher revision cannot
+    // turn it into a second rebaseline on this connection.
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [],
+        revision: 6,
+        currentQueueItemId: null,
+        bootstrap: true,
+      },
+      conn,
+    );
+
+    expect(getState('playlist.items')).toEqual([wireItem(item)]);
+    expect(getState('playlist.currentQueueItemId')).toBe(item.queueItemId);
+    expect(getState('playlist.revision')).toBe(5);
+
+    const replacement = {
+      peer: 'host-one-shot-replacement',
+      open: true,
+      send: vi.fn(),
+    } as unknown as DataConnection;
+    setState('network.hostConn', replacement);
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [],
+        revision: 0,
+        currentQueueItemId: null,
+        bootstrap: true,
+      },
+      replacement,
+    );
+
+    expect(getState('playlist.items')).toEqual([]);
+    expect(getState('playlist.currentQueueItemId')).toBeNull();
+    expect(getState('playlist.revision')).toBe(0);
+  });
+
+  it('does not consume the bootstrap gate for a malformed baseline', async () => {
+    const item = fileItem('valid-after-malformed.mp3');
+    const conn = setupGuestConnection('host-malformed-first');
+    const warn = vi.spyOn(log, 'warn');
+
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(item), wireItem(item)],
+        revision: 1,
+        currentQueueItemId: item.queueItemId,
+        bootstrap: true,
+      },
+      conn,
+    );
+    expect(warn).toHaveBeenCalledWith(
+      '[Protocol] Invalid payload for playlist-update',
+      expect.any(Array),
+    );
+
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(item)],
+        revision: 0,
+        currentQueueItemId: item.queueItemId,
+        bootstrap: true,
+      },
+      conn,
+    );
+    expect(getState('playlist.items')).toEqual([wireItem(item)]);
+    expect(getState('playlist.currentQueueItemId')).toBe(item.queueItemId);
+    expect(getState('playlist.revision')).toBe(0);
+  });
+
+  it('warns for equal-revision conflicts and malformed snapshots, but only debugs stale ones', async () => {
+    const current = fileItem('current.mp3');
+    const conflict = fileItem('conflict.mp3');
+    const conn = setupGuestConnection('host-classification');
+    const warn = vi.spyOn(log, 'warn');
+    const debug = vi.spyOn(log, 'debug');
+
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(current)],
+        revision: 3,
+        currentQueueItemId: current.queueItemId,
+        bootstrap: true,
+      },
+      conn,
+    );
+    warn.mockClear();
+    debug.mockClear();
+
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(conflict)],
+        revision: 3,
+        currentQueueItemId: conflict.queueItemId,
+      },
+      conn,
+    );
+    expect(warn).toHaveBeenCalledWith(
+      '[Playlist] Rejected conflicting playlist snapshot at equal revision',
+    );
+
+    warn.mockClear();
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [wireItem(current), wireItem(current)],
+        revision: 4,
+        currentQueueItemId: current.queueItemId,
+      },
+      conn,
+    );
+    expect(warn).toHaveBeenCalledWith(
+      '[Protocol] Invalid payload for playlist-update',
+      expect.any(Array),
+    );
+
+    warn.mockClear();
+    await handleData(
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [],
+        revision: 2,
+        currentQueueItemId: null,
+      },
+      conn,
+    );
+    expect(warn).not.toHaveBeenCalled();
+    expect(debug).toHaveBeenCalledWith('[Playlist] Ignored stale playlist snapshot');
+    expect(getState('playlist.revision')).toBe(3);
+  });
+});
+
+describe('late-join playlist bootstrap', () => {
+  it('marks repeat and shuffle mode frames as bootstrap so guests do not toast', () => {
+    const send = vi.fn();
+    const acknowledge = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    initPlaylist();
+    setState('playlist.repeatMode', 2);
+    setState('playlist.isShuffle', false);
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    setState('playlist.items', [a, b]);
+    selectIndex(1);
+
+    bus.emit(
+      'network:peer-bootstrap',
+      conn,
+      (frame) => {
+        send(frame);
+        return true;
+      },
+      acknowledge,
+    );
+
+    expect(send.mock.calls.slice(0, 3).map(([message]) => message.type)).toEqual([
+      MSG.PLAYLIST_UPDATE,
+      MSG.REPEAT_MODE,
+      MSG.SHUFFLE_MODE,
+    ]);
+    expect(send).toHaveBeenCalledWith({ type: MSG.REPEAT_MODE, value: 2, _bootstrap: true });
+    expect(send).toHaveBeenCalledWith({
+      type: MSG.SHUFFLE_MODE,
+      value: false,
+      _bootstrap: true,
+    });
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.PLAYLIST_UPDATE,
+        bootstrap: true,
+        revision: 0,
+        currentQueueItemId: b.queueItemId,
+        list: [
+          expect.objectContaining({ queueItemId: a.queueItemId }),
+          expect.objectContaining({ queueItemId: b.queueItemId }),
+        ],
+      }),
+    );
+    expect(acknowledge).toHaveBeenCalledTimes(1);
+    expect(acknowledge).toHaveBeenCalledWith(true);
+  });
+
+  it('fails the host bootstrap synchronously at the first unsent frame', () => {
+    const conn = { peer: 'guest-1', open: true, send: vi.fn() } as unknown as DataConnection;
+    const send = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(false);
+    const acknowledge = vi.fn();
+    initPlaylist();
+
+    bus.emit('network:peer-bootstrap', conn, send, acknowledge);
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(acknowledge).toHaveBeenCalledTimes(1);
+    expect(acknowledge).toHaveBeenCalledWith(false);
+  });
+
+  it('applies the exact three-frame guest baseline and establishes queue authority', () => {
+    const conn = { peer: 'host-1', open: true, send: vi.fn() } as unknown as DataConnection;
+    setState('network.hostConn', conn);
+    initPlaylist();
+
+    const playlistAck = vi.fn();
+    bus.emit(
+      'network:peer-bootstrap-apply',
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [],
+        revision: 0,
+        currentQueueItemId: null,
+        bootstrap: true,
+      },
+      conn,
+      playlistAck,
+    );
+    expect(playlistAck).toHaveBeenCalledTimes(1);
+    expect(playlistAck).toHaveBeenCalledWith(true);
+    expect(hasQueueAuthority(conn)).toBe(true);
+
+    const repeatAck = vi.fn();
+    bus.emit(
+      'network:peer-bootstrap-apply',
+      { type: MSG.REPEAT_MODE, value: 2, _bootstrap: true },
+      conn,
+      repeatAck,
+    );
+    expect(repeatAck).toHaveBeenCalledTimes(1);
+    expect(repeatAck).toHaveBeenCalledWith(true);
+    expect(getState('playlist.repeatMode')).toBe(2);
+
+    const shuffleAck = vi.fn();
+    bus.emit(
+      'network:peer-bootstrap-apply',
+      { type: MSG.SHUFFLE_MODE, value: true, _bootstrap: true },
+      conn,
+      shuffleAck,
+    );
+    expect(shuffleAck).toHaveBeenCalledTimes(1);
+    expect(shuffleAck).toHaveBeenCalledWith(true);
+    expect(getState('playlist.isShuffle')).toBe(true);
+
+    const repeatedAuthorityAck = vi.fn();
+    bus.emit(
+      'network:peer-bootstrap-apply',
+      {
+        type: MSG.PLAYLIST_UPDATE,
+        list: [],
+        revision: 0,
+        currentQueueItemId: null,
+        bootstrap: true,
+      },
+      conn,
+      repeatedAuthorityAck,
+    );
+    expect(repeatedAuthorityAck).toHaveBeenCalledTimes(1);
+    expect(repeatedAuthorityAck).toHaveBeenCalledWith(false);
+  });
+});
+
+describe('device-local decode failures preserve room playback', () => {
+  // Only a decode failure on the authoritative host may advance the room.
+  // Guest and operator reports are informational under every repeat mode.
+  function setupOpReporter(): ReturnType<typeof vi.fn> {
+    const send = vi.fn();
+    const conn = { peer: 'guest-op', open: true, send } as unknown as DataConnection;
+    setState('network.appRole', 'host');
+    setState('network.activeHostConnByPeerId', new Map([[conn.peer, conn]]));
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-op', true), conn }]);
+    initDecodeHandlers();
+    setState('playlist.items', [fileItem('a.mp3'), fileItem('b.mp3'), fileItem('c.mp3')]);
+    selectIndex(2);
+    return send;
+  }
+
+  it('repeat OFF: an operator device failure does not end the playlist', async () => {
+    vi.useFakeTimers();
+    const send = setupOpReporter();
+    setRepeatMode(0, false);
+
+    const opConn = getState('network.connectedPeers')[0].conn!;
+    await handleData(
+      {
+        type: MSG.GUEST_DECODE_FAILED,
+        queueItemId: getState('playlist.currentQueueItemId')!,
+      },
+      opConn,
+    );
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(currentIndex()).toBe(2);
+    expect(send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: MSG.PAUSE, endOfPlaylist: true }),
+    );
+  });
+
+  it('repeat ALL: an operator device failure does not wrap the playlist', async () => {
+    vi.useFakeTimers();
+    setupOpReporter();
+    setRepeatMode(1, false);
+
+    const opConn = getState('network.connectedPeers')[0].conn!;
+    await handleData(
+      {
+        type: MSG.GUEST_DECODE_FAILED,
+        queueItemId: getState('playlist.currentQueueItemId')!,
+      },
+      opConn,
+    );
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(currentIndex()).toBe(2);
+  });
+});
+
+describe('repeat-one ended-advance after a mid-window removal (SA-12)', () => {
+  it('starts the stable current qid after a lower row is removed', async () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', false), conn }]);
+    initPlaylist();
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const file = new File(['audio'], 'c.mp3', { type: 'audio/mpeg' });
+    const c = fileItem('c.mp3', file);
+    setState('playlist.items', [a, b, c]);
+    selectIndex(2);
+    setState('files.current', residentFor(c, file));
+    setCurrentAudioBuffer({ duration: 120 } as AudioBuffer);
+    setRepeatMode(2, false);
+    const startSpy = vi
+      .spyOn(transport, 'startHostFileAndBroadcastPlay')
+      .mockResolvedValueOnce(true);
+
+    bus.emit('player:ended');
+    // A non-current track removal during the 300ms window shifts the
+    // current index down — the replay broadcast must follow it.
+    bus.emit('playlist:remove-tracks', [a.queueItemId]);
+    await vi.advanceTimersByTimeAsync(320);
+
+    expect(startSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ time: 0, queueItemId: c.queueItemId }),
+    );
+  });
+});
+
+describe('immediate same-track replay stable identity (F-2404)', () => {
+  it('starts the same qid immediately and keeps its stable identity', async () => {
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', false), conn }]);
+    initPlaylist();
+
+    const file = new File([new Uint8Array([1, 2, 3])], 'c.mp3', { type: 'audio/mpeg' });
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3', file);
+    setState('playlist.items', [a, b, c]);
+    selectIndex(2);
+    setState('player.isFirstTrackLoad', false);
+    // A matching resident buffer selects the fast-replay path under test.
+    setState('files.current', residentFor(c, file));
+    setCurrentAudioBuffer({} as AudioBuffer);
+    const startSpy = vi
+      .spyOn(transport, 'startHostFileAndBroadcastPlay')
+      .mockResolvedValueOnce(true);
+
+    await playTrack(c.queueItemId);
+
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect(startSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        time: 0,
+        queueItemId: c.queueItemId,
+        name: 'c.mp3',
+      }),
+    );
+
+    // A later lower-index removal may shift the projected array index, but it
+    // cannot change the occurrence identity already sent to the play kernel.
+    bus.emit('playlist:remove-tracks', [a.queueItemId]);
+    expect(getState('playlist.currentQueueItemId')).toBe(c.queueItemId);
+  });
+
+  it('does not send a transfer prepare for an already-resident replay', async () => {
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', false), conn }]);
+    initPlaylist();
+
+    const file = new File(['audio'], 'loop.mp3', { type: 'audio/mpeg' });
+    const item = fileItem('loop.mp3', file);
+    setState('playlist.items', [item]);
+    selectIndex(0);
+    setState('player.isFirstTrackLoad', false);
+    setState('files.current', residentFor(item, file));
+    setCurrentAudioBuffer({ duration: 120 } as AudioBuffer);
+    const startSpy = vi
+      .spyOn(transport, 'startHostFileAndBroadcastPlay')
+      .mockResolvedValueOnce(true);
+
+    await playTrack(item.queueItemId);
+
+    expect(startSpy).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: MSG.FILE_PREPARE }));
+  });
+});
+
+describe('qid-stable removal and reorder regressions', () => {
+  it('promotes the preloaded successor by qid after current-row removal without redownloading', async () => {
+    const fileA = new File(['a'], 'a.mp3', { type: 'audio/mpeg' });
+    const fileB = new File(['preloaded-b'], 'b.mp3', { type: 'audio/mpeg' });
+    const a = fileItem('a.mp3', fileA);
+    const b = fileItem('b.mp3', fileB);
+    const readyB = residentFor(b, fileB, 42);
+
+    setState('playlist.items', [a, b]);
+    selectIndex(0);
+    setState('files.current', residentFor(a, fileA, 41));
+    setState('preload.nextQueueItemId', b.queueItemId);
+    setState('preload.activeTarget', {
+      queueItemId: b.queueItemId,
+      indexHint: 1,
+      name: b.name,
+      sessionId: readyB.sessionId,
+    });
+    setState('preload.ready', readyB);
+
+    decodeMocks.loadPreloadedTrack.mockImplementation(async (queueItemId) => {
+      const ready = getState('preload.ready');
+      if (!ready || ready.queueItemId !== queueItemId) return false;
+      setState('files.current', ready);
+      setState('preload.ready', null);
+      setState('preload.activeTarget', null);
+      setState('preload.nextQueueItemId', null);
+      return true;
+    });
+
+    initPlaylist();
+    bus.emit('playlist:remove-tracks', [a.queueItemId]);
+
+    await vi.waitFor(() => {
+      expect(decodeMocks.loadPreloadedTrack).toHaveBeenCalledWith(
+        b.queueItemId,
+        expect.any(Number),
+      );
+      expect(getState('files.current')).toBe(readyB);
+    });
+
+    expect(getState('playlist.items')).toEqual([b]);
+    expect(getState('playlist.currentQueueItemId')).toBe(b.queueItemId);
+    expect(getState('files.current')?.blob).toBe(fileB);
+    expect(getState('files.current')?.sessionId).toBe(42);
+    expect(decodeMocks.loadAndBroadcastFile).not.toHaveBeenCalled();
+  });
+
+  it('reorders another row without disturbing current, resident, or preload ownership', async () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', false), conn }]);
+
+    const fileB = new File(['resident-b'], 'b.mp3', { type: 'audio/mpeg' });
+    const fileC = new File(['preloaded-c'], 'c.mp3', { type: 'audio/mpeg' });
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3', fileB);
+    const c = fileItem('c.mp3', fileC);
+    const residentB = residentFor(b, fileB, 51);
+    const readyC = residentFor(c, fileC, 52);
+
+    setState('playlist.items', [a, b, c]);
+    setState('playlist.revision', 8);
+    setState('playlist.currentQueueItemId', b.queueItemId);
+    setState('files.current', residentB);
+    setState('preload.nextQueueItemId', c.queueItemId);
+    setState('preload.activeTarget', {
+      queueItemId: c.queueItemId,
+      indexHint: 2,
+      name: c.name,
+      sessionId: readyC.sessionId,
+    });
+    setState('preload.ready', readyC);
+
+    initPlaylist();
+    bus.emit('playlist:reorder-track', a.queueItemId, null, 8);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(getState('playlist.items').map((item) => item.queueItemId)).toEqual([
+      b.queueItemId,
+      c.queueItemId,
+      a.queueItemId,
+    ]);
+    expect(getState('playlist.revision')).toBe(9);
+    expect(getState('playlist.currentQueueItemId')).toBe(b.queueItemId);
+    expect(getState('files.current')).toBe(residentB);
+    expect(getState('preload.ready')).toBe(readyC);
+    expect(getState('preload.nextQueueItemId')).toBe(c.queueItemId);
+    expect(decodeMocks.loadPreloadedTrack).not.toHaveBeenCalled();
+    expect(decodeMocks.loadAndBroadcastFile).not.toHaveBeenCalled();
+
+    const snapshots = send.mock.calls
+      .map(([message]) => message as { type?: string })
+      .filter((message) => message.type === MSG.PLAYLIST_UPDATE);
+    expect(snapshots).toHaveLength(1);
+  });
+
+  it('recomputes the sequential preload target after reorder without reusing the wrong row', async () => {
+    vi.useFakeTimers();
+    const fileA = new File(['a'], 'a.mp3', { type: 'audio/mpeg' });
+    const fileB = new File(['b'], 'b.mp3', { type: 'audio/mpeg' });
+    const fileC = new File(['c'], 'c.mp3', { type: 'audio/mpeg' });
+    const a = fileItem('a.mp3', fileA);
+    const b = fileItem('b.mp3', fileB);
+    const c = fileItem('c.mp3', fileC);
+    const readyB = residentFor(b, fileB, 61);
+
+    setState('playlist.items', [a, b, c]);
+    setState('playlist.revision', 3);
+    setState('playlist.currentQueueItemId', a.queueItemId);
+    setState('preload.nextQueueItemId', b.queueItemId);
+    setState('preload.activeTarget', readyB);
+    setState('preload.ready', readyB);
+
+    initPlaylist();
+    bus.emit('playlist:reorder-track', c.queueItemId, b.queueItemId, 3);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(getState('playlist.items').map((item) => item.queueItemId)).toEqual([
+      a.queueItemId,
+      c.queueItemId,
+      b.queueItemId,
+    ]);
+    expect(getState('preload.nextQueueItemId')).toBe(c.queueItemId);
+    expect(getState('preload.ready')?.queueItemId).toBe(c.queueItemId);
+    expect(getState('preload.ready')?.blob).toBe(fileC);
+    expect(getState('preload.ready')).not.toBe(readyB);
+  });
+
+  it('keeps shuffle previous-to-next roundtrip stable across reorder and deletion', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3');
+    const d = fileItem('d.mp3');
+    setState('playlist.items', [a, b, c, d]);
+    setState('playlist.currentQueueItemId', c.queueItemId);
+    setRepeatMode(1, false);
+    setShuffle(true, false);
+    initPlaylist();
+
+    expect(advanceToShufflePreviousQueueItemId()).toBe(b.queueItemId);
+    setState('playlist.currentQueueItemId', b.queueItemId);
+
+    const revision = getState('playlist.revision');
+    bus.emit('playlist:reorder-track', a.queueItemId, null, revision);
+    bus.emit('playlist:remove-tracks', [d.queueItemId]);
+
+    expect(advanceToShuffleNextQueueItemId()).toBe(c.queueItemId);
+  });
+
+  it('ignores stale reorder revisions and broadcasts exactly one snapshot for a valid reorder', () => {
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', false), conn }]);
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3');
+    setState('playlist.items', [a, b, c]);
+    setState('playlist.currentQueueItemId', b.queueItemId);
+    setState('playlist.revision', 5);
+    initPlaylist();
+
+    bus.emit('playlist:reorder-track', c.queueItemId, a.queueItemId, 4);
+    expect(getState('playlist.items')).toEqual([a, b, c]);
+    expect(getState('playlist.revision')).toBe(5);
+    expect(send).not.toHaveBeenCalled();
+
+    bus.emit('playlist:reorder-track', c.queueItemId, a.queueItemId, 5);
+    expect(getState('playlist.items')).toEqual([c, a, b]);
+    expect(getState('playlist.revision')).toBe(6);
+    expect(getState('playlist.currentQueueItemId')).toBe(b.queueItemId);
+
+    const snapshots = send.mock.calls
+      .map(([message]) => message as { type?: string; revision?: number })
+      .filter((message) => message.type === MSG.PLAYLIST_UPDATE);
+    expect(snapshots).toEqual([expect.objectContaining({ revision: 6 })]);
+  });
+});
+
+describe('preloaded activation post-play ownership', () => {
+  it('does not broadcast or schedule from an activation superseded while play awaits', async () => {
+    const send = vi.fn();
+    const conn = { peer: 'guest-1', open: true, send } as unknown as DataConnection;
+    setState('network.connectedPeers', [{ ...makeConnectedPeer('guest-1', false), conn }]);
+
+    const fileA = new File(['preloaded-a'], 'a.mp3', { type: 'audio/mpeg' });
+    const fileB = new File(['b'], 'b.mp3', { type: 'audio/mpeg' });
+    const a = fileItem('a.mp3', fileA);
+    const b = fileItem('b.mp3', fileB);
+    const readyA = residentFor(a, fileA, 61);
+    setState('playlist.items', [a, b]);
+    selectIndex(1);
+    setState('preload.nextQueueItemId', a.queueItemId);
+    setState('preload.activeTarget', readyA);
+    setState('preload.ready', readyA);
+
+    decodeMocks.loadPreloadedTrack.mockImplementation(async () => {
+      setState('files.current', readyA);
+      setState('preload.nextQueueItemId', null);
+      setState('preload.activeTarget', null);
+      setState('preload.ready', null);
+      setState('playback.lifecycle', PLAYBACK_STATE.READY);
+      setState('playback.mode', 'file');
+      setState('playback.activity', 'pending');
+      return true;
+    });
+
+    let releaseStart!: () => void;
+    const startGate = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const startSpy = vi
+      .spyOn(transport, 'startHostFileAndBroadcastPlay')
+      .mockImplementationOnce(async (options) => {
+        await startGate;
+        if (options.shouldApply?.() === false) return false;
+        options.onStarted?.();
+        return true;
+      });
+
+    const activation = playTrack(a.queueItemId);
+    await vi.waitFor(() =>
+      expect(startSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          time: 0,
+          queueItemId: a.queueItemId,
+          shouldApply: expect.any(Function),
+          onStarted: expect.any(Function),
+        }),
+      ),
+    );
+
+    // Model a newer playTrack invocation taking ownership while the old
+    // transport is suspended inside AudioContext/engine initialization.
+    newLoadEpoch();
+    setState('playlist.currentQueueItemId', b.queueItemId);
+    setState('playback.lifecycle', PLAYBACK_STATE.PLAYING);
+    setState('playback.mode', 'file');
+    setState('playback.activity', 'playing');
+
+    releaseStart();
+    await activation;
+
+    expect(
+      send.mock.calls.some(
+        ([message]) =>
+          (message as { type?: string; queueItemId?: QueueItemId }).type === MSG.PLAY &&
+          (message as { queueItemId?: QueueItemId }).queueItemId === a.queueItemId,
+      ),
+    ).toBe(false);
+    expect(getManagedTimer('preloadScheduleTimer')).toBeNull();
+  });
+
+  it('keeps offline preloaded playback eligible and schedules the next preload after start', async () => {
+    vi.useFakeTimers();
+    const file = new File(['offline'], 'offline.mp3', { type: 'audio/mpeg' });
+    const item = fileItem('offline.mp3', file);
+    const ready = residentFor(item, file, 71);
+    setState('playlist.items', [item]);
+    setState('preload.nextQueueItemId', item.queueItemId);
+    setState('preload.activeTarget', ready);
+    setState('preload.ready', ready);
+    decodeMocks.loadPreloadedTrack.mockImplementation(async () => {
+      setState('playlist.currentQueueItemId', item.queueItemId);
+      setState('files.current', ready);
+      setCurrentAudioBuffer({ duration: 120 } as AudioBuffer);
+      return true;
+    });
+    const startSpy = vi
+      .spyOn(transport, 'startHostFileAndBroadcastPlay')
+      .mockImplementationOnce(async (options) => {
+        expect(options.shouldApply?.()).toBe(true);
+        options.onStarted?.();
+        return true;
+      });
+
+    await playTrack(item.queueItemId);
+
+    expect(startSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ time: 0, queueItemId: item.queueItemId }),
+    );
+    expect(getManagedTimer('preloadScheduleTimer')).not.toBeNull();
+  });
+});
+
+describe('standard operator queue mutation requests', () => {
+  function setupOperator(isOp = true): {
+    conn: DataConnection;
+    send: ReturnType<typeof vi.fn>;
+  } {
+    const send = vi.fn();
+    const conn = { peer: 'operator-1', open: true, send } as unknown as DataConnection;
+    setState('network.appRole', 'host');
+    setState('network.activeHostConnByPeerId', new Map([[conn.peer, conn]]));
+    setState('network.connectedPeers', [{ ...makeConnectedPeer(conn.peer, isOp), conn }]);
+    initPlaylist();
+    return { conn, send };
+  }
+
+  it('rejects legacy administrator removal requests even when the row IDs are valid', async () => {
+    const { conn, send } = setupOperator();
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3');
+    setState('playlist.items', [a, b, c]);
+    setState('playlist.currentQueueItemId', a.queueItemId);
+    setState('playlist.revision', 9);
+    const request = {
+      type: MSG.REQUEST_PLAYLIST_REMOVE,
+      requestId: nextQueueItemId(),
+      baseRevision: 7,
+      queueItemIds: [b.queueItemId],
+    } as const;
+
+    await handleData(request, conn);
+    expect(getState('playlist.items').map((item) => item.queueItemId)).toEqual([
+      a.queueItemId,
+      b.queueItemId,
+      c.queueItemId,
+    ]);
+    expect(getState('playlist.revision')).toBe(9);
+
+    send.mockClear();
+    await handleData(request, conn);
+    expect(getState('playlist.revision')).toBe(9);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.OPERATOR_QUEUE_MUTATION_RESULT,
+        outcome: 'rejected',
+        code: 'unauthorized',
+      }),
+    );
+  });
+
+  it('rejects legacy administrator reorder requests with an explicit result', async () => {
+    const { conn, send } = setupOperator();
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    const c = fileItem('c.mp3');
+    setState('playlist.items', [a, b, c]);
+    setState('playlist.revision', 4);
+
+    await handleData(
+      {
+        type: MSG.REQUEST_PLAYLIST_REORDER,
+        requestId: nextQueueItemId(),
+        baseRevision: 2,
+        queueItemId: c.queueItemId,
+        beforeQueueItemId: a.queueItemId,
+      },
+      conn,
+    );
+    expect(getState('playlist.items').map((item) => item.queueItemId)).toEqual([
+      a.queueItemId,
+      b.queueItemId,
+      c.queueItemId,
+    ]);
+    expect(getState('playlist.revision')).toBe(4);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.OPERATOR_QUEUE_MUTATION_RESULT,
+        outcome: 'rejected',
+        code: 'unauthorized',
+      }),
+    );
+
+    send.mockClear();
+    await handleData(
+      {
+        type: MSG.REQUEST_PLAYLIST_REORDER,
+        requestId: nextQueueItemId(),
+        baseRevision: 4,
+        queueItemId: c.queueItemId,
+        beforeQueueItemId: a.queueItemId,
+      },
+      conn,
+    );
+    expect(getState('playlist.revision')).toBe(4);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.OPERATOR_QUEUE_MUTATION_RESULT,
+        outcome: 'rejected',
+        code: 'unauthorized',
+      }),
+    );
+
+    send.mockClear();
+    await handleData(
+      {
+        type: MSG.REQUEST_PLAYLIST_REORDER,
+        requestId: nextQueueItemId(),
+        baseRevision: 4,
+        queueItemId: b.queueItemId,
+        beforeQueueItemId: nextQueueItemId(),
+      },
+      conn,
+    );
+    expect(getState('playlist.revision')).toBe(4);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.OPERATOR_QUEUE_MUTATION_RESULT,
+        outcome: 'rejected',
+        code: 'unauthorized',
+      }),
+    );
+  });
+
+  it('rejects non-operators, malformed shapes, and replaced connections', async () => {
+    const { conn } = setupOperator(false);
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    setState('playlist.items', [a, b]);
+    setState('playlist.revision', 3);
+    const base = {
+      type: MSG.REQUEST_PLAYLIST_REMOVE,
+      requestId: nextQueueItemId(),
+      baseRevision: 3,
+      queueItemIds: [b.queueItemId],
+    } as const;
+
+    await handleData(base, conn);
+    await handleData({ ...base, requestId: nextQueueItemId(), unexpected: true }, conn);
+    const stale = { ...conn, send: vi.fn() } as unknown as DataConnection;
+    await handleData({ ...base, requestId: nextQueueItemId() }, stale);
+
+    expect(getState('playlist.items')).toEqual([a, b]);
+    expect(getState('playlist.revision')).toBe(3);
+  });
+
+  it('routes removal and reorder for a standard media manager without playback permission', () => {
+    const send = vi.fn();
+    const hostConn = { peer: 'host', open: true, send } as unknown as DataConnection;
+    setState('network.appRole', 'guest');
+    setState('network.hostConn', hostConn);
+    setState('network.isOperator', true);
+    setState('network.standardRoomCapabilities', ['media.add', 'queue.mutate', 'asset.upload']);
+    const a = fileItem('a.mp3');
+    const b = fileItem('b.mp3');
+    setState('playlist.items', [a, b]);
+    setState('playlist.revision', 6);
+    initPlaylist();
+
+    bus.emit('playlist:remove-tracks', [b.queueItemId]);
+    bus.emit('playlist:reorder-track', b.queueItemId, a.queueItemId, 6);
+
+    expect(getState('playlist.items')).toEqual([a, b]);
+    expect(getState('playlist.revision')).toBe(6);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.REQUEST_PLAYLIST_REMOVE,
+        baseRevision: 6,
+        queueItemIds: [b.queueItemId],
+      }),
+    );
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MSG.REQUEST_PLAYLIST_REORDER,
+        baseRevision: 6,
+        queueItemId: b.queueItemId,
+        beforeQueueItemId: a.queueItemId,
+      }),
+    );
+  });
+
+  it('appends only a fully received supported operator file on the host', () => {
+    const { conn } = setupOperator();
+    const file = new File(['audio'], 'operator.mp3', { type: 'audio/mpeg' });
+    const acknowledge = vi.fn();
+
+    bus.emit('standard-room:operator-file-received', file, acknowledge, conn);
+
+    expect(getState('playlist.items')).toEqual([
+      expect.objectContaining({ type: 'file', file, name: 'operator.mp3' }),
+    ]);
+    expect(getState('playlist.revision')).toBe(1);
+    expect(acknowledge).toHaveBeenCalledWith(true);
+  });
+});
+
+describe('request-setting authorization', () => {
+  beforeEach(() => {
+    initPlaylist();
+  });
+
+  it('lets demo non-operators use only the settings exposed by demo UI', async () => {
+    const conn = makeConnection('guest-demo');
+    setState('demo.active', true);
+
+    await handleData({ type: MSG.REQUEST_SETTING, settingType: MSG.VBASS, value: 60 }, conn);
+    expect(getState('audio.virtualBass')).toBeCloseTo(0.6);
+
+    await handleData({ type: MSG.REQUEST_SETTING, settingType: MSG.EXCITER, value: 1 }, conn);
+    expect(getState('audio.exciter')).toBe(true);
+
+    await handleData(
+      { type: MSG.REQUEST_SETTING, settingType: MSG.STEREO_WIDTH, value: 120 },
+      conn,
+    );
+    expect(getState('audio.stereoWidth')).toBeCloseTo(1.2);
+
+    const beforeDecay = getState('audio.reverbDecay');
+    await handleData({ type: MSG.REQUEST_SETTING, settingType: MSG.REVERB_DECAY, value: 8 }, conn);
+    expect(getState('audio.reverbDecay')).toBe(beforeDecay);
+  });
+
+  it('lets a standard media manager set repeat and shuffle without playback control', async () => {
+    const conn = makeConnection('media-manager');
+    setState('network.appRole', 'host');
+    setState('network.activeHostConnByPeerId', new Map([[conn.peer, conn]]));
+    setState('network.connectedPeers', [
+      {
+        ...makeConnectedPeer(conn.peer, true),
+        conn,
+        roomCapabilities: ['media.add', 'queue.mutate', 'asset.upload'],
+      },
+    ]);
+
+    await handleData({ type: MSG.REQUEST_SETTING, settingType: MSG.REPEAT_MODE, value: 1 }, conn);
+    await handleData(
+      { type: MSG.REQUEST_SETTING, settingType: MSG.SHUFFLE_MODE, value: true },
+      conn,
+    );
+
+    expect(getState('playlist.repeatMode')).toBe(1);
+    expect(getState('playlist.isShuffle')).toBe(true);
+  });
+
+  it('lets standard administrators control full room effects', async () => {
+    const conn = makeConnection('guest-op');
+    setState('network.appRole', 'host');
+    setState('network.activeHostConnByPeerId', new Map([[conn.peer, conn]]));
+    setState('network.connectedPeers', [{ ...makeConnectedPeer(conn.peer, true), conn }]);
+
+    await handleData({ type: MSG.REQUEST_SETTING, settingType: MSG.REVERB_DECAY, value: 8 }, conn);
+
+    expect(getState('audio.reverbDecay')).toBe(8);
+  });
+});

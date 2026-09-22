@@ -1,0 +1,1394 @@
+/**
+ * MUSIXQUARE — Message Protocol & Dispatch
+ *
+ * Manages: Message validation, handler registry, dispatch (handleData).
+ */
+
+import { log } from '../core/log.ts';
+import { bus } from '../core/events.ts';
+import { getState } from '../core/state.ts';
+import {
+  MSG,
+  CHUNK_SIZE,
+  REMOTE_SHARE_MAX_BYTES,
+  BOT_RATE_LIMIT_MAX_RETRY_SECONDS,
+  MAX_GUEST_SLOTS,
+  MAX_SENDER_LABEL_LENGTH,
+} from '../core/constants.ts';
+import type { MsgType } from '../core/constants.ts';
+import { isQueueItemId, parsePlaylistSnapshot } from '../player/queue-model.ts';
+import type {
+  AnyProtocolMsg,
+  DataConnection,
+  ProtocolMsg,
+  RoomCapability,
+} from '../types/index.ts';
+import { hasQueueAuthority } from './queue-authority.ts';
+import { verifyPeerCapability } from '../rooms/authority.ts';
+import { isFileRequestId } from './file-request-authority.ts';
+import { parseRoomEffectsState } from '../core/room-effects.ts';
+import { isJoinBootstrapApplied, isJoinBootstrapHello } from './join-bootstrap.ts';
+
+// ─── Message Validation ─────────────────────────────────────────────
+
+/**
+ * Validate message structure — must be an object with a `type` field.
+ * Optionally checks for required fields.
+ */
+export function validateMessage(
+  data: unknown,
+  requiredFields: string[] = [],
+): data is Record<string, unknown> {
+  if (!data || typeof data !== 'object') return false;
+  const msg = data as Record<string, unknown>;
+  if (!msg.type) return false;
+  for (const field of requiredFields) {
+    if (msg[field] === undefined || msg[field] === null) {
+      log.warn(`[Network] Missing required field '${field}' in message:`, msg.type);
+      return false;
+    }
+  }
+  return true;
+}
+
+// ─── Lightweight Protocol Validators ─────────────────────────────────
+// Validate bounded/high-risk payloads before dispatch. Every declared type is
+// classified below, while authority-guarded no-payload frames remain rolling
+// compatible instead of requiring one monolithic exact schema.
+
+export const isArrayBufferLike = (v: unknown): boolean =>
+  v instanceof ArrayBuffer ||
+  v instanceof Uint8Array ||
+  (v != null &&
+    typeof v === 'object' &&
+    Object.prototype.toString.call(v) === '[object ArrayBuffer]');
+
+const REMOTE_OBJECT_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const STANDARD_REMOTE_ROOM_ID_RE = /^[1-9]\d{5}$/u;
+const DOWNLOAD_TOKEN_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u;
+const DOWNLOAD_TOKEN_MAX_LENGTH = 2048;
+// Cloudflare signaling's authenticated PRO participant identifier contract.
+// Keep member-management requests to one small opaque identifier so callers
+// cannot smuggle a connection object or other coordinator-owned state.
+const PRO_PEER_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
+const STANDARD_ROOM_MEMBER_ID_RE = /^member_[A-Za-z0-9_-]{22}$/;
+const ROOM_MEMBER_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+// Shared with the authenticated PRO API idempotency-key contract. BOT chat
+// correlation ids are opaque, bounded tokens; they never contain a room or
+// participant identity.
+const BOT_REQUEST_ID_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._~-]{14,126})[A-Za-z0-9]$/;
+// Host-created, opaque transition identity. The production generator uses
+// URL-safe base36/UUID-like components; keeping the wire alphabet narrow also
+// prevents control characters from reaching diagnostics and map keys.
+const YOUTUBE_ZERO_START_RUN_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
+const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+const PRO_SYSTEM_AUDIO_PUBLIC_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
+const OPERATOR_FILE_UPLOAD_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// Tight numeric validator — rejects NaN, Infinity, -Infinity, and out-of-range
+// values. Without this, Number(undefined) → NaN silently passes typeof===number,
+// and a malicious peer could send chunkIndex=Infinity to explode a reorder buffer Map.
+const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const isNonNegInt = (v: unknown): v is number => isFiniteNumber(v) && v >= 0 && Number.isInteger(v);
+const isNonNegSafeInt = (v: unknown): v is number =>
+  typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+const isPositiveSafeInt = (v: unknown): v is number =>
+  typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
+const isNonNegFiniteSafeNumber = (v: unknown): v is number =>
+  isFiniteNumber(v) && v >= 0 && v <= Number.MAX_SAFE_INTEGER;
+
+export function isSafeOperatorUploadFileName(value: unknown): value is string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > 255 ||
+    value.trim() !== value ||
+    value.includes('/') ||
+    value.includes('\\')
+  ) {
+    return false;
+  }
+  return ![...value].some((character) => {
+    const codePoint = character.charCodeAt(0);
+    return codePoint <= 31 || codePoint === 127;
+  });
+}
+
+export function isOperatorUploadMime(value: unknown): value is string {
+  return (
+    typeof value === 'string' && value.length > 0 && value.length <= 128 && value.trim() === value
+  );
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return (
+    required.every((key) => Object.prototype.hasOwnProperty.call(value, key)) &&
+    Object.keys(value).every((key) => allowed.has(key))
+  );
+}
+
+const REMOTE_FILE_SHARE_COMMON_REQUIRED_KEYS = Object.freeze([
+  'type',
+  'roomId',
+  'objectId',
+  'name',
+  'mime',
+  'size',
+  'queueItemId',
+  'sessionId',
+  'expiresAt',
+] as const);
+const REMOTE_FILE_SHARE_COMMON_OPTIONAL_KEYS = Object.freeze([
+  'downloadUrl',
+  'delivery',
+  'preload',
+] as const);
+const REMOTE_FILE_SHARE_REQUIRED_KEYS = Object.freeze([
+  ...REMOTE_FILE_SHARE_COMMON_REQUIRED_KEYS,
+  'storageFormat',
+  'storedSize',
+  'downloadToken',
+] as const);
+
+function hasValidRemoteFileShareCommonFields(d: Record<string, unknown>): boolean {
+  return (
+    d.type === MSG.REMOTE_FILE_SHARE &&
+    typeof d.roomId === 'string' &&
+    d.roomId.length > 0 &&
+    d.roomId.length <= 80 &&
+    typeof d.objectId === 'string' &&
+    REMOTE_OBJECT_ID_RE.test(d.objectId) &&
+    (d.downloadUrl === undefined ||
+      (typeof d.downloadUrl === 'string' &&
+        d.downloadUrl.length > 0 &&
+        d.downloadUrl.length <= 2048)) &&
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    typeof d.mime === 'string' &&
+    isQueueItemId(d.queueItemId) &&
+    isPositiveSafeInt(d.sessionId) &&
+    Number.isSafeInteger(d.size) &&
+    (d.size as number) > 0 &&
+    (d.size as number) <= REMOTE_SHARE_MAX_BYTES &&
+    isFiniteNumber(d.expiresAt) &&
+    (d.delivery === undefined || d.delivery === 'r2') &&
+    (d.preload === undefined || d.preload === true)
+  );
+}
+
+function isRemoteFileShare(d: Record<string, unknown>): boolean {
+  if (!hasValidRemoteFileShareCommonFields(d)) return false;
+  return (
+    hasExactKeys(d, REMOTE_FILE_SHARE_REQUIRED_KEYS, REMOTE_FILE_SHARE_COMMON_OPTIONAL_KEYS) &&
+    d.storageFormat === 'whole-v1' &&
+    STANDARD_REMOTE_ROOM_ID_RE.test(d.roomId as string) &&
+    Number.isSafeInteger(d.storedSize) &&
+    d.storedSize === d.size &&
+    typeof d.downloadToken === 'string' &&
+    d.downloadToken.length >= 32 &&
+    d.downloadToken.length <= DOWNLOAD_TOKEN_MAX_LENGTH &&
+    DOWNLOAD_TOKEN_RE.test(d.downloadToken)
+  );
+}
+
+function isBotChatResult(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  switch (result.kind) {
+    case 'answer':
+      return (
+        hasExactKeys(result, ['kind', 'text']) &&
+        typeof result.text === 'string' &&
+        result.text.trim().length > 0 &&
+        result.text.length <= 500
+      );
+    case 'added':
+      return (
+        hasExactKeys(result, ['kind', 'count', 'playbackChanged']) &&
+        Number.isSafeInteger(result.count) &&
+        (result.count as number) >= 1 &&
+        (result.count as number) <= 3 &&
+        typeof result.playbackChanged === 'boolean'
+      );
+    case 'failed':
+      return hasExactKeys(result, ['kind']);
+    case 'rate_limited':
+      return (
+        hasExactKeys(result, ['kind', 'retryAfterSeconds']) &&
+        Number.isSafeInteger(result.retryAfterSeconds) &&
+        (result.retryAfterSeconds as number) >= 1 &&
+        (result.retryAfterSeconds as number) <= BOT_RATE_LIMIT_MAX_RETRY_SECONDS
+      );
+    default:
+      return false;
+  }
+}
+
+// Max 200,000 chunks ≈ 12.2 GiB at 64 KiB/chunk; prevents an unbounded total.
+const MAX_FILE_TOTAL = 200_000;
+
+const hasExactFileSizeContract = (d: Record<string, unknown>): boolean =>
+  isPositiveSafeInt(d.size) &&
+  isPositiveSafeInt(d.total) &&
+  (d.total as number) <= MAX_FILE_TOTAL &&
+  (d.total as number) === Math.ceil((d.size as number) / CHUNK_SIZE);
+
+// Per-chunk byte cap. Host always sends exactly CHUNK_SIZE (or smaller for
+// the tail chunk via file.slice()), so anything larger is a malformed or
+// hostile frame. Caps memory cost of the reorder buffer at 500 × CHUNK_SIZE.
+const MAX_CHUNK_BYTES = CHUNK_SIZE;
+const isBoundedChunk = (v: unknown): boolean =>
+  isArrayBufferLike(v) && (v as ArrayBuffer | Uint8Array).byteLength <= MAX_CHUNK_BYTES;
+
+// Frames without a top-level queueItemId that still create/mutate a media
+// owner. Queue-scoped frames are detected generically below.
+const PRE_AUTHORITY_MEDIA_TYPES: ReadonlySet<string> = new Set([
+  MSG.FILE_WAIT,
+  MSG.SYSTEM_AUDIO_START,
+  MSG.SYSTEM_AUDIO_SFU_READY,
+  MSG.SYSTEM_AUDIO_STOP,
+  MSG.DEMO_ENTER,
+  MSG.DEMO_PLAY,
+  MSG.DEMO_PAUSE,
+  MSG.DEMO_EXIT,
+  MSG.YOUTUBE_PLAYLIST_INFO,
+  MSG.YOUTUBE_SUB_TITLE_UPDATE,
+]);
+
+function requiresQueueAuthority(msgType: MsgType, msg: Record<string, unknown>): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(msg, 'queueItemId') ||
+    PRE_AUTHORITY_MEDIA_TYPES.has(msgType)
+  );
+}
+const isBoundedNumber = (v: unknown, min: number, max: number): boolean =>
+  isFiniteNumber(v) && v >= min && v <= max;
+const isReverbPreset = (v: unknown): boolean => v === 'off' || v === 'studio' || v === 'arena';
+const isRepeatMode = (v: unknown): boolean => v === 0 || v === 1 || v === 2;
+const hasValidBootstrapFlag = (data: Record<string, unknown>): boolean =>
+  data._bootstrap === undefined || typeof data._bootstrap === 'boolean';
+
+const ROOM_WIRE_CAPABILITIES: ReadonlySet<RoomCapability> = new Set([
+  'media.add',
+  'queue.mutate',
+  'playback.control',
+  'effects.control',
+  'asset.upload',
+  'system-audio.publish',
+  'members.manage',
+  'chat.notice',
+  'room.configure',
+  'coordinator.eligible',
+]);
+const DEVICE_CONNECTION_TYPES = new Set(['local', 'remote', 'unknown']);
+const DEVICE_PLATFORMS = new Set(['ios', 'android', 'windows', 'macos', 'linux', 'other']);
+const isWireAbsent = (value: unknown): value is null | undefined => value == null;
+
+function isBoundedWireString(
+  value: unknown,
+  maxLength: number,
+  allowEmpty = false,
+): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length <= maxLength &&
+    (allowEmpty || value.length > 0) &&
+    ![...value].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 31 || codePoint === 127;
+    })
+  );
+}
+
+function isKnownRoomCapabilityList(value: unknown): value is RoomCapability[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= ROOM_WIRE_CAPABILITIES.size &&
+    value.every(
+      (capability) =>
+        typeof capability === 'string' && ROOM_WIRE_CAPABILITIES.has(capability as RoomCapability),
+    ) &&
+    new Set(value).size === value.length
+  );
+}
+
+function isDeviceListUpdate(data: Record<string, unknown>): boolean {
+  // Standard-room wire projection only. PRO presence is parsed from its
+  // server snapshot and projected locally without traversing handleData().
+  if (
+    !Array.isArray(data.list) ||
+    data.list.length === 0 ||
+    data.list.length > MAX_GUEST_SLOTS + 1
+  ) {
+    return false;
+  }
+
+  const ids = new Set<string>();
+  let hostCount = 0;
+  for (const value of data.list) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const device = value as Record<string, unknown>;
+    if (
+      (device.id !== null && !isBoundedWireString(device.id, 128)) ||
+      !isBoundedWireString(device.label, 64) ||
+      device.status !== 'connected' ||
+      typeof device.isHost !== 'boolean' ||
+      (!isWireAbsent(device.isOp) && typeof device.isOp !== 'boolean') ||
+      (!isWireAbsent(device.connectionType) &&
+        (typeof device.connectionType !== 'string' ||
+          !DEVICE_CONNECTION_TYPES.has(device.connectionType))) ||
+      (!isWireAbsent(device.devicePlatform) &&
+        (typeof device.devicePlatform !== 'string' ||
+          !DEVICE_PLATFORMS.has(device.devicePlatform))) ||
+      (!isWireAbsent(device.joinOrder) &&
+        (!isNonNegSafeInt(device.joinOrder) || (device.joinOrder as number) > MAX_GUEST_SLOTS)) ||
+      (!isWireAbsent(device.memberId) &&
+        (typeof device.memberId !== 'string' || !ROOM_MEMBER_ID_RE.test(device.memberId))) ||
+      (!isWireAbsent(device.memberDisplayNumber) &&
+        (!isNonNegSafeInt(device.memberDisplayNumber) ||
+          (device.memberDisplayNumber as number) > MAX_GUEST_SLOTS + 1)) ||
+      (!isWireAbsent(device.isAuthenticated) && typeof device.isAuthenticated !== 'boolean') ||
+      (!isWireAbsent(device.capabilities) && !isKnownRoomCapabilityList(device.capabilities))
+    ) {
+      return false;
+    }
+
+    if (device.isHost) {
+      hostCount += 1;
+      if (!isWireAbsent(device.joinOrder) && device.joinOrder !== 0) return false;
+    } else if (device.id === null) {
+      return false;
+    }
+
+    if (typeof device.id === 'string') {
+      if (ids.has(device.id)) return false;
+      ids.add(device.id);
+    }
+  }
+  return hostCount === 1;
+}
+
+function isChatModerationTarget(data: Record<string, unknown>): boolean {
+  return (
+    isBoundedWireString(data.targetId, 128) &&
+    isBoundedWireString(data.targetLabel, MAX_SENDER_LABEL_LENGTH)
+  );
+}
+
+const isYouTubeZeroStartPlatform = (value: unknown): boolean =>
+  value === 'ios' || value === 'android' || value === 'other';
+const isYouTubePlayerState = (value: unknown): boolean =>
+  value === -1 || value === 0 || value === 1 || value === 2 || value === 3 || value === 5;
+const isYouTubePosition = (value: unknown): boolean => isBoundedNumber(value, 0, 31_536_000);
+const isYouTubeZeroStartRunId = (value: unknown): boolean =>
+  typeof value === 'string' && YOUTUBE_ZERO_START_RUN_ID_RE.test(value);
+const isYouTubeVideoId = (value: unknown): boolean =>
+  typeof value === 'string' && YOUTUBE_VIDEO_ID_RE.test(value);
+const isYouTubeZeroStartLead = (value: unknown): boolean => isBoundedNumber(value, -600, 600);
+
+function hasYouTubeZeroStartIdentity(data: Record<string, unknown>): boolean {
+  return (
+    data.version === 1 &&
+    isYouTubeZeroStartRunId(data.runId) &&
+    isPositiveSafeInt(data.sequence) &&
+    isQueueItemId(data.queueItemId)
+  );
+}
+
+function isYouTubeZeroStartCohort(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.length <= 100 &&
+    value.every((peerId) => typeof peerId === 'string' && PRO_PEER_ID_RE.test(peerId)) &&
+    new Set(value).size === value.length
+  );
+}
+
+function isProSystemAudioPublication(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const publication = value as Record<string, unknown>;
+  if (
+    !hasExactKeys(publication, ['publicationId', 'sessionId', 'track']) ||
+    typeof publication.publicationId !== 'string' ||
+    !PRO_SYSTEM_AUDIO_PUBLIC_ID_RE.test(publication.publicationId) ||
+    typeof publication.sessionId !== 'string' ||
+    !PRO_SYSTEM_AUDIO_PUBLIC_ID_RE.test(publication.sessionId)
+  ) {
+    return false;
+  }
+  const trackValue = publication.track;
+  if (!trackValue || typeof trackValue !== 'object' || Array.isArray(trackValue)) return false;
+  const track = trackValue as Record<string, unknown>;
+  return (
+    hasExactKeys(track, ['trackName'], ['mid']) &&
+    typeof track.trackName === 'string' &&
+    track.trackName.length > 0 &&
+    track.trackName.length <= 160 &&
+    track.trackName.trim() === track.trackName &&
+    (track.mid === undefined ||
+      (typeof track.mid === 'string' &&
+        track.mid.length > 0 &&
+        track.mid.length <= 64 &&
+        track.mid.trim() === track.mid))
+  );
+}
+
+function isProSystemAudioState(data: Record<string, unknown>): boolean {
+  if (
+    !hasExactKeys(data, [
+      'type',
+      'version',
+      'generation',
+      'status',
+      'ownerParticipantId',
+      'ownerDisplayName',
+      'claimExpiresAt',
+      'liveExpiresAt',
+      'publication',
+    ]) ||
+    data.version !== 2 ||
+    !isNonNegSafeInt(data.generation) ||
+    (data.ownerDisplayName !== null &&
+      (typeof data.ownerDisplayName !== 'string' || data.ownerDisplayName.length > 64))
+  ) {
+    return false;
+  }
+  if (data.status === 'idle') {
+    return (
+      data.ownerParticipantId === null &&
+      data.ownerDisplayName === null &&
+      data.claimExpiresAt === null &&
+      data.liveExpiresAt === null &&
+      data.publication === null
+    );
+  }
+  if (
+    !isPositiveSafeInt(data.generation) ||
+    typeof data.ownerParticipantId !== 'string' ||
+    !PRO_SYSTEM_AUDIO_PUBLIC_ID_RE.test(data.ownerParticipantId) ||
+    typeof data.ownerDisplayName !== 'string' ||
+    data.ownerDisplayName.length === 0 ||
+    data.ownerDisplayName.length > 64 ||
+    data.ownerDisplayName.trim() !== data.ownerDisplayName
+  ) {
+    return false;
+  }
+  if (data.status === 'preparing') {
+    return (
+      isPositiveSafeInt(data.claimExpiresAt) &&
+      data.liveExpiresAt === null &&
+      data.publication === null
+    );
+  }
+  return (
+    data.status === 'live' &&
+    data.claimExpiresAt === null &&
+    isPositiveSafeInt(data.liveExpiresAt) &&
+    isProSystemAudioPublication(data.publication)
+  );
+}
+
+function isValidRequestSetting(data: Record<string, unknown>): boolean {
+  if (typeof data.settingType !== 'string') return false;
+
+  switch (data.settingType) {
+    case 'repeat-mode':
+      return isRepeatMode(data.value);
+    case 'shuffle-mode':
+      return typeof data.value === 'boolean';
+    case 'eq':
+      return isNonNegInt(data.band) && data.band < 5 && isBoundedNumber(data.value, -12, 12);
+    case MSG.PREAMP:
+      return isBoundedNumber(data.value, -48, 12);
+    case MSG.VBASS:
+    case MSG.REVERB:
+      return isBoundedNumber(data.value, 0, 100);
+    case MSG.EXCITER:
+      // Toggle-only effect; value is 0 (off) or 1 (on). Reuse the number wire
+      // shape so the existing REQUEST_SETTING dispatcher (playlist.ts) and
+      // bootstrap path (effects.ts network:peer-connected) work without a
+      // boolean special case.
+      return data.value === 0 || data.value === 1;
+    case MSG.STEREO_WIDTH:
+      return isBoundedNumber(data.value, 0, 200);
+    case MSG.REVERB_TYPE:
+      return isReverbPreset(data.value);
+    case MSG.REVERB_DECAY:
+      return isBoundedNumber(data.value, 0.1, 10);
+    case MSG.REVERB_PREDELAY:
+      return isBoundedNumber(data.value, 0, 0.5);
+    case MSG.REVERB_LOWCUT:
+    case MSG.REVERB_HIGHCUT:
+      return isBoundedNumber(data.value, 0, 100);
+    default:
+      return false;
+  }
+}
+
+function isValidSettingsSyncState(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const settings = value as Record<string, unknown>;
+  return (
+    hasExactKeys(settings, ['masterVolume', 'effects']) &&
+    isBoundedNumber(settings.masterVolume, 0, 1) &&
+    parseRoomEffectsState(settings.effects) !== null
+  );
+}
+
+const PROTOCOL_VALIDATORS: Partial<Record<MsgType, (data: Record<string, unknown>) => boolean>> = {
+  // Optional for rolling compatibility. Unknown bounded strings reach the
+  // consumer and normalize to DISPLAY rather than becoming user-visible.
+  [MSG.SYSTEM_AUDIO_START]: (d) =>
+    d.surface === undefined || (typeof d.surface === 'string' && d.surface.length <= 16),
+  [MSG.JOIN_BOOTSTRAP_HELLO]: isJoinBootstrapHello,
+  [MSG.JOIN_BOOTSTRAP_APPLIED]: isJoinBootstrapApplied,
+  [MSG.SETTINGS_SYNC_SNAPSHOT]: (d) =>
+    hasExactKeys(d, ['type', 'version', 'epoch', 'sequence', 'settings'], ['_bootstrap']) &&
+    d.version === 1 &&
+    isNonNegSafeInt(d.epoch) &&
+    isNonNegSafeInt(d.sequence) &&
+    isValidSettingsSyncState(d.settings) &&
+    (d._bootstrap === undefined || d._bootstrap === true),
+  [MSG.REQUEST_SETTINGS_SYNC_SNAPSHOT]: (d) =>
+    hasExactKeys(d, ['type', 'version']) && d.version === 1,
+  [MSG.PUBLISH_SETTINGS_SYNC_SNAPSHOT]: (d) =>
+    hasExactKeys(d, ['type', 'version', 'settings']) &&
+    d.version === 1 &&
+    isValidSettingsSyncState(d.settings),
+  [MSG.PRO_ROOM_INVALIDATED]: (d) =>
+    isNonNegSafeInt(d.revision) && isNonNegSafeInt(d.playlistRevision),
+  [MSG.PRO_SYSTEM_AUDIO_HINT]: (d) =>
+    hasExactKeys(d, ['type', 'generation']) && isNonNegSafeInt(d.generation),
+  [MSG.PRO_SYSTEM_AUDIO_STATE]: isProSystemAudioState,
+  [MSG.PLAY]: (d) =>
+    isQueueItemId(d.queueItemId) &&
+    isFiniteNumber(d.time) &&
+    (d.name === undefined || d.name === null || typeof d.name === 'string') &&
+    (d.hostPlayAt === undefined || isFiniteNumber(d.hostPlayAt)) &&
+    (d.hostStartAt === undefined || (isFiniteNumber(d.hostStartAt) && d.hostStartAt > 0)),
+  [MSG.PAUSE]: (d) =>
+    (d.queueItemId === null || isQueueItemId(d.queueItemId)) &&
+    isFiniteNumber(d.time) &&
+    (d.endOfPlaylist === undefined || typeof d.endOfPlaylist === 'boolean') &&
+    (d.reason === undefined ||
+      d.reason === 'pause' ||
+      d.reason === 'stop' ||
+      d.reason === 'seek' ||
+      d.reason === 'transition' ||
+      d.reason === 'end-of-playlist'),
+  [MSG.PLAY_PRELOADED]: (d) =>
+    isQueueItemId(d.queueItemId) &&
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    (d.mime === undefined || typeof d.mime === 'string'),
+  [MSG.VOLUME]: (d) => isBoundedNumber(d.value, 0, 1) && hasValidBootstrapFlag(d),
+  [MSG.DEVICE_LIST_UPDATE]: isDeviceListUpdate,
+  [MSG.SESSION_FULL]: (d) =>
+    isBoundedWireString(d.message, 512) &&
+    (d.i18nKey === undefined || isBoundedWireString(d.i18nKey, 127)),
+  [MSG.KICK_DEVICE]: (d) => d.reason === undefined || isBoundedWireString(d.reason, 256),
+  [MSG.OPERATOR_GRANT]: (d) =>
+    // Rolling hosts may include transport-only roles. The guest handler owns
+    // the standard-room subset projection and strips those roles before state.
+    (d.capabilities === undefined || isKnownRoomCapabilityList(d.capabilities)) &&
+    (d.silent === undefined || typeof d.silent === 'boolean'),
+  [MSG.OPERATOR_REVOKE]: (d) => d.silent === undefined || typeof d.silent === 'boolean',
+  [MSG.SYNC_PING]: (d) =>
+    isNonNegSafeInt(d.pingId) &&
+    (d.guestTime === undefined || isNonNegFiniteSafeNumber(d.guestTime)),
+  [MSG.REPEAT_MODE]: (d) => isRepeatMode(d.value) && hasValidBootstrapFlag(d),
+  [MSG.SHUFFLE_MODE]: (d) => typeof d.value === 'boolean' && hasValidBootstrapFlag(d),
+  [MSG.PREAMP]: (d) => isBoundedNumber(d.value, -48, 12) && hasValidBootstrapFlag(d),
+  [MSG.VBASS]: (d) => isBoundedNumber(d.value, 0, 100) && hasValidBootstrapFlag(d),
+  [MSG.REVERB]: (d) => isBoundedNumber(d.value, 0, 100) && hasValidBootstrapFlag(d),
+  [MSG.EXCITER]: (d) => (d.value === 0 || d.value === 1) && hasValidBootstrapFlag(d),
+  [MSG.STEREO_WIDTH]: (d) => isBoundedNumber(d.value, 0, 200) && hasValidBootstrapFlag(d),
+  [MSG.REVERB_TYPE]: (d) => isReverbPreset(d.value) && hasValidBootstrapFlag(d),
+  [MSG.REVERB_DECAY]: (d) => isBoundedNumber(d.value, 0.1, 30) && hasValidBootstrapFlag(d),
+  [MSG.REVERB_PREDELAY]: (d) => isBoundedNumber(d.value, 0, 1) && hasValidBootstrapFlag(d),
+  [MSG.REVERB_LOWCUT]: (d) => isBoundedNumber(d.value, 0, 100) && hasValidBootstrapFlag(d),
+  [MSG.REVERB_HIGHCUT]: (d) => isBoundedNumber(d.value, 0, 100) && hasValidBootstrapFlag(d),
+  [MSG.CHAT_MUTE]: isChatModerationTarget,
+  [MSG.CHAT_UNMUTE]: isChatModerationTarget,
+  [MSG.CHAT_SLOWMODE]: (d) => isNonNegSafeInt(d.seconds) && (d.seconds as number) <= 60,
+  [MSG.CHAT_FILTER]: (d) => typeof d.on === 'boolean',
+  [MSG.FILE_CHUNK]: (d) =>
+    isBoundedChunk(d.chunk) &&
+    isNonNegInt(d.chunkIndex) &&
+    isQueueItemId(d.queueItemId) &&
+    isPositiveSafeInt(d.sessionId) &&
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    hasExactFileSizeContract(d),
+  // sessionId must be a positive safe integer. Finite-but-unsafe or fractional
+  // values can poison transfer.localSessionId just like Infinity, after which
+  // the localSid<incomingSid guards in transfer-receive.ts reject
+  // every legitimate inbound transfer until session leave. This keeps
+  // FILE_START aligned with FILE_RESUME.
+  [MSG.FILE_START]: (d) =>
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    isPositiveSafeInt(d.sessionId) &&
+    isQueueItemId(d.queueItemId) &&
+    hasExactFileSizeContract(d),
+  [MSG.OPERATOR_FILE_UPLOAD_START]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'sessionId', 'name', 'mime', 'size', 'total']) &&
+    typeof d.requestId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.requestId) &&
+    typeof d.sessionId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.sessionId) &&
+    isSafeOperatorUploadFileName(d.name) &&
+    isOperatorUploadMime(d.mime) &&
+    isPositiveSafeInt(d.size) &&
+    (d.size as number) <= REMOTE_SHARE_MAX_BYTES &&
+    isPositiveSafeInt(d.total) &&
+    (d.total as number) === Math.ceil((d.size as number) / CHUNK_SIZE),
+  [MSG.OPERATOR_FILE_UPLOAD_BATCH_START]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'fileCount']) &&
+    typeof d.requestId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.requestId) &&
+    isPositiveSafeInt(d.fileCount) &&
+    (d.fileCount as number) <= 1000,
+  [MSG.OPERATOR_FILE_UPLOAD_BATCH_COMPLETE]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'committedCount']) &&
+    typeof d.requestId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.requestId) &&
+    isPositiveSafeInt(d.committedCount) &&
+    (d.committedCount as number) <= 1000,
+  [MSG.OPERATOR_FILE_UPLOAD_CHUNK]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'sessionId', 'chunkIndex', 'chunk']) &&
+    typeof d.requestId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.requestId) &&
+    typeof d.sessionId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.sessionId) &&
+    isNonNegInt(d.chunkIndex) &&
+    isBoundedChunk(d.chunk) &&
+    (d.chunk as Uint8Array | ArrayBuffer).byteLength > 0,
+  [MSG.OPERATOR_FILE_UPLOAD_FINISH]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'sessionId']) &&
+    typeof d.requestId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.requestId) &&
+    typeof d.sessionId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.sessionId),
+  [MSG.OPERATOR_FILE_UPLOAD_ABORT]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'sessionId', 'reason']) &&
+    typeof d.requestId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.requestId) &&
+    typeof d.sessionId === 'string' &&
+    OPERATOR_FILE_UPLOAD_ID_RE.test(d.sessionId) &&
+    typeof d.reason === 'string' &&
+    d.reason.length > 0 &&
+    d.reason.length <= 64,
+  [MSG.OPERATOR_FILE_UPLOAD_STATUS]: (d) => {
+    if (
+      !hasExactKeys(d, ['type', 'requestId', 'sessionId', 'status', 'loaded', 'total', 'code']) ||
+      typeof d.requestId !== 'string' ||
+      !OPERATOR_FILE_UPLOAD_ID_RE.test(d.requestId) ||
+      typeof d.sessionId !== 'string' ||
+      !OPERATOR_FILE_UPLOAD_ID_RE.test(d.sessionId) ||
+      !isNonNegSafeInt(d.loaded) ||
+      !isPositiveSafeInt(d.total) ||
+      (d.loaded as number) > (d.total as number) ||
+      (d.code !== null && (typeof d.code !== 'string' || d.code.length === 0 || d.code.length > 64))
+    ) {
+      return false;
+    }
+    if (d.status === 'ready' || d.status === 'progress') return d.code === null;
+    if (d.status === 'complete') return d.code === null && d.loaded === d.total;
+    return (d.status === 'rejected' || d.status === 'aborted') && typeof d.code === 'string';
+  },
+  [MSG.FILE_END]: (d) =>
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    typeof d.mime === 'string' &&
+    isQueueItemId(d.queueItemId) &&
+    isPositiveSafeInt(d.sessionId),
+  [MSG.PRELOAD_CHUNK]: (d) =>
+    isBoundedChunk(d.chunk) &&
+    isNonNegInt(d.chunkIndex) &&
+    isQueueItemId(d.queueItemId) &&
+    isPositiveSafeInt(d.sessionId),
+  [MSG.PRELOAD_END]: (d) =>
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    isQueueItemId(d.queueItemId) &&
+    isPositiveSafeInt(d.sessionId),
+  // Every preload data/control frame carries the same positive safe sessionId.
+  // Missing/fractional/unsafe IDs are rejected before they can key reorder or
+  // sessionState maps; there is no latest-session fallback.
+  [MSG.PRELOAD_START]: (d) =>
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    isPositiveSafeInt(d.sessionId) &&
+    isQueueItemId(d.queueItemId) &&
+    (d.skipped === undefined || typeof d.skipped === 'boolean') &&
+    hasExactFileSizeContract(d),
+  // sessionId required — handler uses it to scope sessionState/reorder/storage
+  // cleanup. Without the guard, an injected abort with no sid would no-op
+  // through every guard in handlePreloadAbort but still consume rate-limit
+  // budget. Mirrors PRELOAD_END's name-required style.
+  [MSG.PRELOAD_ACK]: (d) => isQueueItemId(d.queueItemId) && isPositiveSafeInt(d.sessionId),
+  [MSG.PRELOAD_ABORT]: (d) => isQueueItemId(d.queueItemId) && isPositiveSafeInt(d.sessionId),
+  [MSG.WELCOME]: (d) => typeof d.label === 'string',
+  [MSG.EQ_UPDATE]: (d) =>
+    isNonNegInt(d.band) &&
+    (d.band as number) < 5 &&
+    isBoundedNumber(d.value, -12, 12) &&
+    hasValidBootstrapFlag(d),
+
+  // YouTube messages — validate numeric fields that flow into player APIs / state
+  [MSG.YOUTUBE_PLAY]: (d) =>
+    isQueueItemId(d.queueItemId) &&
+    (d.videoId === undefined || d.videoId === null || typeof d.videoId === 'string') &&
+    (d.playlistId === undefined ||
+      d.playlistId === null ||
+      typeof d.playlistId === 'string' ||
+      (Array.isArray(d.playlistId) && d.playlistId.every((id) => typeof id === 'string'))) &&
+    typeof d.autoplay === 'boolean' &&
+    (d.subIndex === undefined || isNonNegInt(d.subIndex)),
+  [MSG.YOUTUBE_STOP]: (d) => isQueueItemId(d.queueItemId),
+  [MSG.YOUTUBE_SYNC]: (d) =>
+    isQueueItemId(d.queueItemId) &&
+    isFiniteNumber(d.time) &&
+    isFiniteNumber(d.state) &&
+    (d.subIndex === undefined || isFiniteNumber(d.subIndex)),
+  [MSG.YOUTUBE_STATE]: (d) =>
+    isQueueItemId(d.queueItemId) &&
+    isFiniteNumber(d.state) &&
+    isFiniteNumber(d.time) &&
+    (d.hostPlayAt === undefined || isFiniteNumber(d.hostPlayAt)),
+  [MSG.YOUTUBE_ZERO_START_CAPABILITY]: (d) =>
+    ((d.version === 1 && hasExactKeys(d, ['type', 'version', 'platform'])) ||
+      (d.version === 2 &&
+        hasExactKeys(d, ['type', 'version', 'platform', 'ready']) &&
+        typeof d.ready === 'boolean')) &&
+    isYouTubeZeroStartPlatform(d.platform),
+  [MSG.YOUTUBE_ZERO_START_PREPARE]: (d) =>
+    hasExactKeys(d, [
+      'type',
+      'version',
+      'runId',
+      'sequence',
+      'queueItemId',
+      'videoId',
+      'subIndex',
+      'prepareAtHost',
+      'decisionAtHost',
+      'startDeadlineAtHost',
+      'hostPlatform',
+    ]) &&
+    hasYouTubeZeroStartIdentity(d) &&
+    isYouTubeVideoId(d.videoId) &&
+    (d.subIndex === null || (isNonNegInt(d.subIndex) && (d.subIndex as number) < 5000)) &&
+    isNonNegFiniteSafeNumber(d.prepareAtHost) &&
+    isNonNegFiniteSafeNumber(d.decisionAtHost) &&
+    isNonNegFiniteSafeNumber(d.startDeadlineAtHost) &&
+    (d.prepareAtHost as number) <= (d.decisionAtHost as number) &&
+    (d.decisionAtHost as number) <= (d.startDeadlineAtHost as number) &&
+    (d.startDeadlineAtHost as number) - (d.prepareAtHost as number) <= 10_000 &&
+    isYouTubeZeroStartPlatform(d.hostPlatform),
+  [MSG.YOUTUBE_ZERO_START_ARMED]: (d) =>
+    hasExactKeys(d, [
+      'type',
+      'version',
+      'runId',
+      'sequence',
+      'queueItemId',
+      'videoId',
+      'preparedMs',
+      'warmLatencyMs',
+      'positionSec',
+      'playerState',
+      'audioUnlocked',
+      'muted',
+      'volume',
+      'loadedFraction',
+      'startLeadMs',
+      'audibleBaseLeadMs',
+      'timelineLeadMs',
+      'platform',
+    ]) &&
+    hasYouTubeZeroStartIdentity(d) &&
+    isYouTubeVideoId(d.videoId) &&
+    isBoundedNumber(d.preparedMs, 0, 60_000) &&
+    isBoundedNumber(d.warmLatencyMs, 0, 60_000) &&
+    isYouTubePosition(d.positionSec) &&
+    isYouTubePlayerState(d.playerState) &&
+    typeof d.audioUnlocked === 'boolean' &&
+    typeof d.muted === 'boolean' &&
+    isBoundedNumber(d.volume, 0, 100) &&
+    isBoundedNumber(d.loadedFraction, 0, 1) &&
+    isYouTubeZeroStartLead(d.startLeadMs) &&
+    isYouTubeZeroStartLead(d.audibleBaseLeadMs) &&
+    isYouTubeZeroStartLead(d.timelineLeadMs) &&
+    isYouTubeZeroStartPlatform(d.platform),
+  [MSG.YOUTUBE_ZERO_START_COMMIT]: (d) =>
+    hasExactKeys(d, [
+      'type',
+      'version',
+      'runId',
+      'sequence',
+      'queueItemId',
+      'videoId',
+      'startAtHost',
+      'reason',
+      'cohort',
+    ]) &&
+    hasYouTubeZeroStartIdentity(d) &&
+    isYouTubeVideoId(d.videoId) &&
+    isNonNegFiniteSafeNumber(d.startAtHost) &&
+    (d.reason === 'all-ready' || d.reason === 'guest-timeout' || d.reason === 'host-delayed') &&
+    isYouTubeZeroStartCohort(d.cohort),
+  [MSG.YOUTUBE_ZERO_START_ABORT]: (d) =>
+    hasExactKeys(d, ['type', 'version', 'runId', 'sequence', 'queueItemId', 'reason']) &&
+    hasYouTubeZeroStartIdentity(d) &&
+    (d.reason === 'superseded' ||
+      d.reason === 'cancelled' ||
+      d.reason === 'authority-changed' ||
+      d.reason === 'player-unavailable' ||
+      d.reason === 'prepare-failed'),
+  [MSG.YOUTUBE_ZERO_START_TIMELINE]: (d) =>
+    hasExactKeys(d, [
+      'type',
+      'version',
+      'runId',
+      'sequence',
+      'queueItemId',
+      'videoId',
+      'hostTime',
+      'positionSec',
+      'playerState',
+    ]) &&
+    hasYouTubeZeroStartIdentity(d) &&
+    isYouTubeVideoId(d.videoId) &&
+    isNonNegFiniteSafeNumber(d.hostTime) &&
+    isYouTubePosition(d.positionSec) &&
+    isYouTubePlayerState(d.playerState),
+  // subIdx is capped at 5000 (YouTube playlist max, matches YOUTUBE_PLAYLIST_INFO
+  // ids cap) — the handler pads youtube.subItemsMap[pid].titles up to subIdx, so
+  // an uncapped index would grow that array to billions of empty slots (OOM).
+  [MSG.YOUTUBE_SUB_TITLE_UPDATE]: (d) =>
+    typeof d.playlistId === 'string' &&
+    isNonNegInt(d.subIdx) &&
+    (d.subIdx as number) < 5000 &&
+    typeof d.title === 'string',
+  // Without per-element validation a compromised host or a caller that
+  // bypasses the host trust boundary could populate ids[]
+  // with attacker-controlled strings; youtube/handlers.ts then calls
+  // player.loadVideoById(ids[subIdx]) with whatever's there. videoId is
+  // always 11 chars URL-safe base64 in YouTube's spec; matches search.ts
+  // search-result normalization. Length cap = 5000 (YouTube's own playlist
+  // max), not 200 — large playlists are a first-class app feature (see
+  // index-before-add flow).
+  [MSG.YOUTUBE_PLAYLIST_INFO]: (d) => {
+    const ids = d.ids;
+    const titles = d.titles;
+    return (
+      typeof d.playlistId === 'string' &&
+      d.playlistId.length > 0 &&
+      d.playlistId.length <= 64 &&
+      Array.isArray(ids) &&
+      ids.length <= 5000 &&
+      ids.every((x) => typeof x === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(x)) &&
+      Array.isArray(titles) &&
+      // Titles are lazy-filled after IDs, so partial arrays are valid.
+      titles.length <= ids.length &&
+      titles.every((x) => typeof x === 'string' && x.length <= 200)
+    );
+  },
+  [MSG.REQUEST_YOUTUBE_SUB_SEEK]: (d) =>
+    isQueueItemId(d.queueItemId) && isNonNegInt(d.subIdx) && (d.subIdx as number) < 5000,
+  [MSG.REQUEST_YOUTUBE_PLAY]: (d) => isQueueItemId(d.queueItemId),
+  [MSG.REQUEST_YOUTUBE_PAUSE]: (d) => isQueueItemId(d.queueItemId),
+  [MSG.REQUEST_YOUTUBE_TOGGLE]: (d) => isQueueItemId(d.queueItemId),
+  [MSG.REQUEST_YOUTUBE_PLAYLIST_INFO]: (d) =>
+    typeof d.playlistId === 'string' && d.playlistId.length > 0 && d.playlistId.length <= 64,
+  [MSG.REQUEST_PLAYLIST_ADD_YOUTUBE]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'baseRevision', 'sourceUrl', 'title']) &&
+    isQueueItemId(d.requestId) &&
+    isNonNegSafeInt(d.baseRevision) &&
+    typeof d.sourceUrl === 'string' &&
+    d.sourceUrl.length > 0 &&
+    d.sourceUrl.length <= 2048 &&
+    typeof d.title === 'string' &&
+    d.title.length > 0 &&
+    d.title.length <= 512,
+  [MSG.REQUEST_PLAYLIST_REMOVE]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'baseRevision', 'queueItemIds']) &&
+    isQueueItemId(d.requestId) &&
+    isNonNegSafeInt(d.baseRevision) &&
+    Array.isArray(d.queueItemIds) &&
+    d.queueItemIds.length > 0 &&
+    d.queueItemIds.length <= 1000 &&
+    d.queueItemIds.every(isQueueItemId) &&
+    new Set(d.queueItemIds).size === d.queueItemIds.length,
+  [MSG.REQUEST_PLAYLIST_REORDER]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'baseRevision', 'queueItemId', 'beforeQueueItemId']) &&
+    isQueueItemId(d.requestId) &&
+    isNonNegSafeInt(d.baseRevision) &&
+    isQueueItemId(d.queueItemId) &&
+    (d.beforeQueueItemId === null || isQueueItemId(d.beforeQueueItemId)) &&
+    d.beforeQueueItemId !== d.queueItemId,
+  [MSG.OPERATOR_QUEUE_MUTATION_RESULT]: (d) => {
+    if (
+      !hasExactKeys(d, ['type', 'requestId', 'phase', 'outcome', 'revision', 'code']) ||
+      !isQueueItemId(d.requestId) ||
+      !isNonNegSafeInt(d.revision)
+    ) {
+      return false;
+    }
+    if (d.phase === 'accepted') return d.outcome === null && d.code === null;
+    if (d.phase !== 'settled') return false;
+    if (d.outcome === 'applied') return d.code === null;
+    return (
+      d.outcome === 'rejected' &&
+      (d.code === 'conflict' ||
+        d.code === 'unauthorized' ||
+        d.code === 'invalid-target' ||
+        d.code === 'invalid-source' ||
+        d.code === 'queue-full' ||
+        d.code === 'resolution-failed' ||
+        d.code === 'internal-error')
+    );
+  },
+  [MSG.REQUEST_SETTING]: isValidRequestSetting,
+  [MSG.REQUEST_KICK_DEVICE]: (d) =>
+    Object.keys(d).length === 2 &&
+    Object.prototype.hasOwnProperty.call(d, 'type') &&
+    Object.prototype.hasOwnProperty.call(d, 'targetPeerId') &&
+    typeof d.targetPeerId === 'string' &&
+    PRO_PEER_ID_RE.test(d.targetPeerId),
+  [MSG.REQUEST_KICK_PHYSICAL_DEVICE]: (d) =>
+    Object.keys(d).length === 2 &&
+    Object.prototype.hasOwnProperty.call(d, 'type') &&
+    Object.prototype.hasOwnProperty.call(d, 'targetPeerId') &&
+    typeof d.targetPeerId === 'string' &&
+    PRO_PEER_ID_RE.test(d.targetPeerId),
+
+  // File transfer — validate session IDs and indices
+  [MSG.FILE_PREPARE]: (d) =>
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    isQueueItemId(d.queueItemId) &&
+    isPositiveSafeInt(d.sessionId) &&
+    typeof d.mime === 'string' &&
+    (d.size === undefined || isPositiveSafeInt(d.size)) &&
+    (d.delivery === undefined || d.delivery === 'r2'),
+  [MSG.FILE_R2_CAPABILITY]: (d) => d.version === 1 && d.localAudience === true,
+  [MSG.REMOTE_FILE_UNAVAILABLE]: (d) =>
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    isQueueItemId(d.queueItemId) &&
+    isPositiveSafeInt(d.sessionId) &&
+    (d.limited === undefined || typeof d.limited === 'boolean') &&
+    (d.delivery === undefined || d.delivery === 'r2'),
+  [MSG.REMOTE_FILE_SHARE]: isRemoteFileShare,
+  // Without `name`, a malicious peer can send file-resume with no name to
+  // poison the host's transfer.localSessionId (the transfer-receive handler
+  // bumps it from any incoming sessionId), blocking subsequent legitimate inbound
+  // transfers via the localSid guards in transfer-receive.ts.
+  // FILE_START (above) already requires `name` — this brings FILE_RESUME to parity.
+  [MSG.FILE_RESUME]: (d) =>
+    typeof d.name === 'string' &&
+    d.name.length > 0 &&
+    isPositiveSafeInt(d.sessionId) &&
+    isQueueItemId(d.queueItemId) &&
+    hasExactFileSizeContract(d) &&
+    isNonNegInt(d.startChunk) &&
+    (d.startChunk as number) < (d.total as number),
+  [MSG.FILE_WAIT]: (d) =>
+    isFileRequestId(d.requestId) &&
+    isQueueItemId(d.queueItemId) &&
+    (d.sessionId === undefined || isPositiveSafeInt(d.sessionId)) &&
+    typeof d.message === 'string' &&
+    d.message.length > 0 &&
+    d.message.length <= 512 &&
+    (d.reason === undefined || (typeof d.reason === 'string' && d.reason.length <= 128)),
+  // Recovery binds the stable queue occurrence to a concrete transfer attempt;
+  // nextChunk remains a transport offset and sessionId may be absent initially.
+  [MSG.REQUEST_DATA_RECOVERY]: (d) =>
+    isFileRequestId(d.requestId) &&
+    isNonNegInt(d.nextChunk) &&
+    (d.sessionId === undefined || isPositiveSafeInt(d.sessionId)) &&
+    typeof d.fileName === 'string' &&
+    d.fileName.length > 0 &&
+    isQueueItemId(d.queueItemId),
+  [MSG.REQUEST_CURRENT_FILE]: (d) =>
+    isFileRequestId(d.requestId) &&
+    isQueueItemId(d.queueItemId) &&
+    (d.sessionId === undefined || isPositiveSafeInt(d.sessionId)) &&
+    (d.name === undefined || typeof d.name === 'string') &&
+    (d.reason === undefined || (typeof d.reason === 'string' && d.reason.length <= 128)),
+  [MSG.REQUEST_TRACK_CHANGE]: (d) => isQueueItemId(d.queueItemId),
+  [MSG.REQUEST_PLAY]: (d) =>
+    isQueueItemId(d.queueItemId) && (d.time === undefined || isFiniteNumber(d.time)),
+  [MSG.REQUEST_PAUSE]: (d) => isQueueItemId(d.queueItemId),
+  [MSG.REQUEST_SEEK]: (d) => isQueueItemId(d.queueItemId) && isFiniteNumber(d.time) && d.time >= 0,
+  [MSG.REQUEST_SKIP_TIME]: (d) => isQueueItemId(d.queueItemId) && isFiniteNumber(d.sec),
+  [MSG.REQUEST_NEXT_TRACK]: (d) => d.queueItemId === null || isQueueItemId(d.queueItemId),
+  [MSG.REQUEST_PREV_TRACK]: (d) => d.queueItemId === null || isQueueItemId(d.queueItemId),
+  [MSG.SYNC_PONG]: (d) =>
+    isNonNegSafeInt(d.pingId) &&
+    isFiniteNumber(d.hostTime) &&
+    isFiniteNumber(d.position) &&
+    (d.hostStartAt === undefined || (isFiniteNumber(d.hostStartAt) && d.hostStartAt > 0)) &&
+    (d.mode === null || d.mode === 'file' || d.mode === 'youtube' || d.mode === 'system-audio') &&
+    (d.activity === 'idle' ||
+      d.activity === 'paused' ||
+      d.activity === 'playing' ||
+      d.activity === 'pending') &&
+    (d.queueItemId === null || isQueueItemId(d.queueItemId)) &&
+    (d.demoTrackIndex === undefined || isNonNegSafeInt(d.demoTrackIndex)),
+
+  // Chat — validate text field exists and cap length. This validator ceiling
+  // (4000) is deliberately above the shared 500-character message cap; its job
+  // is killing multi-KB/MB
+  // amplification frames at the door (defense-in-depth behind the host-side
+  // write-back truncation in chat/protocol.ts).
+  [MSG.CHAT]: (d) =>
+    typeof d.text === 'string' &&
+    d.text.length <= 4000 &&
+    (d.senderMemberId === undefined ||
+      (typeof d.senderMemberId === 'string' &&
+        STANDARD_ROOM_MEMBER_ID_RE.test(d.senderMemberId))) &&
+    (d.botRequestId === undefined ||
+      (typeof d.botRequestId === 'string' && BOT_REQUEST_ID_RE.test(d.botRequestId))),
+  [MSG.CHAT_WHISPER]: (d) =>
+    typeof d.text === 'string' && d.text.length <= 4000 && typeof d.targetId === 'string',
+  // text is required for back-compat fallback; i18nKey/i18nParams are optional
+  // and let receivers render in their own locale when sender supplies them.
+  [MSG.CHAT_NOTICE]: (d) =>
+    typeof d.text === 'string' &&
+    d.text.length <= 4000 &&
+    (d.attention === undefined || typeof d.attention === 'boolean') &&
+    (d.i18nKey === undefined || (typeof d.i18nKey === 'string' && d.i18nKey.length < 128)) &&
+    (d.i18nParams === undefined || (typeof d.i18nParams === 'object' && d.i18nParams !== null)),
+  [MSG.CHAT_SYSTEM]: (d) =>
+    typeof d.text === 'string' &&
+    d.text.length <= 4000 &&
+    (d.i18nKey === undefined || (typeof d.i18nKey === 'string' && d.i18nKey.length < 128)) &&
+    (d.i18nParams === undefined || (typeof d.i18nParams === 'object' && d.i18nParams !== null)),
+  [MSG.CHAT_BOT_RESULT]: (d) =>
+    hasExactKeys(d, ['type', 'requestId', 'senderId', 'result']) &&
+    typeof d.requestId === 'string' &&
+    BOT_REQUEST_ID_RE.test(d.requestId) &&
+    typeof d.senderId === 'string' &&
+    PRO_PEER_ID_RE.test(d.senderId) &&
+    isBotChatResult(d.result),
+  [MSG.OPERATOR_TOAST]: (d) =>
+    typeof d.text === 'string' &&
+    d.text.length <= 300 &&
+    (d.i18nKey === undefined || (typeof d.i18nKey === 'string' && d.i18nKey.length < 128)) &&
+    (d.i18nParams === undefined || (typeof d.i18nParams === 'object' && d.i18nParams !== null)),
+  [MSG.REQUEST_CHAT_COMMAND]: (d) =>
+    typeof d.command === 'string' && Array.isArray(d.args) && (d.args as unknown[]).length <= 32,
+
+  [MSG.SYSTEM_AUDIO_SFU_READY]: (d) =>
+    d.version === 2 &&
+    (d.audience === undefined || d.audience === 'remote' || d.audience === 'all') &&
+    (d.handoffFromDirect === undefined || d.handoffFromDirect === true) &&
+    typeof d.sessionId === 'string' &&
+    d.sessionId.length > 0 &&
+    d.sessionId.length <= 128 &&
+    d.tracks === undefined &&
+    !!d.track &&
+    typeof d.track === 'object' &&
+    typeof (d.track as Record<string, unknown>).trackName === 'string' &&
+    ((d.track as Record<string, unknown>).trackName as string).length > 0 &&
+    ((d.track as Record<string, unknown>).trackName as string).length <= 160 &&
+    ((d.track as Record<string, unknown>).mid === undefined ||
+      typeof (d.track as Record<string, unknown>).mid === 'string'),
+  [MSG.SYSTEM_AUDIO_SFU_CAPABILITY]: (d) => d.version === 2 && d.localAudience === true,
+
+  // Playlist snapshots are validated atomically, including unique IDs/current.
+  [MSG.PLAYLIST_UPDATE]: (d) => parsePlaylistSnapshot(d) !== null,
+  [MSG.PRO_FILE_PRELOAD]: (d) =>
+    hasExactKeys(d, ['type', 'queueItemId', 'sessionId']) &&
+    isQueueItemId(d.queueItemId) &&
+    isPositiveSafeInt(d.sessionId),
+
+  // Guest decode-failure reports identify the queue occurrence, not a row.
+  [MSG.GUEST_DECODE_FAILED]: (d) => isQueueItemId(d.queueItemId),
+  [MSG.DEMO_ENTER]: (d) =>
+    isNonNegInt(d.index) &&
+    typeof d.reverbOn === 'boolean' &&
+    typeof d.bassBoostOn === 'boolean' &&
+    typeof d.trebleBoostOn === 'boolean' &&
+    typeof d.surroundOn === 'boolean',
+  [MSG.DEMO_PLAY]: (d) =>
+    isNonNegInt(d.index) &&
+    isFiniteNumber(d.time) &&
+    isFiniteNumber(d.hostPlayAt) &&
+    (d.hostStartAt === undefined || (isFiniteNumber(d.hostStartAt) && d.hostStartAt > 0)),
+  [MSG.DEMO_PAUSE]: (d) => isFiniteNumber(d.time),
+  [MSG.DEMO_EXIT]: () => true,
+  [MSG.REQUEST_DEMO_ENTER]: () => true,
+  [MSG.REQUEST_DEMO_EXIT]: () => true,
+};
+
+/**
+ * Payload-free messages whose handlers enforce the exact live authority
+ * connection and intentionally ignore any rolling-compatible extra fields.
+ * Keeping this list separate makes every new MSG constant fail closed in the
+ * coverage guard below until it receives either a validator or a documented
+ * handler-owned compatibility classification.
+ */
+const PROTOCOL_HANDLER_GUARDED_COMPAT_TYPES: ReadonlySet<MsgType> = new Set([
+  MSG.EQ_RESET,
+  MSG.FORCE_CLOSE_DUPLICATE,
+  MSG.REQUEST_EQ_RESET,
+  MSG.SYSTEM_AUDIO_STOP,
+  MSG.CHAT_FREEZE,
+  MSG.CHAT_UNFREEZE,
+  MSG.CHAT_CLEAR,
+]);
+
+function getUnclassifiedProtocolTypes(): MsgType[] {
+  return (Object.values(MSG) as MsgType[]).filter(
+    (type) => !PROTOCOL_VALIDATORS[type] && !PROTOCOL_HANDLER_GUARDED_COMPAT_TYPES.has(type),
+  );
+}
+
+const UNCLASSIFIED_PROTOCOL_TYPES = getUnclassifiedProtocolTypes();
+if (UNCLASSIFIED_PROTOCOL_TYPES.length > 0) {
+  throw new Error(
+    `[Protocol] Missing payload validation classification: ${UNCLASSIFIED_PROTOCOL_TYPES.join(', ')}`,
+  );
+}
+
+// ─── Generic Inbound Rate-Limit (per peer) ──────────────────────────
+//
+// Chat had its own bucket (`allowChatFromPeer`) but every other message
+// type was uncapped — a single malicious guest could flood SYNC_PING or
+// REQUEST_* frames and burn host CPU on state mutations + rebroadcast
+// amplification. RTCDataChannel backpressure caps raw send-rate in the
+// ~1–3k msg/s range, which is still high enough to degrade UX.
+//
+// Token-bucket per peer: 60 burst, 1 token every 50ms (≈20 msg/s steady
+// state). High-rate chunks bypass it only when their feature module proves an
+// exact, active, host-authorized transfer identity.
+const INBOUND_BURST = 60;
+const INBOUND_REFILL_MS = 50;
+const _inboundBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+
+type InboundRateLimitExemptionGuard = (
+  msg: Readonly<Record<string, unknown>>,
+  conn: DataConnection,
+) => boolean;
+
+// Some high-rate protocols are only safe to exempt while their own bounded,
+// authorized transfer state is active. Keep the guard registration here so a
+// feature module can prove that state without protocol.ts importing the
+// feature back and creating an initialization cycle.
+const _conditionalRateLimitExemptions = new Map<string, InboundRateLimitExemptionGuard>();
+
+export function registerInboundRateLimitExemptionGuard(
+  type: MsgType,
+  guard: InboundRateLimitExemptionGuard,
+): void {
+  _conditionalRateLimitExemptions.set(type, guard);
+}
+
+function isInboundRateLimitExempt(
+  msgType: MsgType,
+  msg: Readonly<Record<string, unknown>>,
+  conn: DataConnection,
+): boolean {
+  const guard = _conditionalRateLimitExemptions.get(msgType);
+  if (!guard) return false;
+  try {
+    return guard(msg, conn);
+  } catch (error) {
+    log.warn(`[Protocol] Rate-limit exemption guard failed for ${msgType}:`, error);
+    return false;
+  }
+}
+
+function allowInboundFromPeer(peerId: string): boolean {
+  if (!peerId) return true;
+  const now = Date.now();
+  let bucket = _inboundBuckets.get(peerId);
+  if (!bucket) {
+    bucket = { tokens: INBOUND_BURST, lastRefill: now };
+    _inboundBuckets.set(peerId, bucket);
+  }
+  const elapsed = now - bucket.lastRefill;
+  if (elapsed > 0) {
+    const refill = Math.floor(elapsed / INBOUND_REFILL_MS);
+    if (refill > 0) {
+      bucket.tokens = Math.min(INBOUND_BURST, bucket.tokens + refill);
+      bucket.lastRefill = now;
+    }
+  }
+  if (bucket.tokens <= 0) return false;
+  bucket.tokens -= 1;
+  return true;
+}
+
+/** Drop rate-limit state for a peer; call on disconnect to bound the map. */
+export function resetInboundRateLimit(peerId: string): void {
+  _inboundBuckets.delete(peerId);
+}
+
+// ─── Handler Registry ───────────────────────────────────────────────
+
+type TypedMessageHandler<T extends MsgType> = (
+  data: ProtocolMsg<T>,
+  conn: DataConnection,
+) => void | Promise<void>;
+type MessageHandler = (data: AnyProtocolMsg, conn: DataConnection) => void | Promise<void>;
+type MessageHandlerMap = { [T in MsgType]?: TypedMessageHandler<T> };
+const _handlers = new Map<string, MessageHandler>();
+
+function setHandler(type: MsgType, handler: MessageHandler): void {
+  if (_handlers.has(type)) {
+    log.warn(`[Protocol] Overwriting handler for: ${type}`);
+  }
+  _handlers.set(type, handler);
+}
+
+/**
+ * Register a handler for a specific message type.
+ * Can be called from any module during initialization.
+ */
+export function registerHandler<T extends MsgType>(type: T, handler: TypedMessageHandler<T>): void {
+  setHandler(type, handler as MessageHandler);
+}
+
+/**
+ * Register multiple handlers at once.
+ * Each handler receives a typed payload matching its message type key.
+ */
+export function registerHandlers(handlers: MessageHandlerMap): void {
+  for (const [type, handler] of Object.entries(handlers) as Array<
+    [MsgType, MessageHandler | undefined]
+  >) {
+    if (handler) setHandler(type, handler);
+  }
+}
+
+/**
+ * Check if a handler is registered for a given message type.
+ */
+export function hasHandler(type: MsgType): boolean {
+  return _handlers.has(type);
+}
+
+// ─── Message Dispatch ───────────────────────────────────────────────
+
+/**
+ * Main message dispatcher. Validates and dispatches to registered handlers.
+ */
+export async function handleData(data: unknown, conn: DataConnection): Promise<void> {
+  // Generic validation
+  if (!validateMessage(data, [])) return;
+
+  const msg = data as Record<string, unknown>;
+  const msgType = msg.type as MsgType;
+
+  // On a guest, one concrete DataConnection is the sole host authority. Drop
+  // every frame from replaced connections centrally before any handler or
+  // rate-limit state can be touched.
+  const appRole = getState('network.appRole');
+  const isGuest = appRole === 'guest';
+  const hostConn = getState('network.hostConn');
+  if (isGuest && conn !== hostConn) {
+    log.debug(`[Protocol] Ignored frame from stale host connection: ${msgType}`);
+    return;
+  }
+
+  // A reconnect can replace a guest DataConnection while frames from the old
+  // ordered channel are still queued. Peer IDs are intentionally stable, so
+  // authorization must belong to the exact live connection, not just peerId.
+  if (
+    appRole === 'host' &&
+    (!conn?.peer || getState('network.activeHostConnByPeerId').get(conn.peer) !== conn)
+  ) {
+    log.debug(`[Protocol] Ignored frame from stale guest connection: ${msgType}`);
+    return;
+  }
+
+  // Ordered channels are not enough across reconnects: a new host may restart
+  // revisions and transfer SIDs at zero/one. Until its explicit queue baseline
+  // has been applied, fail closed for every queue/media-dependent frame.
+  if (
+    isGuest &&
+    hostConn === conn &&
+    !hasQueueAuthority(conn) &&
+    requiresQueueAuthority(msgType, msg)
+  ) {
+    log.debug(`[Protocol] Ignored ${msgType} before queue authority bootstrap`);
+    return;
+  }
+
+  // Generic per-peer rate-limit. A high-rate feature bypasses it only when its
+  // registered guard proves the exact active transfer; all other frames spend
+  // from the ordinary bucket and are silently dropped once it is exhausted.
+  if (
+    conn?.peer &&
+    !isInboundRateLimitExempt(msgType, msg, conn) &&
+    !allowInboundFromPeer(conn.peer)
+  ) {
+    return;
+  }
+
+  // 3.0: Validate high-risk message payloads before dispatch
+  const validator = PROTOCOL_VALIDATORS[msgType];
+  if (validator && !validator(msg)) {
+    log.warn(`[Protocol] Invalid payload for ${msgType}`, Object.keys(msg));
+    return;
+  }
+
+  // Dispatch to registered handler
+  const handler = _handlers.get(msgType);
+  if (handler) {
+    try {
+      await handler(msg as AnyProtocolMsg, conn);
+    } catch (e) {
+      log.error(`Error handling ${msgType}:`, e);
+    }
+  }
+}
+
+// ─── Operator Verification ──────────────────────────────────────────
+
+/**
+ * Check whether the peer behind `conn` has been granted Operator privileges.
+ * Called by Host-side `request-*` handlers before executing commands.
+ */
+export function verifyOperator(
+  conn: DataConnection,
+  _data?: Record<string, unknown>,
+  capability: RoomCapability = 'playback.control',
+): boolean {
+  return verifyPeerCapability(conn, capability);
+}
+
+// ─── Initialize Protocol ────────────────────────────────────────────
+
+/**
+ * Wire up the EventBus → handleData bridge.
+ * Call once at app bootstrap after all handlers are registered.
+ */
+export function initProtocol(): void {
+  bus.on('network:data', (data: unknown, conn: unknown) => {
+    handleData(data, conn as DataConnection).catch((e) =>
+      log.error('[Protocol] handleData error:', e),
+    );
+  });
+
+  // Release per-peer rate-limit buckets on disconnect so the map stays bounded.
+  bus.on('network:peer-disconnected', (peerId: string) => {
+    resetInboundRateLimit(peerId);
+  });
+
+  log.info('[Protocol] Message router initialized');
+}

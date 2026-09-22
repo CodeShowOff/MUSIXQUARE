@@ -1,0 +1,1593 @@
+/**
+ * @vitest-environment jsdom
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { bus } from '../../core/events.ts';
+import { LOCAL_LARGE_TRACK_WARNING_BYTES, MSG } from '../../core/constants.ts';
+import { clearAllManagedTimers } from '../../core/timers.ts';
+import { getState, resetState, setState } from '../../core/state.ts';
+import { DEMO_TRACK } from '../../demo/tracks.ts';
+import { handleData } from '../../network/protocol.ts';
+import {
+  getCurrentLoadEpoch,
+  getCurrentAudioBuffer,
+  getPendingPlayTime,
+  newLoadEpoch,
+  setCurrentAudioBuffer,
+  setPendingPlayTime,
+} from '../_state.ts';
+import { broadcastFileDebounced } from '../../storage/transfer.ts';
+import { registerProRoomMediaHooks, type ProRoomMediaHooks } from '../../pro-room/media-hooks.ts';
+import type {
+  ConnectedPeer,
+  DataConnection,
+  FileMeta,
+  PlaylistItem,
+  QueueItemId,
+  ResidentFile,
+} from '../../types/index.ts';
+
+const mocks = vi.hoisted(() => ({
+  broadcast: vi.fn(),
+  announceSystemMessageLocally: vi.fn(),
+  broadcastSystemMessage: vi.fn(),
+  decodeAudioData: vi.fn(),
+  isFilePipelineBusyForPlay: vi.fn(() => false),
+  sendRecoveryRequest: vi.fn(),
+  safeSend: vi.fn(() => true),
+  sendToHost: vi.fn(),
+  stopAllMedia: vi.fn(),
+  showLoader: vi.fn(),
+  showToast: vi.fn(),
+  transition: vi.fn(),
+  loadPlaylistModule: vi.fn(),
+  playlistPlayTrack: vi.fn(),
+  playlistPlayNextTrack: vi.fn(),
+  playlistShuffleNext: vi.fn(),
+}));
+
+vi.mock('../../audio/engine.ts', () => ({
+  initAudio: vi.fn(),
+}));
+
+vi.mock('../../audio/context.ts', () => ({
+  ensureRunning: vi.fn(),
+  getAudioContext: vi.fn(() => ({
+    state: 'running',
+    sampleRate: 48_000,
+    decodeAudioData: mocks.decodeAudioData,
+  })),
+}));
+
+vi.mock('../../audio/system-capture.ts', () => ({
+  isSystemAudioActive: vi.fn(() => false),
+}));
+
+vi.mock('../../storage/storage.ts', () => ({
+  cleanupStoredFile: vi.fn(),
+  discardResidentStoredFileAdmission: vi.fn(() => false),
+  postCommand: vi.fn(),
+  promoteStoredFileAdmission: vi.fn(() => false),
+  retainStoredFileAdmission: vi.fn(() => false),
+}));
+
+vi.mock('../../storage/transfer.ts', () => ({
+  broadcastFileDebounced: vi.fn(),
+}));
+
+vi.mock('../../share/remote-share.ts', () => ({
+  shareRemoteFileIfNeeded: vi.fn(async () => undefined),
+}));
+
+vi.mock('../../storage/preload.ts', () => ({
+  schedulePreload: vi.fn(),
+}));
+
+vi.mock('../../network/peer.ts', () => ({
+  broadcast: mocks.broadcast,
+  safeSend: mocks.safeSend,
+  sendToHost: mocks.sendToHost,
+  isRemoteGuest: vi.fn(() => false),
+  waitForGuestConnectionType: vi.fn(async () => 'local' as const),
+}));
+
+vi.mock('../../storage/recovery.ts', () => ({
+  sendRecoveryRequest: mocks.sendRecoveryRequest,
+}));
+
+vi.mock('../../chat/protocol.ts', () => ({
+  announceSystemMessageLocally: mocks.announceSystemMessageLocally,
+  broadcastSystemMessage: mocks.broadcastSystemMessage,
+}));
+
+vi.mock('../../ui/toast.ts', () => ({
+  showLoader: mocks.showLoader,
+  showToast: mocks.showToast,
+}));
+
+vi.mock('../transport.ts', () => ({
+  isFilePipelineBusyForPlay: mocks.isFilePipelineBusyForPlay,
+  play: vi.fn(),
+  stopAllMedia: mocks.stopAllMedia,
+  stopPlayerNode: vi.fn(),
+}));
+
+vi.mock('../lifecycle.ts', () => ({
+  transition: mocks.transition,
+}));
+
+vi.mock('../video.ts', () => ({
+  setEngineMode: vi.fn(),
+}));
+
+vi.mock('../playlist-loader.ts', () => ({
+  loadPlaylistModule: mocks.loadPlaylistModule,
+}));
+
+mocks.loadPlaylistModule.mockResolvedValue({
+  getShuffleNextPlayableQueueItemId: mocks.playlistShuffleNext,
+  playNextTrack: mocks.playlistPlayNextTrack,
+  playTrack: mocks.playlistPlayTrack,
+});
+
+function makeConnection(peer: string, send = vi.fn()): DataConnection {
+  return {
+    peer,
+    open: true,
+    send,
+    close: vi.fn(),
+    on: () => undefined,
+  };
+}
+
+function expectCorrelatedRequest(
+  send: ReturnType<typeof vi.fn>,
+  expected: Record<string, unknown>,
+): void {
+  expect(send).toHaveBeenCalledWith({
+    ...expected,
+    requestId: expect.any(Number),
+  });
+  const matchingCall = send.mock.calls.find(([message]) =>
+    Object.entries(expected).every(
+      ([key, value]) => (message as Record<string, unknown> | undefined)?.[key] === value,
+    ),
+  );
+  const requestId = (matchingCall?.[0] as { requestId?: unknown } | undefined)?.requestId;
+  expect(requestId).toEqual(expect.any(Number));
+  expect(requestId as number).toBeGreaterThan(0);
+}
+
+function makeConnectedPeer(id: string, isOp: boolean): ConnectedPeer {
+  return {
+    id,
+    slot: 0,
+    label: id,
+    conn: makeConnection(id),
+    isOp,
+    preloadedQueueItemIds: new Set<QueueItemId>(),
+    status: 'connected',
+    isDataTarget: true,
+    joinOrder: 0,
+    connectionType: 'unknown',
+    lastHeartbeat: Date.now(),
+  };
+}
+
+let nextQueueItemIdValue = 1;
+function nextQueueItemId(): QueueItemId {
+  const suffix = String(nextQueueItemIdValue++).padStart(12, '0');
+  return `00000000-0000-4000-8000-${suffix}`;
+}
+
+function makeWaveFile(name: string, channels: number): File {
+  const bytes = new Uint8Array(44);
+  const view = new DataView(bytes.buffer);
+  const writeAscii = (offset: number, value: string): void => {
+    for (let index = 0; index < value.length; index++) {
+      bytes[offset + index] = value.charCodeAt(index);
+    }
+  };
+  writeAscii(0, 'RIFF');
+  view.setUint32(4, 36, true);
+  writeAscii(8, 'WAVE');
+  writeAscii(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  writeAscii(36, 'data');
+  return new File([bytes.buffer], name, { type: 'audio/wav' });
+}
+
+function makeTrack(name: string): PlaylistItem {
+  return {
+    queueItemId: nextQueueItemId(),
+    type: 'file',
+    name,
+    videoId: null,
+    playlistId: null,
+  };
+}
+
+function makeFileTrack(file: File): PlaylistItem {
+  return {
+    queueItemId: nextQueueItemId(),
+    type: 'file',
+    name: file.name,
+    title: file.name,
+    file,
+    videoId: null,
+    playlistId: null,
+  };
+}
+
+function persistentProMediaHooks(queueItemId: QueueItemId): ProRoomMediaHooks {
+  return {
+    addFiles: () => false,
+    addYouTube: () => false,
+    updateTrackMetadata: () => false,
+    removeTracks: () => false,
+    reorderTrack: () => false,
+    resolveFile: () => null,
+    handlesPersistentFile: (candidate) => candidate === queueItemId,
+  };
+}
+
+function setCurrentIndex(index: number): QueueItemId | null {
+  const queueItemId = getState('playlist.items')[index]?.queueItemId ?? null;
+  setState('playlist.currentQueueItemId', queueItemId);
+  return queueItemId;
+}
+
+function currentQueueItemId(): QueueItemId {
+  const queueItemId = getState('playlist.currentQueueItemId');
+  if (!queueItemId) throw new Error('test queue item is not selected');
+  return queueItemId;
+}
+
+function fileMeta(item: PlaylistItem, file: Blob, sessionId: number): FileMeta {
+  const mime = file.type || 'audio/mpeg';
+  return {
+    queueItemId: item.queueItemId,
+    indexHint: getState('playlist.items').findIndex(
+      (candidate) => candidate.queueItemId === item.queueItemId,
+    ),
+    name: item.name,
+    type: mime,
+    mime,
+    size: file.size,
+    total: 1,
+    sessionId,
+  };
+}
+
+function stagePreload(item: PlaylistItem, file: File, sessionId = 7): ResidentFile {
+  const meta = fileMeta(item, file, sessionId);
+  const ready: ResidentFile = { ...meta, blob: file };
+  setState('preload.nextQueueItemId', item.queueItemId);
+  setState('preload.activeTarget', meta);
+  setState('preload.ready', ready);
+  return ready;
+}
+
+function stageMainTransfer(item: PlaylistItem, file: Blob, sessionId: number): void {
+  setState('transfer.localSessionId', sessionId);
+  setState('transfer.meta', fileMeta(item, file, sessionId));
+}
+
+afterEach(() => {
+  registerProRoomMediaHooks(null);
+  clearAllManagedTimers();
+  vi.useRealTimers();
+});
+
+describe('guest decode failure reports', () => {
+  beforeEach(async () => {
+    resetState();
+    bus.clear();
+    clearAllManagedTimers();
+    vi.clearAllMocks();
+    mocks.decodeAudioData.mockResolvedValue({ duration: 120 });
+
+    const { initDecodeHandlers } = await import('../decode.ts');
+    initDecodeHandlers();
+    setState('playlist.items', [makeTrack('song.mp3')]);
+    setCurrentIndex(0);
+  });
+
+  it('keeps the only non-operator report local instead of advancing the room', async () => {
+    const guest = makeConnectedPeer('guest-a', false);
+    setState('network.connectedPeers', [guest]);
+
+    await handleData(
+      { type: MSG.GUEST_DECODE_FAILED, queueItemId: currentQueueItemId() },
+      guest.conn!,
+    );
+
+    expect(mocks.broadcastSystemMessage).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      'A device failed to decode this track. Playback is continuing for everyone else.',
+    );
+    expect(getState('playback.failedTrackKeys').size).toBe(0);
+  });
+
+  it('forwards held non-operator decode failure notices to connected operators only', async () => {
+    const guest = makeConnectedPeer('guest-a', false);
+    const op = makeConnectedPeer('guest-op', true);
+    setState('network.connectedPeers', [guest, op]);
+
+    await handleData(
+      { type: MSG.GUEST_DECODE_FAILED, queueItemId: currentQueueItemId() },
+      guest.conn!,
+    );
+
+    expect(mocks.safeSend).toHaveBeenCalledWith(op.conn, {
+      type: MSG.OPERATOR_TOAST,
+      text: 'A device failed to decode this track. Playback is continuing for everyone else.',
+      i18nKey: 'toast.remote_decode_device_wait',
+    });
+    expect(mocks.safeSend).not.toHaveBeenCalledWith(guest.conn, expect.anything());
+  });
+
+  it('does not let one non-operator skip when another non-operator is connected', async () => {
+    const guestA = makeConnectedPeer('guest-a', false);
+    const guestB = makeConnectedPeer('guest-b', false);
+    setState('network.connectedPeers', [guestA, guestB]);
+
+    await handleData(
+      { type: MSG.GUEST_DECODE_FAILED, queueItemId: currentQueueItemId() },
+      guestA.conn!,
+    );
+
+    expect(mocks.broadcastSystemMessage).not.toHaveBeenCalled();
+    expect(getState('playback.failedTrackKeys').size).toBe(0);
+  });
+
+  it('keeps room playback running after multiple device-local failures', async () => {
+    const guestA = makeConnectedPeer('guest-a', false);
+    const guestB = makeConnectedPeer('guest-b', false);
+    setState('network.connectedPeers', [guestA, guestB]);
+
+    await handleData(
+      { type: MSG.GUEST_DECODE_FAILED, queueItemId: currentQueueItemId() },
+      guestA.conn!,
+    );
+    await handleData(
+      { type: MSG.GUEST_DECODE_FAILED, queueItemId: currentQueueItemId() },
+      guestB.conn!,
+    );
+
+    expect(mocks.broadcastSystemMessage).not.toHaveBeenCalled();
+    expect(getState('playback.failedTrackKeys').size).toBe(0);
+    expect(mocks.showToast).toHaveBeenCalledOnce();
+  });
+
+  it('treats an operator decode failure as device-local too', async () => {
+    const op = makeConnectedPeer('guest-op', true);
+    setState('network.appRole', 'host');
+    setState('network.connectedPeers', [op]);
+    setState('network.activeHostConnByPeerId', new Map([[op.id, op.conn!]]));
+
+    await handleData(
+      { type: MSG.GUEST_DECODE_FAILED, queueItemId: currentQueueItemId() },
+      op.conn!,
+    );
+
+    expect(mocks.broadcastSystemMessage).not.toHaveBeenCalled();
+    expect(getState('playback.failedTrackKeys').size).toBe(0);
+    expect(mocks.showToast).toHaveBeenCalledOnce();
+  });
+
+  it('shows a local wait notice when guest decoding gives up', async () => {
+    mocks.decodeAudioData.mockRejectedValue(new Error('decode failed'));
+    setState('network.hostConn', makeConnection('host'));
+    setState('player.decodeFailureCount', 1);
+    const item = getState('playlist.items')[0]!;
+    setState('player.decodeFailureQueueItemId', item.queueItemId);
+    setState('playback.pendingPlayTime', 92);
+    setState('playback.pendingPlayTimeSetAt', Date.now());
+    setState('playback.pendingRecoveryTarget', {
+      queueItemId: item.queueItemId,
+      indexHint: 0,
+      name: item.name,
+    });
+    const file = new File([new Uint8Array([1, 2, 3])], 'song.mp3');
+    stageMainTransfer(item, file, 7);
+
+    const { finalizeGuestFile } = await import('../decode.ts');
+    await finalizeGuestFile(file, item.queueItemId, 7);
+
+    expect(mocks.announceSystemMessageLocally).toHaveBeenCalledWith(
+      'chat.device_track_unavailable_system_message',
+    );
+    expect(mocks.sendToHost).toHaveBeenCalledWith({
+      type: MSG.GUEST_DECODE_FAILED,
+      queueItemId: item.queueItemId,
+    });
+    expect(mocks.sendRecoveryRequest).not.toHaveBeenCalled();
+    const { postCommand } = await import('../../storage/storage.ts');
+    expect(postCommand).toHaveBeenCalledWith({ command: 'STORAGE_RESET', isPreload: false });
+    expect(getState('playback.pendingPlayTime')).toBeUndefined();
+    expect(getState('playback.pendingRecoveryTarget')).toBeNull();
+  });
+});
+
+describe('guest file finalization sync', () => {
+  beforeEach(() => {
+    resetState();
+    bus.clear();
+    clearAllManagedTimers();
+    vi.clearAllMocks();
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:guest-file'),
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      value: vi.fn(),
+    });
+    mocks.decodeAudioData.mockResolvedValue({ duration: 120 });
+  });
+
+  it.each([
+    { route: 'preload', finishedAt: 1100, offset: 0, delay: 0.1 },
+    { route: 'transfer', finishedAt: 1100, offset: 0, delay: 0.1 },
+    { route: 'preload', finishedAt: 4700, offset: 3.5, delay: 0 },
+    { route: 'transfer', finishedAt: 4700, offset: 3.5, delay: 0 },
+  ])(
+    'keeps the shared start after $route decode completes at $finishedAt',
+    async ({ route, finishedAt, offset, delay }) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(1050);
+      const monotonicNow = vi.spyOn(performance, 'now').mockReturnValue(10_000);
+      setCurrentAudioBuffer(null);
+      setState('network.hostConn', makeConnection('host-1'));
+      const file = new File([new Uint8Array([1, 2, 3])], 'shared-start.mp3', {
+        type: 'audio/mpeg',
+      });
+      const item = makeFileTrack(file);
+      setState('playlist.items', [item]);
+      setCurrentIndex(0);
+      if (route === 'preload') stagePreload(item, file);
+      else stageMainTransfer(item, file, 7);
+      setPendingPlayTime(0, 1200);
+      mocks.decodeAudioData.mockImplementationOnce(async () => {
+        vi.setSystemTime(finishedAt);
+        return { duration: 120 };
+      });
+
+      const { finalizeGuestFile, loadPreloadedTrack } = await import('../decode.ts');
+      const { play } = await import('../transport.ts');
+      if (route === 'preload') await loadPreloadedTrack(item.queueItemId);
+      else await finalizeGuestFile(file, item.queueItemId, 7);
+
+      expect(play).toHaveBeenCalledWith(
+        offset,
+        delay,
+        10_000 + delay * 1000,
+        expect.any(Function),
+        expect.objectContaining({ timing: 'catch-up' }),
+      );
+      monotonicNow.mockRestore();
+    },
+  );
+
+  it('treats a user file matching a demo filename as ordinary audio without time wrapping', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-31T00:00:05.000Z'));
+
+    const hostConn = makeConnection('host-1');
+    setState('network.hostConn', hostConn);
+    setState('playlist.items', [makeTrack(DEMO_TRACK.fileName)]);
+    setCurrentIndex(0);
+    const item = getState('playlist.items')[0]!;
+    const file = new File([new Uint8Array([1, 2, 3])], DEMO_TRACK.fileName, {
+      type: DEMO_TRACK.mime,
+    });
+    stageMainTransfer(item, file, 7);
+    setPendingPlayTime(118, Date.now() - 5_000);
+
+    const syncRequest = vi.fn();
+    bus.on('sync:request-immediate-ping', syncRequest);
+
+    const { finalizeGuestFile } = await import('../decode.ts');
+    const { play } = await import('../transport.ts');
+    vi.mocked(play).mockImplementationOnce(async () => {
+      setState('playback.mode', 'file');
+      setState('playback.activity', 'playing');
+      return true;
+    });
+    await finalizeGuestFile(file, item.queueItemId, 7);
+
+    expect(play).toHaveBeenCalledWith(
+      123,
+      0,
+      expect.any(Number),
+      expect.any(Function),
+      expect.objectContaining({ timing: 'catch-up', onRecoveredStarted: expect.any(Function) }),
+    );
+    expect(getPendingPlayTime()).toBeUndefined();
+    expect(syncRequest).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect(syncRequest).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { isOperator: false, expectedEnabled: false, label: 'standard guest' },
+    { isOperator: true, expectedEnabled: true, label: 'standard administrator' },
+  ])(
+    'keeps the play-button affordance aligned for $label after decode',
+    async ({ isOperator, expectedEnabled }) => {
+      setState('network.appRole', 'guest');
+      setState('network.hostConn', makeConnection('host'));
+      setState('network.isOperator', isOperator);
+      const item = makeTrack('song.mp3');
+      const file = new File([new Uint8Array([1, 2, 3])], item.name, { type: 'audio/mpeg' });
+      setState('playlist.items', [item]);
+      setCurrentIndex(0);
+      stageMainTransfer(item, file, 7);
+
+      const buttonStates: boolean[] = [];
+      bus.on('ui:play-btn-state', (enabled) => buttonStates.push(enabled));
+
+      const { finalizeGuestFile } = await import('../decode.ts');
+      await finalizeGuestFile(file, item.queueItemId, 7);
+
+      expect(buttonStates).toEqual([expectedEnabled]);
+    },
+  );
+
+  it.each([
+    { capabilities: [] as const, label: 'ordinary PRO member' },
+    { capabilities: ['playback.control'] as const, label: 'authorized PRO controller' },
+  ])(
+    'reports decoded-media readiness independently for $label without a host connection',
+    async ({ capabilities }) => {
+      setState('network.appRole', 'guest');
+      setState('network.hostConn', null);
+      setState('room.context', {
+        kind: 'pro',
+        roomId: '000001',
+        role: 'member',
+        coordinatorId: null,
+        epoch: 1,
+        snapshotRevision: 1,
+        capabilities: [...capabilities],
+      });
+      const item = makeTrack('pro-song.mp3');
+      const file = new File([new Uint8Array([1, 2, 3])], item.name, { type: 'audio/mpeg' });
+      setState('playlist.items', [item]);
+      setCurrentIndex(0);
+      stageMainTransfer(item, file, 7);
+
+      const buttonStates: boolean[] = [];
+      bus.on('ui:play-btn-state', (enabled) => buttonStates.push(enabled));
+
+      const { finalizeGuestFile } = await import('../decode.ts');
+      await finalizeGuestFile(file, item.queueItemId, 7);
+
+      expect(buttonStates).toEqual([true]);
+    },
+  );
+
+  it('a superseded finalize (new transfer session mid-decode) is inert in the catch — no wrong-track report (pin j reject twin)', async () => {
+    setState('network.hostConn', makeConnection('host'));
+    setState('playlist.items', [makeTrack('A.mp3')]);
+    setCurrentIndex(0);
+    const item = getState('playlist.items')[0]!;
+    const file = new File([new Uint8Array([1, 2, 3])], 'A.mp3');
+    stageMainTransfer(item, file, 1);
+    setState('player.decodeFailureCount', 0);
+    setState('transfer.receivedCount', 7);
+
+    // FILE_PREPARE starts a replacement transfer during decode without bumping
+    // activeLoadSessionId. The transfer-session checkpoint must make the stale
+    // catch inert so it cannot change successor state or report the wrong track.
+    mocks.decodeAudioData.mockImplementation(async () => {
+      setState('transfer.localSessionId', 2);
+      throw new Error('decode failed');
+    });
+
+    const { finalizeGuestFile } = await import('../decode.ts');
+    await finalizeGuestFile(file, item.queueItemId, 1);
+
+    expect(mocks.sendToHost).not.toHaveBeenCalled(); // no GUEST_DECODE_FAILED wrong-track report
+    expect(mocks.transition).not.toHaveBeenCalled(); // no DECODE_ERROR stomp on the successor's FSM
+    expect(mocks.sendRecoveryRequest).not.toHaveBeenCalled();
+    expect(getState('player.decodeFailureCount')).toBe(0); // counter untouched
+    expect(getState('transfer.receivedCount')).toBe(7); // successor transfer state untouched
+    expect(mocks.showLoader).not.toHaveBeenCalledWith(false); // successor owns the loader
+  });
+
+  it.each(['prepare', 'receiving', 'finalizing'] as const)(
+    'preserves a successor loader while %s when an older native decode settles',
+    async (successorPhase) => {
+      const first = makeTrack('first.mp3');
+      const second = makeTrack('second.mp3');
+      const firstFile = new File([new Uint8Array([1, 2, 3])], first.name);
+      const secondFile = new File([new Uint8Array([4, 5, 6])], second.name);
+      setState('network.hostConn', makeConnection('host'));
+      setState('playlist.items', [first, second]);
+      setCurrentIndex(0);
+      stageMainTransfer(first, firstFile, 1);
+
+      let finishFirst!: (value: AudioBuffer) => void;
+      let finishSecond!: (value: AudioBuffer) => void;
+      mocks.decodeAudioData
+        .mockReset()
+        .mockImplementationOnce(
+          () =>
+            new Promise<AudioBuffer>((resolve) => {
+              finishFirst = resolve;
+            }),
+        )
+        .mockImplementationOnce(
+          () =>
+            new Promise<AudioBuffer>((resolve) => {
+              finishSecond = resolve;
+            }),
+        );
+      const { finalizeGuestFile } = await import('../decode.ts');
+      const firstFinalize = finalizeGuestFile(firstFile, first.queueItemId, 1);
+      await vi.waitFor(() => expect(mocks.decodeAudioData).toHaveBeenCalledTimes(1));
+
+      // PREPARE/START replace transfer ownership without allocating M2. A
+      // second finalizer also replaces M2; all three own the default loader.
+      setCurrentIndex(1);
+      stageMainTransfer(second, secondFile, 2);
+      setState('transfer.state', successorPhase === 'prepare' ? 'IDLE' : 'RECEIVING');
+      mocks.showLoader(true, 'second is loading');
+      const secondFinalize =
+        successorPhase === 'finalizing'
+          ? finalizeGuestFile(secondFile, second.queueItemId, 2)
+          : null;
+      if (secondFinalize) {
+        await vi.waitFor(() => expect(mocks.decodeAudioData).toHaveBeenCalledTimes(2));
+      }
+      mocks.showLoader.mockClear();
+
+      finishFirst({ duration: 120 } as AudioBuffer);
+      await firstFinalize;
+      expect(mocks.showLoader).not.toHaveBeenCalledWith(false);
+
+      if (secondFinalize) {
+        finishSecond({ duration: 120 } as AudioBuffer);
+        await secondFinalize;
+        expect(mocks.showLoader).toHaveBeenLastCalledWith(false);
+      }
+    },
+  );
+
+  it.each(['success', 'failure'] as const)(
+    'releases its own loader after %s even when the load epoch changes',
+    async (outcome) => {
+      const item = makeTrack('current.mp3');
+      const file = new File([new Uint8Array([1, 2, 3])], item.name);
+      setState('network.hostConn', makeConnection('host'));
+      setState('playlist.items', [item]);
+      setCurrentIndex(0);
+      stageMainTransfer(item, file, 7);
+      let finish!: (value: AudioBuffer) => void;
+      let fail!: (reason: Error) => void;
+      mocks.decodeAudioData.mockReset().mockImplementationOnce(
+        () =>
+          new Promise<AudioBuffer>((resolve, reject) => {
+            finish = resolve;
+            fail = reject;
+          }),
+      );
+      const { finalizeGuestFile } = await import('../decode.ts');
+      const finalizing = finalizeGuestFile(file, item.queueItemId, 7);
+      await vi.waitFor(() => expect(mocks.decodeAudioData).toHaveBeenCalledTimes(1));
+      newLoadEpoch(); // watchdog/cancelInFlight does not supersede guest-finalize ownership.
+      mocks.showLoader.mockClear();
+      if (outcome === 'success') finish({ duration: 120 } as AudioBuffer);
+      else fail(new Error('decode failed'));
+      await finalizing;
+      expect(mocks.showLoader).toHaveBeenLastCalledWith(false);
+    },
+  );
+});
+
+describe('host preload activation result (SA-05)', () => {
+  beforeEach(() => {
+    resetState();
+    bus.clear();
+    clearAllManagedTimers();
+    vi.clearAllMocks();
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:preload'),
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      value: vi.fn(),
+    });
+  });
+
+  it('returns false on decode failure and routes the host into failed-mark cleanup', async () => {
+    mocks.decodeAudioData.mockRejectedValue(new Error('unsupported codec'));
+    const file = new File([new Uint8Array([1, 2, 3])], 'broken.mp3', {
+      type: 'audio/mpeg',
+      lastModified: 123,
+    });
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    stagePreload(item, file);
+
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    const activated = await loadPreloadedTrack(item.queueItemId);
+
+    expect(activated).toBe(false);
+    // Host must not fall into the guest-only recovery request (no-op on host)
+    expect(mocks.sendToHost).not.toHaveBeenCalled();
+    // Single broken track → all-failed terminal reset, mirrored to guests
+    expect(mocks.broadcast).toHaveBeenCalledWith({
+      type: MSG.PAUSE,
+      time: 0,
+      queueItemId: null,
+      endOfPlaylist: true,
+      reason: 'end-of-playlist',
+    });
+    expect(getState('playlist.currentQueueItemId')).toBeNull();
+  });
+
+  it('returns true when activation succeeds', async () => {
+    mocks.decodeAudioData.mockResolvedValue({ duration: 120 });
+    const file = new File([new Uint8Array([1, 2, 3])], 'ok.mp3', {
+      type: 'audio/mpeg',
+      lastModified: 123,
+    });
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    stagePreload(item, file);
+
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    const activated = await loadPreloadedTrack(item.queueItemId);
+
+    expect(activated).toBe(true);
+    expect(getState('preload.ready')).toBeNull();
+    expect(getState('files.current')?.blob).toBe(file);
+  });
+
+  it('returns false when no preloaded blob exists', async () => {
+    const item = makeTrack('missing.mp3');
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    expect(await loadPreloadedTrack(item.queueItemId)).toBe(false);
+  });
+
+  it('rejects a same-name Blob whose metadata belongs to another index', async () => {
+    const staleBlob = new File([new Uint8Array([1, 2, 3])], 'same.mp3', {
+      type: 'audio/mpeg',
+    });
+    const exactHostSend = vi.fn();
+    setState('network.hostConn', makeConnection('host', exactHostSend));
+    const first = makeTrack('same.mp3');
+    const second = makeTrack('same.mp3');
+    setState('playlist.items', [first, second]);
+    stagePreload(first, staleBlob);
+    setCurrentIndex(1);
+
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    await expect(loadPreloadedTrack(second.queueItemId)).resolves.toBe(false);
+
+    expect(mocks.decodeAudioData).not.toHaveBeenCalled();
+    expectCorrelatedRequest(exactHostSend, {
+      type: MSG.REQUEST_CURRENT_FILE,
+      queueItemId: second.queueItemId,
+      name: 'same.mp3',
+      reason: 'preload_resident_missing',
+    });
+    expect(getState('preload.ready')?.queueItemId).toBe(first.queueItemId);
+  });
+
+  it('rejects a same-index Blob that is not the host playlist File object', async () => {
+    const cachedA = new File([new Uint8Array([1])], 'same.mp3', { type: 'audio/mpeg' });
+    const playlistB = new File([new Uint8Array([2])], 'same.mp3', { type: 'audio/mpeg' });
+    const item = makeFileTrack(playlistB);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    stagePreload(item, cachedA);
+
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    await expect(loadPreloadedTrack(item.queueItemId)).resolves.toBe(false);
+
+    expect(mocks.decodeAudioData).not.toHaveBeenCalled();
+    expect(getState('preload.ready')).toBeNull();
+  });
+
+  it('rejects coercible or missing preload session identity before decode', async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], 'strict.mp3', {
+      type: 'audio/mpeg',
+    });
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    const ready = stagePreload(item, file);
+    setState('preload.ready', {
+      ...ready,
+      sessionId: '7' as unknown as number,
+    });
+
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    await expect(loadPreloadedTrack(item.queueItemId)).resolves.toBe(false);
+
+    expect(mocks.decodeAudioData).not.toHaveBeenCalled();
+  });
+
+  it('discards a same-Blob activation when its live session changes during decode', async () => {
+    let resolveDecode: (value: AudioBuffer) => void = () => undefined;
+    mocks.decodeAudioData.mockReturnValueOnce(
+      new Promise<AudioBuffer>((resolve) => {
+        resolveDecode = resolve;
+      }),
+    );
+    const file = new File([new Uint8Array([1, 2, 3])], 'session.mp3', {
+      type: 'audio/mpeg',
+    });
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    const ready = stagePreload(item, file);
+
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    const pending = loadPreloadedTrack(item.queueItemId);
+    await vi.waitFor(() => expect(mocks.decodeAudioData).toHaveBeenCalledOnce());
+
+    setState('preload.ready', { ...ready, sessionId: 8 });
+    setState('preload.activeTarget', { ...ready, sessionId: 8 });
+    resolveDecode({ duration: 120 } as AudioBuffer);
+
+    await expect(pending).resolves.toBe(false);
+    expect(getState('files.current')).toBeNull();
+  });
+});
+
+describe('guest preload activation failure recovery', () => {
+  beforeEach(() => {
+    resetState();
+    bus.clear();
+    clearAllManagedTimers();
+    vi.clearAllMocks();
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:guest-preload'),
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      value: vi.fn(),
+    });
+  });
+
+  function stageGuestPreload(file: File): {
+    item: PlaylistItem;
+    exactHostSend: ReturnType<typeof vi.fn>;
+  } {
+    const exactHostSend = vi.fn();
+    setState('network.hostConn', makeConnection('host', exactHostSend));
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    stagePreload(item, file);
+    setState('transfer.meta', fileMeta(item, file, 7));
+    return { item, exactHostSend };
+  }
+
+  it('requests the current file again after the first live guest preload decode failure', async () => {
+    mocks.decodeAudioData.mockRejectedValue(new Error('partial blob'));
+    const file = new File([new Uint8Array([1, 2, 3])], 'retry-me.mp3', {
+      type: 'audio/mpeg',
+      lastModified: 123,
+    });
+    const { item, exactHostSend } = stageGuestPreload(file);
+
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    const activated = await loadPreloadedTrack(item.queueItemId);
+
+    expect(activated).toBe(false);
+    expect(mocks.transition).toHaveBeenCalledWith({ type: 'DECODE_ERROR' });
+    expect(getState('player.decodeFailureCount')).toBe(1);
+    expectCorrelatedRequest(exactHostSend, {
+      type: MSG.REQUEST_CURRENT_FILE,
+      queueItemId: item.queueItemId,
+      name: 'retry-me.mp3',
+      reason: 'preload_activation_failed',
+    });
+  });
+
+  it('bounds repeated live guest preload decode failures instead of re-requesting forever', async () => {
+    mocks.decodeAudioData.mockRejectedValue(new Error('persistent codec failure'));
+    const file = new File([new Uint8Array([1, 2, 3])], 'broken-remote.mp3', {
+      type: 'audio/mpeg',
+      lastModified: 123,
+    });
+    const { item, exactHostSend } = stageGuestPreload(file);
+    setState('player.decodeFailureCount', 1);
+    setState('player.decodeFailureQueueItemId', item.queueItemId);
+
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    const activated = await loadPreloadedTrack(item.queueItemId);
+
+    expect(activated).toBe(false);
+    expect(getState('player.decodeFailureCount')).toBe(2);
+    expect(getState('playback.failedTrackKeys').size).toBe(1);
+    expect(exactHostSend).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: MSG.REQUEST_CURRENT_FILE }),
+    );
+    expect(mocks.sendToHost).toHaveBeenCalledWith({
+      type: MSG.GUEST_DECODE_FAILED,
+      queueItemId: item.queueItemId,
+    });
+  });
+});
+
+describe('admission-bound resident handoff', () => {
+  beforeEach(() => {
+    resetState();
+    bus.clear();
+    clearAllManagedTimers();
+    vi.clearAllMocks();
+    mocks.decodeAudioData.mockResolvedValue({ duration: 1 } as AudioBuffer);
+  });
+
+  it('does not publish a received preload when exact promotion fails', async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], 'bound-preload.mp3');
+    const { bindEncodedReceiveReservationToBlob, reserveEncodedReceiveMemoryWithinBudget } =
+      await import('../decode-admission.ts');
+    const receive = reserveEncodedReceiveMemoryWithinBudget(file.size);
+    receive.markFinalized();
+    bindEncodedReceiveReservationToBlob(file, receive.id);
+    try {
+      const item = makeFileTrack(file);
+      setState('playlist.items', [item]);
+      setCurrentIndex(0);
+      stagePreload(item, file);
+
+      const { loadPreloadedTrack } = await import('../decode.ts');
+      await expect(loadPreloadedTrack(item.queueItemId)).resolves.toBe(false);
+      expect(getState('files.current')).toBeNull();
+    } finally {
+      receive.release();
+    }
+  });
+
+  it('does not publish a received main file when resident retain fails', async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], 'bound-main.mp3');
+    const { bindEncodedReceiveReservationToBlob, reserveEncodedReceiveMemoryWithinBudget } =
+      await import('../decode-admission.ts');
+    const receive = reserveEncodedReceiveMemoryWithinBudget(file.size);
+    receive.markFinalized();
+    bindEncodedReceiveReservationToBlob(file, receive.id);
+    try {
+      setState('network.hostConn', makeConnection('host'));
+      const item = makeFileTrack(file);
+      setState('playlist.items', [item]);
+      setCurrentIndex(0);
+      stageMainTransfer(item, file, 7);
+
+      const { finalizeGuestFile } = await import('../decode.ts');
+      await finalizeGuestFile(file, item.queueItemId, 7);
+      expect(getState('files.current')).toBeNull();
+      expect(mocks.transition).toHaveBeenCalledWith({ type: 'DECODE_ERROR' });
+    } finally {
+      receive.release();
+    }
+  });
+});
+
+describe('host decode failure cleanup', () => {
+  beforeEach(() => {
+    resetState();
+    bus.clear();
+    clearAllManagedTimers();
+    vi.clearAllMocks();
+    mocks.decodeAudioData.mockRejectedValue(new Error('unsupported codec'));
+  });
+
+  it('returns to an empty player title state when the only track cannot decode', async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], 'broken.mp3', {
+      type: 'audio/mpeg',
+      lastModified: 123,
+    });
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    setState('player.currentTrackMeta', item);
+
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    const didLoad = await loadAndBroadcastFile(file, item.queueItemId, 1);
+
+    expect(didLoad).toBe(false);
+    expect(getState('player.currentTrackMeta')).toBeNull();
+    expect(getState('playlist.currentQueueItemId')).toBeNull();
+    expect(getState('playback.mode')).toBeNull();
+    expect(getState('playback.activity')).toBe('idle');
+    expect(mocks.broadcast).toHaveBeenCalledWith({
+      type: MSG.PAUSE,
+      time: 0,
+      queueItemId: null,
+      endOfPlaylist: true,
+      reason: 'end-of-playlist',
+    });
+  });
+
+  it('contains a rejected lazy playlist load during failed-track auto-advance', async () => {
+    vi.useFakeTimers();
+    const error = new Error('playlist chunk unavailable');
+    mocks.loadPlaylistModule.mockRejectedValueOnce(error);
+    const brokenFile = new File([new Uint8Array([1, 2, 3])], 'broken.mp3', {
+      type: 'audio/mpeg',
+    });
+    const nextFile = new File([new Uint8Array([4, 5, 6])], 'next.mp3', {
+      type: 'audio/mpeg',
+    });
+    const broken = makeFileTrack(brokenFile);
+    const next = makeFileTrack(nextFile);
+    setState('playlist.items', [broken, next]);
+    setCurrentIndex(0);
+
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    expect(await loadAndBroadcastFile(brokenFile, broken.queueItemId, 1)).toBe(false);
+    mocks.showToast.mockClear();
+
+    await vi.advanceTimersByTimeAsync(600);
+
+    expect(mocks.loadPlaylistModule).toHaveBeenCalledOnce();
+    expect(mocks.playlistPlayTrack).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledOnce();
+  });
+});
+
+describe('unbounded legacy decode policy', () => {
+  let originalUserAgent: PropertyDescriptor | undefined;
+
+  beforeEach(() => {
+    resetState();
+    bus.clear();
+    clearAllManagedTimers();
+    vi.clearAllMocks();
+    mocks.decodeAudioData.mockReset();
+    setCurrentAudioBuffer(null);
+    originalUserAgent = Object.getOwnPropertyDescriptor(navigator, 'userAgent');
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (iPhone) jsdom',
+    });
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:admission'),
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      value: vi.fn(),
+    });
+  });
+
+  afterEach(() => {
+    if (originalUserAgent) {
+      Object.defineProperty(navigator, 'userAgent', originalUserAgent);
+    } else {
+      Reflect.deleteProperty(navigator, 'userAgent');
+    }
+  });
+
+  it('lets a local file reach the native decoder without predictive rejection', async () => {
+    const file = new File([new Uint8Array(4 * 1024 * 1024)], 'unknown-duration.mp3', {
+      type: 'audio/mpeg',
+    });
+    const arrayBuffer = vi.spyOn(file, 'arrayBuffer');
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    mocks.decodeAudioData.mockResolvedValue({
+      duration: 120,
+      length: 120 * 48_000,
+      numberOfChannels: 2,
+      sampleRate: 48_000,
+    } as AudioBuffer);
+
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    await expect(loadAndBroadcastFile(file, item.queueItemId, 1)).resolves.toBe(true);
+
+    expect(arrayBuffer).toHaveBeenCalledOnce();
+    expect(mocks.decodeAudioData).toHaveBeenCalledOnce();
+  });
+
+  it('announces a metadata-based memory estimate before allocating or decoding', async () => {
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (iPhone)',
+    });
+    const file = makeWaveFile('long-stereo.wav', 2);
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+
+    const order: string[] = [];
+    const nativeArrayBuffer = file.arrayBuffer.bind(file);
+    const arrayBufferSpy = vi.spyOn(file, 'arrayBuffer').mockImplementation(async () => {
+      order.push('array-buffer');
+      return nativeArrayBuffer();
+    });
+    const loadSpy = vi
+      .spyOn(HTMLMediaElement.prototype, 'load')
+      .mockImplementation(function metadataLoad(this: HTMLMediaElement) {
+        if (!this.hasAttribute('src')) return;
+        Object.defineProperty(this, 'duration', { configurable: true, value: 600 });
+        queueMicrotask(() => this.dispatchEvent(new Event('loadedmetadata')));
+      });
+    const pauseSpy = vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {});
+    mocks.announceSystemMessageLocally.mockImplementation((key: string) => {
+      if (key === 'chat.decode_memory_risk_system_message') order.push('warning');
+    });
+    mocks.decodeAudioData.mockImplementation(async () => {
+      order.push('decode');
+      return {
+        duration: 600,
+        length: 600 * 48_000,
+        numberOfChannels: 2,
+        sampleRate: 48_000,
+      } as AudioBuffer;
+    });
+
+    try {
+      const { loadAndBroadcastFile } = await import('../decode.ts');
+      await expect(loadAndBroadcastFile(file, item.queueItemId, 1)).resolves.toBe(true);
+    } finally {
+      arrayBufferSpy.mockRestore();
+      loadSpy.mockRestore();
+      pauseSpy.mockRestore();
+    }
+
+    expect(mocks.announceSystemMessageLocally).toHaveBeenCalledWith(
+      'chat.decode_memory_risk_system_message',
+      { estimatedMiB: expect.any(Number) },
+    );
+    expect(order).toEqual(['warning', 'array-buffer', 'decode']);
+  });
+
+  it('uses the size fallback without blocking when metadata is uncertain above 200 MiB', async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], 'large-lossless.flac', {
+      type: 'audio/flac',
+    });
+    Object.defineProperty(file, 'size', {
+      configurable: true,
+      value: LOCAL_LARGE_TRACK_WARNING_BYTES + 1,
+    });
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    mocks.decodeAudioData.mockResolvedValue({
+      duration: 120,
+      length: 120 * 48_000,
+      numberOfChannels: 2,
+      sampleRate: 48_000,
+    } as AudioBuffer);
+
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    await expect(loadAndBroadcastFile(file, item.queueItemId, 1)).resolves.toBe(true);
+
+    expect(mocks.announceSystemMessageLocally).toHaveBeenCalledWith(
+      'chat.large_local_track_system_message',
+    );
+    expect(mocks.decodeAudioData).toHaveBeenCalledOnce();
+  });
+
+  it('lets a received remote Blob reach the native decoder', async () => {
+    const blob = new Blob([new Uint8Array(4 * 1024 * 1024)], { type: 'audio/mpeg' });
+    const arrayBuffer = vi.spyOn(blob, 'arrayBuffer');
+    setState('network.hostConn', makeConnection('host'));
+    const item = makeTrack('remote.mp3');
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    stageMainTransfer(item, blob, 9);
+    mocks.decodeAudioData.mockResolvedValue({
+      duration: 120,
+      length: 120 * 48_000,
+      numberOfChannels: 2,
+      sampleRate: 48_000,
+    } as AudioBuffer);
+
+    const { finalizeGuestFile } = await import('../decode.ts');
+    await finalizeGuestFile(blob, item.queueItemId, 9);
+
+    expect(arrayBuffer).toHaveBeenCalledOnce();
+    expect(mocks.decodeAudioData).toHaveBeenCalledOnce();
+    expect(mocks.sendToHost).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: MSG.GUEST_DECODE_FAILED }),
+    );
+  });
+
+  it('activates a preloaded file without predictive memory rejection', async () => {
+    const file = new File([new Uint8Array(4 * 1024 * 1024)], 'remote-preload.mp3', {
+      type: 'audio/mpeg',
+    });
+    const arrayBuffer = vi.spyOn(file, 'arrayBuffer');
+    const exactHostSend = vi.fn();
+    setState('network.hostConn', makeConnection('host', exactHostSend));
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    stagePreload(item, file);
+    setState('transfer.meta', fileMeta(item, file, 7));
+    mocks.decodeAudioData.mockResolvedValue({
+      duration: 120,
+      length: 120 * 48_000,
+      numberOfChannels: 2,
+      sampleRate: 48_000,
+    } as AudioBuffer);
+
+    const { loadPreloadedTrack } = await import('../decode.ts');
+    await expect(loadPreloadedTrack(item.queueItemId)).resolves.toBe(true);
+
+    expect(arrayBuffer).toHaveBeenCalledOnce();
+    expect(mocks.sendToHost).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: MSG.GUEST_DECODE_FAILED }),
+    );
+    expect(exactHostSend).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: MSG.REQUEST_CURRENT_FILE }),
+    );
+  });
+});
+
+describe('native decoder deadline policy', () => {
+  beforeEach(() => {
+    resetState();
+    bus.clear();
+    clearAllManagedTimers();
+    vi.clearAllMocks();
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:slow-decode'),
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      value: vi.fn(),
+    });
+  });
+
+  it('broadcasts and R2-shares a user file whose name matches a bundled demo asset', async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], DEMO_TRACK.fileName, {
+      type: DEMO_TRACK.mime,
+    });
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    setState('network.connectedPeers', [makeConnectedPeer('remote-guest', false)]);
+    mocks.decodeAudioData.mockResolvedValue({ duration: 120 });
+
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    const { shareRemoteFileIfNeeded } = await import('../../share/remote-share.ts');
+    await expect(loadAndBroadcastFile(file, item.queueItemId, 7)).resolves.toBe(true);
+
+    expect(vi.mocked(broadcastFileDebounced)).toHaveBeenCalledWith(
+      file,
+      item.queueItemId,
+      7,
+      undefined,
+    );
+    expect(vi.mocked(shareRemoteFileIfNeeded)).toHaveBeenCalledWith(file, 7, undefined, {
+      queueItemId: item.queueItemId,
+    });
+  });
+
+  it('publishes only FILE_PREPARE for persistent PRO media', async () => {
+    const file = new File([new Uint8Array([1, 2, 3])], 'persistent.flac', {
+      type: 'audio/flac',
+    });
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+    setState('network.connectedPeers', [makeConnectedPeer('pro-member', false)]);
+    registerProRoomMediaHooks(persistentProMediaHooks(item.queueItemId));
+    mocks.decodeAudioData.mockResolvedValue({ duration: 120 });
+
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    const { shareRemoteFileIfNeeded } = await import('../../share/remote-share.ts');
+    await expect(loadAndBroadcastFile(file, item.queueItemId, 11)).resolves.toBe(true);
+
+    expect(mocks.broadcast).toHaveBeenCalledWith({
+      type: MSG.FILE_PREPARE,
+      name: file.name,
+      mime: file.type,
+      size: file.size,
+      queueItemId: item.queueItemId,
+      sessionId: 11,
+    });
+    expect(vi.mocked(broadcastFileDebounced)).not.toHaveBeenCalled();
+    expect(vi.mocked(shareRemoteFileIfNeeded)).not.toHaveBeenCalled();
+  });
+
+  it('does not abandon a healthy native decode at the former 10-second deadline', async () => {
+    vi.useFakeTimers();
+    const file = new File([new Uint8Array([1, 2, 3])], 'slow-lossless.flac', {
+      type: 'audio/flac',
+    });
+    const item = makeFileTrack(file);
+    setState('playlist.items', [item]);
+    setCurrentIndex(0);
+
+    let resolveDecode!: (buffer: AudioBuffer) => void;
+    const nativeDecode = new Promise<AudioBuffer>((resolve) => {
+      resolveDecode = resolve;
+    });
+    mocks.decodeAudioData.mockReturnValue(nativeDecode);
+
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    let settled = false;
+    const result = loadAndBroadcastFile(file, item.queueItemId, 1).then((value) => {
+      settled = true;
+      return value;
+    });
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mocks.decodeAudioData).toHaveBeenCalledOnce();
+    expect(settled).toBe(false);
+
+    resolveDecode({ duration: 120 } as AudioBuffer);
+    await expect(result).resolves.toBe(true);
+  });
+});
+
+// Superseded host loads are inert on both success and failure. Neither path may
+// publish, fail, auto-advance, or restore a track after playlist teardown.
+describe('superseded host load is inert (rapid-click / remove-track supersession)', () => {
+  it.each(['host', 'demo'] as const)(
+    'does not clear a successor buffer when the old %s audio initialization settles late',
+    async (kind) => {
+      const { initAudio } = await import('../../audio/engine.ts');
+      let finishOldInit!: () => void;
+      // An already-built graph resumes its context without the graph-creation
+      // single flight. A later gesture can leave it running while the older
+      // native resume promise is still pending.
+      vi.mocked(initAudio).mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishOldInit = resolve;
+          }),
+      );
+      const fileA = new File([new Uint8Array([1])], 'old.mp3', { type: 'audio/mpeg' });
+      const fileB = new File([new Uint8Array([2])], 'current.mp3', { type: 'audio/mpeg' });
+      const itemA = makeFileTrack(fileA);
+      const itemB = makeFileTrack(fileB);
+      setState('playlist.items', [itemA, itemB]);
+      setCurrentIndex(0);
+      const { loadAndBroadcastFile, loadDemoFile } = await import('../decode.ts');
+      const oldLoad =
+        kind === 'host'
+          ? loadAndBroadcastFile(fileA, itemA.queueItemId, 1, getCurrentLoadEpoch())
+          : loadDemoFile(fileA, itemA, getCurrentLoadEpoch());
+      const nextEpoch = newLoadEpoch();
+      setCurrentIndex(1);
+      const nextBuffer = { duration: 120 } as AudioBuffer;
+      mocks.decodeAudioData.mockResolvedValueOnce(nextBuffer);
+      expect(await loadAndBroadcastFile(fileB, itemB.queueItemId, 2, nextEpoch)).toBe(true);
+      expect(getCurrentAudioBuffer()).toBe(nextBuffer);
+      mocks.showToast.mockClear();
+
+      finishOldInit();
+      await oldLoad;
+
+      expect(getCurrentAudioBuffer()).toBe(nextBuffer);
+      expect(getState('files.current')?.blob).toBe(fileB);
+      expect(mocks.decodeAudioData).toHaveBeenCalledTimes(1);
+      expect(mocks.showToast).not.toHaveBeenCalled();
+    },
+  );
+
+  function deferredDecode(): {
+    promise: Promise<{ duration: number }>;
+    resolve: (v: { duration: number }) => void;
+    reject: (e: unknown) => void;
+  } {
+    let resolve!: (v: { duration: number }) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<{ duration: number }>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  beforeEach(() => {
+    resetState();
+    bus.clear();
+    clearAllManagedTimers();
+    vi.clearAllMocks();
+    // A pre-decode ownership abort intentionally leaves one-shot decoder
+    // implementations unconsumed, so reset the queue between cases.
+    mocks.decodeAudioData.mockReset();
+  });
+
+  it('a load resolving after an epoch bump publishes nothing and leaves the play button alone', async () => {
+    const fileA = new File([new Uint8Array([1, 2, 3])], 'a.mp3', { type: 'audio/mpeg' });
+    const itemA = makeFileTrack(fileA);
+    setState('playlist.items', [itemA]);
+    setCurrentIndex(0);
+    setState('network.connectedPeers', [makeConnectedPeer('guest-a', false)]);
+
+    const decodeA = deferredDecode();
+    mocks.decodeAudioData.mockImplementationOnce(() => decodeA.promise);
+
+    const btnEvents: boolean[] = [];
+    bus.on('ui:play-btn-state', (on) => btnEvents.push(on));
+
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    const p = loadAndBroadcastFile(fileA, itemA.queueItemId, 1, getCurrentLoadEpoch());
+
+    // Playlist-empty teardown shape: epoch bump with NO successor load.
+    newLoadEpoch();
+    setState('playlist.currentQueueItemId', null);
+
+    decodeA.resolve({ duration: 120 });
+    expect(await p).toBe(false);
+
+    expect(mocks.decodeAudioData).not.toHaveBeenCalled();
+    expect(getState('files.current')).toBeNull(); // no resurrection publish
+    expect(vi.mocked(broadcastFileDebounced)).not.toHaveBeenCalled(); // no FILE_START(-1) to guests
+    expect(btnEvents).not.toContain(true); // soft-disable survives the finally
+  });
+
+  it('a superseded load failing late does not clobber the successor or auto-advance the room', async () => {
+    vi.useFakeTimers();
+    const fileA = new File([new Uint8Array([1, 2, 3])], 'a.mp3', { type: 'audio/mpeg' });
+    const fileB = new File([new Uint8Array([4, 5, 6])], 'b.mp3', { type: 'audio/mpeg' });
+    const fileC = new File([new Uint8Array([7, 8, 9])], 'c.mp3', { type: 'audio/mpeg' });
+    const itemA = makeFileTrack(fileA);
+    const itemB = makeFileTrack(fileB);
+    const itemC = makeFileTrack(fileC);
+    setState('playlist.items', [itemA, itemB, itemC]);
+    setCurrentIndex(0);
+
+    const decodeA = deferredDecode();
+    mocks.decodeAudioData
+      .mockImplementationOnce(() => decodeA.promise) // A wedges in its decode
+      .mockResolvedValueOnce({ duration: 120 }); // B decodes cleanly
+
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    const pA = loadAndBroadcastFile(fileA, itemA.queueItemId, 1, getCurrentLoadEpoch());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mocks.decodeAudioData).toHaveBeenCalledTimes(1);
+
+    // User clicks B while A is still decoding (playTrack shape: new epoch,
+    // new index, new load).
+    const epochB = newLoadEpoch();
+    setCurrentIndex(1);
+    const pB = loadAndBroadcastFile(fileB, itemB.queueItemId, 2, epochB);
+    expect(await pB).toBe(true);
+    expect(getState('files.current')?.blob).toBe(fileB);
+
+    mocks.transition.mockClear();
+    decodeA.reject(new Error('unsupported codec'));
+    expect(await pA).toBe(false);
+
+    // The stale failure must be fully inert:
+    expect(getState('files.current')?.blob).toBe(fileB); // B's published blob survives
+    expect(mocks.broadcastSystemMessage).not.toHaveBeenCalled(); // no room-wide skip notice
+    expect(mocks.transition).not.toHaveBeenCalled(); // no DECODE_ERROR stomp on B's FSM
+
+    // ...and no decode-fail-advance hijack: 700ms later the room is still on B.
+    await vi.advanceTimersByTimeAsync(700);
+    expect(getState('playlist.currentQueueItemId')).toBe(itemB.queueItemId);
+  });
+
+  it('starts a superseding decode immediately when both native leases fit together', async () => {
+    const makeProjectedFile = (name: string): File => {
+      const file = new File([new Uint8Array([1])], name, { type: 'audio/mpeg' });
+      // Unknown-duration accounting projects each 4 MiB file to a 264 MiB
+      // decode footprint. Its diagnostic reservation must not delay B.
+      Object.defineProperty(file, 'size', { configurable: true, value: 4 * 1024 * 1024 });
+      vi.spyOn(file, 'arrayBuffer').mockResolvedValue(new Uint8Array([1]).buffer);
+      return file;
+    };
+    const fileA = makeProjectedFile('joint-a.mp3');
+    const fileB = makeProjectedFile('joint-b.mp3');
+    const itemA = makeFileTrack(fileA);
+    const itemB = makeFileTrack(fileB);
+    setState('playlist.items', [itemA, itemB]);
+    setCurrentIndex(0);
+
+    const decodeA = deferredDecode();
+    mocks.decodeAudioData
+      .mockImplementationOnce(() => decodeA.promise)
+      .mockResolvedValueOnce({ duration: 120 });
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    const pA = loadAndBroadcastFile(fileA, itemA.queueItemId, 1, getCurrentLoadEpoch());
+    await vi.waitFor(() => expect(mocks.decodeAudioData).toHaveBeenCalledOnce());
+
+    const epochB = newLoadEpoch();
+    setCurrentIndex(1);
+    const pB = loadAndBroadcastFile(fileB, itemB.queueItemId, 2, epochB);
+
+    // B must enter native decode while superseded A is still settling.
+    await vi.waitFor(() => expect(mocks.decodeAudioData).toHaveBeenCalledTimes(2));
+    await expect(pB).resolves.toBe(true);
+
+    decodeA.resolve({ duration: 120 });
+    await expect(pA).resolves.toBe(false);
+    expect(getState('files.current')?.blob).toBe(fileB);
+  });
+
+  it('starts a superseding decode above the former predictive budget while the old decode is pending', async () => {
+    const makeProjectedFile = (name: string): File => {
+      const file = new File([new Uint8Array([1])], name, { type: 'audio/mpeg' });
+      // A 6 MiB unknown-duration input projects to 384 MiB PCM plus 12 MiB
+      // encoded working copies. Together they exceed the former 768 MiB budget,
+      // which remains diagnostic and must not delay the next track.
+      Object.defineProperty(file, 'size', { configurable: true, value: 6 * 1024 * 1024 });
+      vi.spyOn(file, 'arrayBuffer').mockResolvedValue(new Uint8Array([1]).buffer);
+      return file;
+    };
+    const fileA = makeProjectedFile('reserved-a.mp3');
+    const fileB = makeProjectedFile('reserved-b.mp3');
+    const itemA = makeFileTrack(fileA);
+    const itemB = makeFileTrack(fileB);
+    setState('playlist.items', [itemA, itemB]);
+    setCurrentIndex(0);
+
+    const decodeA = deferredDecode();
+    mocks.decodeAudioData
+      .mockImplementationOnce(() => decodeA.promise)
+      .mockResolvedValueOnce({ duration: 120 });
+    const { loadAndBroadcastFile } = await import('../decode.ts');
+    const pA = loadAndBroadcastFile(fileA, itemA.queueItemId, 1, getCurrentLoadEpoch());
+    await vi.waitFor(() => expect(mocks.decodeAudioData).toHaveBeenCalledOnce());
+
+    const epochB = newLoadEpoch();
+    setCurrentIndex(1);
+    const pB = loadAndBroadcastFile(fileB, itemB.queueItemId, 2, epochB);
+    try {
+      // Observe B's real decode and completion before allowing native A to
+      // settle, so an early microtask cannot masquerade as admission waiting.
+      await vi.waitFor(() => expect(mocks.decodeAudioData).toHaveBeenCalledTimes(2));
+      await expect(pB).resolves.toBe(true);
+      expect(fileB.arrayBuffer).toHaveBeenCalledOnce();
+    } finally {
+      decodeA.resolve({ duration: 120 });
+      await expect(pA).resolves.toBe(false);
+      await pB;
+    }
+    expect(getState('files.current')?.blob).toBe(fileB);
+    expect(mocks.broadcastSystemMessage).not.toHaveBeenCalled();
+  });
+});
+
+// clearPreviousTrackState must preserve an engaged download lifecycle while
+// still idling file playback when no pipeline is busy.
+describe('clearPreviousTrackState lifecycle guard (DV-1)', () => {
+  beforeEach(() => {
+    resetState();
+    bus.clear();
+    vi.clearAllMocks();
+  });
+
+  it('does not idle playback while the file pipeline is mid-engagement', async () => {
+    const { clearPreviousTrackState } = await import('../decode.ts');
+    mocks.isFilePipelineBusyForPlay.mockReturnValue(true);
+    setState('playback.mode', 'file');
+    setState('playback.activity', 'pending');
+
+    clearPreviousTrackState('file-prepare');
+
+    expect(getState('playback.mode')).toBe('file');
+    expect(getState('playback.activity')).toBe('pending');
+  });
+
+  it('still idles active file playback when the pipeline is not busy', async () => {
+    const { clearPreviousTrackState } = await import('../decode.ts');
+    mocks.isFilePipelineBusyForPlay.mockReturnValue(false);
+    setState('playback.mode', 'file');
+    setState('playback.activity', 'pending');
+
+    clearPreviousTrackState('file-prepare');
+
+    expect(getState('playback.mode')).toBeNull();
+    expect(getState('playback.activity')).toBe('idle');
+  });
+});

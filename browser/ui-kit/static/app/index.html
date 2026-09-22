@@ -1,0 +1,105 @@
+<!doctype html>
+<!-- MUSIXQUARE-authored file: AGPLv3 section 7 terms are in ADDITIONAL_TERMS.md; trademark use is addressed separately in TRADEMARKS.md. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>MUSIXQUARE · UI Kit</title>
+    <link rel="stylesheet" href="../../colors_and_type.css" />
+    <link rel="stylesheet" href="app.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #0a0a0a;
+        font-family: var(--font-sans);
+        min-height: 100vh;
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        padding: 24px;
+        box-sizing: border-box;
+      }
+      @media (max-width: 760px) {
+        body {
+          justify-content: flex-start;
+          padding: 12px;
+        }
+        .legend {
+          display: none;
+        }
+      }
+      .phone {
+        border: 10px solid #1f1f1f;
+        border-radius: 48px;
+        overflow: hidden;
+        box-shadow:
+          0 40px 80px rgba(0, 0, 0, 0.4),
+          0 0 0 1px rgba(255, 255, 255, 0.05);
+        width: 390px;
+        height: 844px;
+        flex-shrink: 0;
+      }
+      .legend {
+        color: #666;
+        font-size: 12px;
+        margin-left: 28px;
+        max-width: 260px;
+        margin-top: 40px;
+      }
+      .legend h1 {
+        color: #ddd;
+        font-size: 16px;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+        margin: 0 0 8px;
+      }
+      .legend p {
+        line-height: 1.55;
+        margin: 0 0 12px;
+      }
+      .legend ul {
+        padding-left: 18px;
+        margin: 0;
+      }
+      .legend li {
+        margin-bottom: 4px;
+      }
+      .legend kbd {
+        background: #1f1f1f;
+        color: #ddd;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-family: ui-monospace, monospace;
+        font-size: 11px;
+      }
+    </style>
+
+    <script
+      src="https://unpkg.com/react@18.3.1/umd/react.development.js"
+      integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L"
+      crossorigin="anonymous"
+    ></script>
+    <script
+      src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"
+      integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm"
+      crossorigin="anonymous"
+    ></script>
+  </head>
+  <body>
+    <div class="phone"><div id="root"></div></div>
+    <div class="legend">
+      <h1>MUSIXQUARE UI Kit</h1>
+      <p>
+        Non-authoritative click-through component sample. State is fake. Toggling the theme, picking
+        a role, playing a track, and flipping tabs all work.
+      </p>
+      <ul>
+        <li>Start on the landing screen and tap <strong>I'll host</strong></li>
+        <li>Pick a role, then explore the 5 tabs</li>
+        <li><kbd>Settings</kbd>: Light / Dark toggles themes</li>
+      </ul>
+    </div>
+
+    <script src="/designsystem/ui_kits/app/app.js"></script>
+  </body>
+</html>

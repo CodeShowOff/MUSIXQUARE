@@ -1,0 +1,74 @@
+name = "musixquare-signaling"
+main = "signaling-worker.ts"
+compatibility_date = "2026-05-04"
+workers_dev = false
+preview_urls = false
+upload_source_maps = true
+
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+[observability]
+enabled = true
+
+# Keep provider request-URL telemetry disabled as the production
+# credential-minimization baseline. PRO credentials are accepted only through
+# the exact WebSocket subprotocol contract, and custom logs remain URL-free.
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.1
+invocation_logs = false
+
+[observability.traces]
+enabled = false
+
+# Required at deploy time and intentionally never committed. All values must
+# be random and at least 32 characters, purpose-separated, and match only their
+# named counterpart:
+#   npm run wrangler -- secret put PRO_SIGNALING_SECRET --config cloudflare/wrangler.signaling.toml
+#   npm run wrangler -- secret put MXQR_STANDARD_ROOM_ACCOUNT_ASSERTION_SECRET --config cloudflare/wrangler.signaling.toml
+#   npm run wrangler -- secret put MXQR_STANDARD_ROOM_PIN_PEPPER --config cloudflare/wrangler.signaling.toml
+#   npm run wrangler -- secret put MXQR_REMOTE_SHARE_UPLOAD_ASSERTION_SECRET --config cloudflare/wrangler.signaling.toml
+#   (Remote Share rotation is documented in cloudflare/remote-share-ops.md.
+#   Standard PIN pepper rotation has a different retirement boundary; follow
+#   cloudflare/standard-room-pin-ops.md and never apply the 90-second assertion
+#   TTL rule to persisted room PIN verifiers.)
+
+[[routes]]
+pattern = "signal.musixquare.com"
+custom_domain = true
+
+# Cold Standard-room retry origin. The browser never preconnects this alias;
+# it is first contacted only after the primary signaling origin fails before
+# admission, so an iOS route hand-off gets a distinct hostname/TLS path while
+# still reaching this exact Worker and Durable Object namespace.
+[[routes]]
+pattern = "signal-alt.musixquare.com"
+custom_domain = true
+
+[[durable_objects.bindings]]
+name = "MUSIXQUARE_ROOMS"
+class_name = "MusixquareRoom"
+
+[[durable_objects.bindings]]
+name = "MUSIXQUARE_SERVICE_CONTROL"
+class_name = "MusixquareServiceControl"
+script_name = "musixquare-pro-room"
+
+# Private cross-script authority boundary for privileged PRO realtime frames.
+# Signaling derives the room/participant/incarnation from its admitted socket;
+# browsers cannot address this Durable Object binding directly.
+[[durable_objects.bindings]]
+name = "PRO_ROOM_AUTHORITY_ROOMS"
+class_name = "MusixquareProRoom"
+script_name = "musixquare-pro-room"
+
+# Shared PRO-room registry used to resolve the current room generation.
+[[d1_databases]]
+binding = "MUSIXQUARE_ADMIN_DB"
+database_name = "musixquare-admin-metrics"
+database_id = "d6cc9ceb-f0b6-40e4-99aa-8f28bec412ed"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MusixquareRoom"]

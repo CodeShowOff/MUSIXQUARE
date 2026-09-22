@@ -1,0 +1,519 @@
+import { beforeEach, describe, expect, it } from 'vitest';
+import { PLAYBACK_STATE, TRANSFER_STATE } from '../../core/constants.ts';
+import { getState, resetState, setState } from '../../core/state.ts';
+import {
+  claimPlaybackOwner,
+  createFileTrackMeta,
+  createSystemAudioTrackMeta,
+  createYouTubeTrackMetaForTests,
+  getPlaybackSelectionTrackMeta,
+  getPlaybackModeActivity,
+  getPlaybackModeActivitySnapshot,
+  getPlaybackOwnership,
+  getPlaybackProjection,
+  isExternalOwner,
+  isFileOwner,
+  isPlaybackIdle,
+  isPlaybackIdleCompat,
+  isPlaybackIdleCompatModeActivity,
+  isPlaybackActivityValue,
+  isPlaybackModeSystemAudio,
+  isPlaybackModeValue,
+  isPlaybackModeYouTube,
+  isPlaybackNonIdleFile,
+  isPlaybackPausedOrPendingFile,
+  isPlaybackPending,
+  isPlaybackPendingFile,
+  isPlaybackPlayingFile,
+  isPlaybackPlayingSystemAudio,
+  isPlaybackPlayingYouTube,
+  isSystemAudioOwner,
+  isSystemAudioPlaceholderMeta,
+  isYouTubeOwner,
+  releasePlaybackOwner,
+  setPlaybackFilePaused,
+  setPlaybackFilePlaying,
+  setPlaybackIdle,
+  setPlaybackSystemAudioPlaying,
+  setPlaybackLifecycleState,
+  setPlaybackTransferState,
+  setPlaybackYouTubePaused,
+  setPlaybackYouTubePlaying,
+  setSystemAudioReceiving,
+  setPlaybackTrackMeta,
+  updatePlaybackTrackDetails,
+  updatePlaybackTrackTitle,
+} from '../ownership.ts';
+
+beforeEach(() => {
+  resetState();
+});
+
+function expectPlaybackModeActivitySlots(mode: string | null, activity: string): void {
+  expect(getState('playback.mode')).toBe(mode);
+  expect(getState('playback.activity')).toBe(activity);
+}
+
+// Locks the production projection (exposed to e2e via
+// __MUSIXQUARE_GET_PLAYBACK_PROJECTION__) against the mirror in
+// e2e/helpers/wait.ts, so coarse playback assertions stay consistent with the
+// decomposed mode/activity/lifecycle contract.
+describe('getPlaybackProjection (e2e projection)', () => {
+  it('projects an idle room to IDLE', () => {
+    expect(getPlaybackProjection()).toBe('IDLE');
+  });
+
+  it('projects file playback to PLAYING_AUDIO / PAUSED', () => {
+    setPlaybackFilePlaying();
+    expect(getPlaybackProjection()).toBe('PLAYING_AUDIO');
+    setPlaybackFilePaused();
+    expect(getPlaybackProjection()).toBe('PAUSED');
+  });
+
+  it('projects a READY file pipeline (decoded, not yet playing) as PAUSED', () => {
+    setPlaybackLifecycleState(PLAYBACK_STATE.READY);
+    expect(getPlaybackProjection()).toBe('PAUSED');
+  });
+
+  it('projects YouTube playback to PLAYING_YOUTUBE', () => {
+    setPlaybackYouTubePlaying();
+    expect(getPlaybackProjection()).toBe('PLAYING_YOUTUBE');
+  });
+
+  it('projects system audio (sharing and receiving) to PLAYING_SYSTEM_AUDIO', () => {
+    setPlaybackSystemAudioPlaying();
+    expect(getPlaybackProjection()).toBe('PLAYING_SYSTEM_AUDIO');
+
+    resetState();
+    setSystemAudioReceiving(true);
+    expect(getPlaybackProjection()).toBe('PLAYING_SYSTEM_AUDIO');
+  });
+});
+
+describe('playback ownership view', () => {
+  it('defaults to no owner', () => {
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'none',
+      mode: null,
+      activity: 'idle',
+      hasFilePipeline: false,
+      isExternalOwner: false,
+    });
+    expect(getPlaybackModeActivity()).toEqual({ mode: null, activity: 'idle' });
+    expect(getPlaybackModeActivitySnapshot()).toEqual({ mode: null, activity: 'idle' });
+    expect(isPlaybackIdle()).toBe(true);
+    expectPlaybackModeActivitySlots(null, 'idle');
+  });
+
+  it('treats YouTube as an external owner', () => {
+    setPlaybackYouTubePlaying();
+
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'youtube',
+      mode: 'youtube',
+      activity: 'playing',
+      isExternalOwner: true,
+    });
+    expect(isExternalOwner()).toBe(true);
+    expect(isYouTubeOwner()).toBe(true);
+    expect(isPlaybackModeYouTube()).toBe(true);
+    expect(isPlaybackPlayingYouTube()).toBe(true);
+    expectPlaybackModeActivitySlots('youtube', 'playing');
+  });
+
+  it('preserves paused YouTube as YouTube ownership without reporting playing', () => {
+    setPlaybackYouTubePaused();
+
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'youtube',
+      mode: 'youtube',
+      activity: 'paused',
+      isExternalOwner: true,
+    });
+    expect(isYouTubeOwner()).toBe(true);
+    expect(isPlaybackModeYouTube()).toBe(true);
+    expect(isPlaybackPlayingYouTube()).toBe(false);
+    expectPlaybackModeActivitySlots('youtube', 'paused');
+  });
+
+  it('treats system audio playback as an external owner', () => {
+    setPlaybackSystemAudioPlaying();
+
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'system-audio',
+      mode: 'system-audio',
+      activity: 'playing',
+      isExternalOwner: true,
+    });
+    expect(isSystemAudioOwner()).toBe(true);
+    expect(isPlaybackModeSystemAudio()).toBe(true);
+    expect(isPlaybackPlayingSystemAudio()).toBe(true);
+    expectPlaybackModeActivitySlots('system-audio', 'playing');
+  });
+
+  it('treats the guest system-audio placeholder as ownership', () => {
+    setState('player.currentTrackMeta', {
+      type: 'file',
+      name: 'system-audio-receiving',
+      systemAudioPlaceholder: true,
+    });
+
+    expect(isSystemAudioPlaceholderMeta(getPlaybackOwnership().currentTrackMeta)).toBe(true);
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'system-audio',
+      mode: 'system-audio',
+      activity: 'pending',
+      isSystemAudioPlaceholder: true,
+      isExternalOwner: true,
+    });
+    expect(isSystemAudioOwner()).toBe(true);
+    expect(isPlaybackModeSystemAudio()).toBe(true);
+    expect(isPlaybackPending()).toBe(true);
+    expectPlaybackModeActivitySlots('system-audio', 'pending');
+  });
+
+  it('treats active file lifecycle or transfer work as file ownership', () => {
+    setState('playback.lifecycle', PLAYBACK_STATE.DOWNLOADING);
+    expect(isFileOwner()).toBe(true);
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'file',
+      mode: 'file',
+      activity: 'pending',
+      hasFilePipeline: true,
+      isExternalOwner: false,
+    });
+    expectPlaybackModeActivitySlots('file', 'pending');
+
+    resetState();
+    setState('transfer.state', TRANSFER_STATE.RECEIVING);
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'file',
+      mode: 'file',
+      activity: 'pending',
+      hasFilePipeline: true,
+      isExternalOwner: false,
+    });
+    expectPlaybackModeActivitySlots('file', 'pending');
+  });
+
+  it('claims active system-audio ownership with canonical metadata', () => {
+    claimPlaybackOwner('system-audio', {
+      currentTrackMeta: createSystemAudioTrackMeta('sharing'),
+    });
+
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'system-audio',
+      mode: 'system-audio',
+      activity: 'playing',
+      currentTrackMeta: {
+        name: 'system-audio',
+        title: 'System Audio Sharing',
+        systemAudioSurface: 'display',
+      },
+    });
+    expectPlaybackModeActivitySlots('system-audio', 'playing');
+  });
+
+  it('normalizes system-audio surface metadata without exposing raw picker text', () => {
+    expect(createSystemAudioTrackMeta('sharing', undefined, 'browser')).toMatchObject({
+      systemAudioSurface: 'browser',
+    });
+    expect(createSystemAudioTrackMeta('receiving', undefined, 'application')).toMatchObject({
+      systemAudioSurface: 'window',
+    });
+    expect(createSystemAudioTrackMeta('sharing', undefined, 'Secret YouTube tab')).toMatchObject({
+      systemAudioSurface: 'display',
+    });
+  });
+
+  it('claims pending system-audio ownership through placeholder mode/activity', () => {
+    claimPlaybackOwner('system-audio', {
+      pending: true,
+      currentTrackMeta: createSystemAudioTrackMeta('receiving'),
+    });
+
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'system-audio',
+      mode: 'system-audio',
+      activity: 'pending',
+      isSystemAudioPlaceholder: true,
+    });
+    expectPlaybackModeActivitySlots('system-audio', 'pending');
+  });
+
+  it('returns a sticky receiver placeholder to pending during a delivery handoff', () => {
+    claimPlaybackOwner('system-audio', {
+      pending: true,
+      currentTrackMeta: createSystemAudioTrackMeta('receiving'),
+    });
+
+    setSystemAudioReceiving(true);
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'system-audio',
+      mode: 'system-audio',
+      activity: 'playing',
+      isReceivingSystemAudio: true,
+      isSystemAudioPlaceholder: true,
+    });
+    expectPlaybackModeActivitySlots('system-audio', 'playing');
+
+    setSystemAudioReceiving(false);
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'system-audio',
+      mode: 'system-audio',
+      activity: 'pending',
+      isReceivingSystemAudio: false,
+      isSystemAudioPlaceholder: true,
+    });
+    expectPlaybackModeActivitySlots('system-audio', 'pending');
+  });
+
+  it('releases only the requested owner unless forced', () => {
+    setPlaybackYouTubePlaying();
+    const before = getPlaybackOwnership();
+
+    releasePlaybackOwner('system-audio');
+    expect(getPlaybackOwnership()).toEqual(before);
+
+    releasePlaybackOwner('system-audio', {
+      force: true,
+      currentTrackMeta: null,
+    });
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'none',
+      mode: null,
+      activity: 'idle',
+      currentTrackMeta: null,
+    });
+    expectPlaybackModeActivitySlots(null, 'idle');
+  });
+
+  it('sets track metadata through the ownership write helper', () => {
+    setPlaybackTrackMeta({ type: 'file', name: 'track.mp3', title: 'Track' });
+
+    expect(getPlaybackOwnership().currentTrackMeta).toMatchObject({
+      name: 'track.mp3',
+      title: 'Track',
+    });
+    expectPlaybackModeActivitySlots(null, 'idle');
+  });
+
+  it('mirrors placeholder metadata ownership into playback mode/activity slots', () => {
+    setPlaybackTrackMeta(createSystemAudioTrackMeta('receiving'));
+
+    expect(getPlaybackOwnership()).toMatchObject({
+      owner: 'system-audio',
+      mode: 'system-audio',
+      activity: 'pending',
+      isSystemAudioPlaceholder: true,
+    });
+    expectPlaybackModeActivitySlots('system-audio', 'pending');
+  });
+
+  it('freshens owner predicates when shadow mode/activity slots are stale', () => {
+    setPlaybackTrackMeta(createSystemAudioTrackMeta('receiving'));
+    setState('playback.mode', null);
+    setState('playback.activity', 'idle');
+
+    expect(isSystemAudioOwner()).toBe(true);
+    expect(isExternalOwner()).toBe(true);
+    expectPlaybackModeActivitySlots('system-audio', 'pending');
+  });
+
+  it('reconciles lifecycle, transfer, and system-audio source helpers into playback slots', () => {
+    setPlaybackTransferState(TRANSFER_STATE.RECEIVING);
+    expectPlaybackModeActivitySlots('file', 'pending');
+
+    setPlaybackLifecycleState(PLAYBACK_STATE.PAUSED);
+    expectPlaybackModeActivitySlots('file', 'paused');
+
+    resetState();
+    setSystemAudioReceiving(true);
+    expectPlaybackModeActivitySlots('system-audio', 'playing');
+  });
+
+  it('keeps file pause and resume writes stable across stale lifecycle sources', () => {
+    setPlaybackLifecycleState(PLAYBACK_STATE.PLAYING);
+    expectPlaybackModeActivitySlots('file', 'playing');
+
+    setPlaybackFilePaused();
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.PLAYING);
+    expect(getPlaybackModeActivity()).toEqual({ mode: 'file', activity: 'paused' });
+
+    setPlaybackLifecycleState(PLAYBACK_STATE.PAUSED);
+    expect(getPlaybackModeActivity()).toEqual({ mode: 'file', activity: 'paused' });
+
+    setPlaybackFilePlaying();
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.PAUSED);
+    expect(getPlaybackModeActivity()).toEqual({ mode: 'file', activity: 'playing' });
+
+    setPlaybackLifecycleState(PLAYBACK_STATE.PLAYING);
+    expect(getPlaybackModeActivity()).toEqual({ mode: 'file', activity: 'playing' });
+  });
+
+  it('clears stale file pipeline sources when semantic idle is requested', () => {
+    setPlaybackTransferState(TRANSFER_STATE.RECEIVING);
+    setPlaybackLifecycleState(PLAYBACK_STATE.PLAYING);
+    expect(getPlaybackOwnership()).toMatchObject({
+      mode: 'file',
+      activity: 'playing',
+      hasFilePipeline: true,
+    });
+
+    setPlaybackIdle();
+
+    expect(getPlaybackModeActivity()).toEqual({ mode: null, activity: 'idle' });
+    expect(getPlaybackOwnership()).toMatchObject({
+      mode: null,
+      activity: 'idle',
+      hasFilePipeline: false,
+    });
+    expect(getState('playback.lifecycle')).toBe(PLAYBACK_STATE.IDLE);
+    expect(getState('transfer.state')).toBe(TRANSFER_STATE.IDLE);
+  });
+
+  it('updates track metadata through the ownership write helper', () => {
+    setPlaybackTrackMeta(createFileTrackMeta('track.mp3'));
+
+    updatePlaybackTrackDetails({ artist: 'Artist' });
+
+    expect(getPlaybackOwnership().currentTrackMeta).toMatchObject({
+      name: 'track.mp3',
+      artist: 'Artist',
+    });
+  });
+
+  it('updates track titles with an optional fallback meta', () => {
+    updatePlaybackTrackTitle('Fetched Title', createYouTubeTrackMetaForTests({ name: 'Loading' }));
+
+    expect(getPlaybackOwnership().currentTrackMeta).toMatchObject({
+      type: 'youtube',
+      name: 'Loading',
+      title: 'Fetched Title',
+    });
+  });
+
+  it('updates and clears the current track artist without losing its title', () => {
+    setPlaybackTrackMeta(
+      createYouTubeTrackMetaForTests({ name: 'Video', videoId: 'abc', playlistId: null }),
+    );
+
+    updatePlaybackTrackDetails({ artist: 'Channel One' });
+    expect(getPlaybackOwnership().currentTrackMeta).toMatchObject({
+      title: 'Video',
+      artist: 'Channel One',
+    });
+
+    updatePlaybackTrackDetails({ artist: null });
+    expect(getPlaybackOwnership().currentTrackMeta).toMatchObject({ title: 'Video' });
+    expect(getPlaybackOwnership().currentTrackMeta?.artist).toBeUndefined();
+  });
+
+  it('drops a playlist-level artist from concrete YouTube playback metadata', () => {
+    const playlistTrack = {
+      ...createYouTubeTrackMetaForTests({
+        name: 'Playlist entry',
+        videoId: 'abc',
+        playlistId: 'PL_CROSS_CHANNEL',
+      }),
+      artist: 'Playlist owner',
+    };
+
+    const selectionTrack = getPlaybackSelectionTrackMeta(playlistTrack);
+
+    expect(selectionTrack).not.toBe(playlistTrack);
+    expect(selectionTrack.artist).toBeUndefined();
+    expect(playlistTrack.artist).toBe('Playlist owner');
+
+    const singleVideo = {
+      ...createYouTubeTrackMetaForTests({
+        name: 'Single video',
+        videoId: 'def',
+        playlistId: null,
+      }),
+      artist: 'Exact channel',
+    };
+    expect(getPlaybackSelectionTrackMeta(singleVideo)).toBe(singleVideo);
+  });
+
+  it('creates canonical synthetic file track metadata', () => {
+    expect(createFileTrackMeta('demo.mp3')).toEqual({
+      type: 'file',
+      title: 'demo',
+      name: 'demo.mp3',
+      videoId: null,
+      playlistId: null,
+    });
+    expect(createFileTrackMeta('Version.2')).toEqual({
+      type: 'file',
+      title: 'Version.2',
+      name: 'Version.2',
+      videoId: null,
+      playlistId: null,
+    });
+  });
+
+  it('creates canonical synthetic YouTube track metadata', () => {
+    expect(
+      createYouTubeTrackMetaForTests({ name: 'Video', videoId: 'abc', playlistId: null }),
+    ).toEqual({
+      type: 'youtube',
+      name: 'Video',
+      title: 'Video',
+      videoId: 'abc',
+      playlistId: null,
+    });
+  });
+
+  it('preserves compatibility IDLE semantics as a narrow predicate', () => {
+    expect(isPlaybackIdleCompatModeActivity({ mode: null, activity: 'idle' })).toBe(true);
+    expect(isPlaybackIdleCompatModeActivity({ mode: 'file', activity: 'idle' })).toBe(true);
+    expect(isPlaybackIdleCompatModeActivity({ mode: 'file', activity: 'pending' })).toBe(false);
+    expect(isPlaybackIdleCompatModeActivity({ mode: 'file', activity: 'paused' })).toBe(false);
+    expect(isPlaybackIdleCompatModeActivity({ mode: 'youtube', activity: 'playing' })).toBe(false);
+    expect(isPlaybackIdleCompatModeActivity({ mode: 'system-audio', activity: 'pending' })).toBe(
+      true,
+    );
+    expect(isPlaybackIdleCompatModeActivity({ mode: 'system-audio', activity: 'playing' })).toBe(
+      false,
+    );
+
+    setPlaybackSystemAudioPlaying();
+    expect(isPlaybackIdleCompat()).toBe(false);
+
+    setState('playback.activity', 'pending');
+    expect(isPlaybackIdleCompat()).toBe(true);
+  });
+
+  it('writes playback mode/activity through semantic helpers', () => {
+    setPlaybackFilePlaying();
+    expect(getPlaybackModeActivity()).toEqual({ mode: 'file', activity: 'playing' });
+
+    setPlaybackFilePaused();
+    expect(getPlaybackModeActivity()).toEqual({ mode: 'file', activity: 'paused' });
+
+    setPlaybackYouTubePlaying();
+    expect(getPlaybackModeActivity()).toEqual({ mode: 'youtube', activity: 'playing' });
+
+    setPlaybackSystemAudioPlaying();
+    expect(getPlaybackModeActivity()).toEqual({ mode: 'system-audio', activity: 'playing' });
+
+    setPlaybackIdle();
+    expect(getPlaybackModeActivity()).toEqual({ mode: null, activity: 'idle' });
+  });
+
+  it('evaluates mode/activity predicates against supplied snapshots', () => {
+    expect(isPlaybackModeValue('file')).toBe(true);
+    expect(isPlaybackModeValue('audio')).toBe(false);
+    expect(isPlaybackActivityValue('playing')).toBe(true);
+    expect(isPlaybackActivityValue('loading')).toBe(false);
+    expect(isPlaybackPlayingFile({ mode: 'file', activity: 'playing' })).toBe(true);
+    expect(isPlaybackPlayingFile({ mode: 'file', activity: 'paused' })).toBe(false);
+    expect(isPlaybackPendingFile({ mode: 'file', activity: 'pending' })).toBe(true);
+    expect(isPlaybackPausedOrPendingFile({ mode: 'file', activity: 'paused' })).toBe(true);
+    expect(isPlaybackPausedOrPendingFile({ mode: 'file', activity: 'pending' })).toBe(true);
+    expect(isPlaybackPausedOrPendingFile({ mode: 'youtube', activity: 'paused' })).toBe(false);
+    expect(isPlaybackNonIdleFile({ mode: 'file', activity: 'paused' })).toBe(true);
+    expect(isPlaybackNonIdleFile({ mode: 'file', activity: 'idle' })).toBe(false);
+  });
+});

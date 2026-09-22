@@ -1,0 +1,988 @@
+/* ==========================================================================
+   Wide desktop dashboard, active from 1280px.
+   Layout: [ Play ] | [ Playlist / Chat ] | [ Settings ]
+   ========================================================================== */
+
+@layer desktop {
+  @media (min-width: 1280px) {
+    /*
+       Desktop density experiment
+
+       Treat very large 100%-scaled displays like a physically larger version
+       of the familiar desktop canvas. A root transform scales fixed-pixel
+       controls as a single system; the inverse logical viewport keeps the
+       dashboard inside the real screen instead of creating overflow. Unlike
+       CSS `zoom`, transform preserves one consistent coordinate system for
+       grid rows and fixed-position descendants.
+
+       FHD and smaller desktop canvases intentionally remain 1:1. These values
+       are deliberately gentler than raw resolution ratios (QHD 1.333 / 4K 2)
+       so the app gains presence without throwing away all extra workspace.
+    */
+    body {
+      --desktop-ui-scale: 1;
+      --desktop-layout-ratio: 1;
+      --desktop-viewport-width: calc(100vw * var(--desktop-layout-ratio));
+      --desktop-viewport-height: calc(var(--app-height, 100dvh) * var(--desktop-layout-ratio));
+    }
+
+    /* Browser chrome and the OS taskbar reduce a maximized QHD viewport well
+       below the panel's nominal 1440px. Height remains the safety gate, so a
+       5120x1080 strip stays 1:1 while a genuinely taller ultrawide still gains
+       the same density as QHD. */
+    @media (min-width: 2560px) and (min-height: 1280px) {
+      body {
+        --desktop-ui-scale: 1.2;
+        --desktop-layout-ratio: 0.833333;
+      }
+    }
+
+    /* A maximized 4K browser commonly exposes roughly 2,000px of content
+       height rather than the panel's nominal 2160px. */
+    @media (min-width: 3840px) and (min-height: 1900px) {
+      body {
+        --desktop-ui-scale: 1.5;
+        --desktop-layout-ratio: 0.666667;
+      }
+    }
+
+    /* ---------------------------------------------------
+       1. Application Base Grid
+       --------------------------------------------------- */
+    body {
+      transform: scale(var(--desktop-ui-scale));
+      transform-origin: top left;
+      display: grid;
+      /* Preserve the familiar 420px side panels at FHD, then distribute
+         additional width at a 3:1:1 ratio so ultra-wide screens invest more
+         space in playlist/chat and settings instead of empty play gutters. */
+      grid-template-columns:
+        minmax(0, 3fr)
+        minmax(420px, 1fr)
+        minmax(420px, 1fr);
+      grid-template-rows: var(--header-height) 1fr 1fr;
+      grid-template-areas:
+        'header header header'
+        'tab-play tab-playlist tab-settings'
+        'tab-play tab-chat tab-settings';
+      gap: 0;
+      padding: 0;
+      background: var(--bg);
+      overflow: hidden;
+      /* Use JS-measured visible viewport height when available.
+           Prevents clipping on Android tablets where 100vh may include the
+           area behind the system navigation bar (esp. landscape / PWA). */
+      width: var(--desktop-viewport-width);
+      height: var(--desktop-viewport-height);
+      max-height: var(--desktop-viewport-height);
+    }
+
+    /* RTL anchors the reduced logical body to the right edge. Scale from
+       that same edge so QHD/4K controls and focus rings stay in the viewport. */
+    html[dir='rtl'] body {
+      transform-origin: top right;
+    }
+
+    header {
+      grid-area: header;
+      position: relative;
+      width: 100%;
+      padding-inline-start: 24px;
+      padding-inline-end: 24px;
+      box-sizing: border-box;
+      box-shadow: none;
+      background: var(--surface-1);
+      border-bottom: none;
+      margin-bottom: 0;
+    }
+
+    /* ---------------------------------------------------
+       2. Hide Mobile Elements
+       --------------------------------------------------- */
+    .bottom-nav,
+    .bottom-nav::before {
+      display: none;
+    }
+
+    #btn-chat-close,
+    #chat-preview-btn {
+      display: none;
+    }
+
+    /* ---------------------------------------------------
+       3. Shared Panel Styles
+       --------------------------------------------------- */
+    #tab-play,
+    .chat-drawer,
+    #tab-playlist,
+    #tab-settings,
+    #tab-guide,
+    #tab-connect {
+      padding-top: 0;
+      display: flex;
+      flex-direction: column;
+      opacity: 1;
+      visibility: visible;
+      pointer-events: auto;
+      position: relative;
+      transform: none;
+      height: 100%;
+      top: 0;
+      left: 0;
+      width: 100%;
+
+      /* The wide dashboard keeps every panel visible, including the play panel
+       that mobile parks off-screen while YouTube owns playback. */
+    }
+    body.mode-youtube #tab-play:not(.active) {
+      position: relative;
+      left: 0;
+      opacity: 1;
+      visibility: visible;
+      pointer-events: auto;
+      transform: none;
+      z-index: auto;
+
+      background: transparent;
+      border-radius: 0;
+      border: 0;
+      border-inline-end: 1px solid var(--divider);
+      box-shadow: none;
+      overflow: hidden;
+    }
+
+    /* Panel bodies own scrolling while headers remain fixed in the grid. */
+    .tab-body,
+    .chat-drawer-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding-bottom: 16px;
+      scroll-padding-bottom: 0;
+    }
+
+    /* Entrance-staggered settings sections begin just outside the panel.
+       Keep that horizontal travel clipped without changing vertical scroll. */
+    #tab-settings > .tab-body {
+      overflow-x: hidden;
+    }
+
+    #tab-play .tab-body {
+      /* Keep the rail in place while the scroller includes the transport
+         buttons' outer hit area and keyboard focus ring. */
+      width: calc(100% + 40px);
+      padding-inline: 20px;
+      box-sizing: border-box;
+      padding-top: 0;
+      padding-bottom: 0;
+    }
+
+    #tab-playlist > .playlist-selection-pill {
+      left: 24px;
+      right: 24px;
+      bottom: calc(16px + var(--safe-bottom) + var(--safe-nav-bottom, 0px));
+    }
+
+    /* Five auto margins divide desktop free height into 2:1:2 shares:
+       two above the stage, one before metadata, and two before secondary
+       actions. The configured fixed content insets remain intact. */
+    #tab-play .tab-body::before {
+      content: '';
+      flex: 0 0 0;
+      margin-top: auto;
+    }
+
+    #tab-play .track-box,
+    #tab-play .play-secondary-area {
+      margin-top: auto;
+      margin-bottom: 0;
+    }
+
+    #tab-play .controls-area {
+      margin-top: 0;
+      margin-bottom: auto;
+    }
+
+    /* Panel headers stay outside their scrolling bodies. */
+    .tab-header,
+    .chat-drawer-header {
+      flex: none;
+      padding: 32px 32px 16px;
+      position: relative;
+      background: transparent;
+      z-index: 10;
+      border-bottom: none;
+      margin-bottom: 0;
+    }
+
+    /* Chat panel has padding: 0 (unlike tab-playlist's padding: 0 4px),
+       so nudge the chat header's left padding by +4 to keep its title on
+       the same X as the other tab titles. */
+    .chat-drawer-header {
+      padding-inline-start: 36px;
+    }
+
+    /* Shared panel-title metrics keep header rows aligned. */
+    .tab-title,
+    .chat-drawer-title,
+    .track-title {
+      font-size: 24px;
+      font-weight: var(--font-weight-display);
+      letter-spacing: -0.02em;
+      color: var(--text-main);
+      /* Lock line-box to 36px (24 × 1.5) so the title's own height matches
+           the 36px right-side content (buttons / invite wrapper) in tab
+           headers. Without this, chat-header's lone title renders at 29px
+           line-box while tab-headers' flex cross-axis stays 36px, pushing
+           those titles ~3.5px lower via align-items: center. */
+      line-height: 1.5;
+    }
+
+    /* ---------------------------------------------------
+       4. Specific Panel: Play (Main)
+       --------------------------------------------------- */
+    #tab-play {
+      --playback-rail-width: min(
+        100%,
+        max(360px, calc((var(--desktop-viewport-height) - 400px) * 16 / 9))
+      );
+
+      grid-area: tab-play;
+      flex-direction: column;
+      justify-content: flex-start;
+      align-items: center;
+      /* One panel inset owns the shared stage-and-controls rail. */
+      padding: 0 44px;
+      border-inline-end: 1px solid var(--divider);
+      min-width: 0;
+      min-height: 0;
+      max-width: 100%;
+      gap: 16px;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+
+    #tab-playlist {
+      /* The narrow 420px column uses half of tab-play's inset. chat-drawer
+           shares this column and keeps padding: 0
+           (compensated via .chat-drawer-header padding-left). */
+      padding: 0 4px;
+      border-inline-end: 1px solid var(--divider);
+      border-bottom: 1px solid var(--divider);
+    }
+
+    .chat-drawer {
+      padding: 0;
+      border-inline-end: 1px solid var(--divider);
+      background: transparent;
+      box-shadow: none;
+      /* Reset the mobile slide-up drawer into a grid panel. */
+      position: relative;
+      visibility: visible;
+      height: 100%;
+      max-height: 100%;
+      overflow: hidden;
+      border-radius: 0;
+    }
+
+    #tab-settings {
+      /* Narrow 420px column — matches tab-playlist's 4px. Nested settings
+           controls get extra breathing via .settings-subtab-panel's own
+           8px inner padding (total 12px inset from panel edge). */
+      padding: 0 4px;
+    }
+
+    .play-header-desktop {
+      display: none;
+    }
+
+    .play-action-buttons {
+      position: relative;
+      bottom: auto;
+      left: auto;
+      right: auto;
+      width: 100%;
+      max-width: calc(100% - 80px);
+      margin-inline-start: auto;
+      margin-inline-end: auto;
+      gap: 12px;
+      margin-top: auto;
+      padding-bottom: 0px;
+      flex-shrink: 0;
+      justify-content: center;
+    }
+
+    .play-action-buttons .file-select-btn-large {
+      font-size: 15px;
+    }
+
+    .playback-stage {
+      /* Prefer a 360px stage rail when the play column permits it. Controls
+         stay centered on a deliberate 4px optical inset per side. */
+      --visualizer-content-block-size: max(
+        160px,
+        min(calc(22vw * var(--desktop-layout-ratio)), calc(30vh * var(--desktop-layout-ratio)))
+      );
+      width: var(--playback-rail-width);
+      max-width: none;
+      flex-shrink: 0;
+      margin: auto auto 0;
+    }
+
+    /* Demo moves this wrapper outside the playback stage. Keep its sizing
+       independent of the stage's inherited visualizer height token. */
+    .playback-stage > .vinyl-wrapper {
+      width: auto;
+      max-width: 100%;
+      height: min(100%, var(--visualizer-content-block-size));
+      flex: none;
+      aspect-ratio: 1;
+      min-height: 0;
+      margin: 0;
+    }
+
+    body.viz-spectrum .playback-stage > .vinyl-wrapper {
+      width: 100%;
+      max-width: none;
+      height: min(100%, var(--visualizer-content-block-size));
+      aspect-ratio: auto;
+      padding: 0;
+    }
+
+    /* Preserve the larger visualizer treatment on QHD/4K while the outer
+       playback footprint remains identical to YouTube. */
+    @media (min-width: 2560px) and (min-height: 1280px) {
+      .playback-stage {
+        --visualizer-content-block-size: max(
+          160px,
+          min(calc(28vw * var(--desktop-layout-ratio)), calc(42vh * var(--desktop-layout-ratio)))
+        );
+      }
+    }
+
+    .video-wrapper {
+      width: 100%;
+      height: 100%;
+      max-width: none;
+      margin: 0;
+      border-radius: 16px;
+      box-shadow: none;
+    }
+
+    /* Content groups follow the adaptive stage rail with a centered 4px
+       optical inset per side. */
+    .track-box,
+    .controls-area,
+    .play-secondary-area {
+      width: calc(var(--playback-rail-width) - 8px);
+      max-width: none;
+      box-sizing: border-box;
+      padding: 20px 0 0;
+      margin-top: 0;
+      margin-inline-start: auto;
+      margin-inline-end: auto;
+      flex-grow: 0;
+    }
+
+    .track-box,
+    .play-secondary-area {
+      margin-top: auto;
+    }
+
+    .controls-area {
+      padding-top: 12px;
+    }
+
+    .play-secondary-area {
+      padding-bottom: 32px;
+    }
+
+    /* ---------------------------------------------------
+       5. Specific Panel: Chat
+       --------------------------------------------------- */
+    .chat-drawer {
+      grid-area: tab-chat;
+    }
+
+    /* Desktop entrance animation for chat (can't use .app-entrance
+       because mobile .chat-drawer has its own transform/transition
+       for the slide-up drawer that conflicts) */
+    @keyframes chatEntranceUp {
+      from {
+        opacity: 0;
+        transform: translateY(20px);
+      }
+      to {
+        opacity: 1;
+        transform: none;
+      }
+    }
+
+    .chat-drawer.app-chat-entrance {
+      animation: chatEntranceUp 0.8s cubic-bezier(0.22, 1, 0.36, 1) 0.2s both;
+    }
+
+    /* Desktop: no backdrop, no drag handle */
+    .chat-backdrop {
+      display: none;
+    }
+
+    .chat-drawer-header {
+      cursor: default;
+      touch-action: auto;
+    }
+
+    .chat-drawer-header::before {
+      display: none;
+    }
+
+    /* Hide chat title when messages exist — more room for bubbles */
+    .chat-drawer.has-messages .chat-drawer-header {
+      display: none;
+    }
+
+    /* ---------------------------------------------------
+       6. Specific Panel: Playlist
+       --------------------------------------------------- */
+    #tab-playlist {
+      grid-area: tab-playlist;
+    }
+
+    /* ---------------------------------------------------
+       7. Specific Panel: Settings
+       --------------------------------------------------- */
+    #tab-settings {
+      grid-area: tab-settings;
+      /* Padding bottom is handled by .tab-content style above */
+    }
+
+    /* ---------------------------------------------------
+       8. Mobile-only Guide and Connect Tabs
+       --------------------------------------------------- */
+    #tab-guide,
+    #tab-connect {
+      display: none;
+    }
+
+    /* ---------------------------------------------------
+       8b. Settings Sub-Tab Navigation (Desktop)
+       --------------------------------------------------- */
+    .settings-subtab-nav {
+      display: flex;
+      gap: 4px;
+      padding: 16px 20px 0;
+      border-bottom: 1px solid var(--divider);
+      /* Deliberate prominent inset — the pill bar is a visual anchor, so
+           it sits 20px in from the panel's 4px padding edge (total 24px from
+           the panel border), visually wider than the sub-panel content. */
+      margin: 0 20px;
+    }
+
+    .subtab-pill {
+      flex: 1;
+      padding: 10px 0;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-sub);
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+      transition:
+        color 0.2s,
+        border-color 0.2s;
+      text-align: center;
+    }
+
+    .subtab-pill:hover {
+      color: var(--text-main);
+    }
+
+    .subtab-pill.active {
+      color: var(--primary);
+      border-bottom-color: var(--primary);
+    }
+
+    /* Sub-panels: only active visible */
+    .settings-subtab-panel {
+      display: none;
+      /* Extra 8px inner padding for nested settings controls (e.g., sliders,
+           section groups). Stacks on top of #tab-settings' 4px padding for a
+           12px total inset — deeper than playlist's 4px because settings
+           content is denser and benefits from more breathing. */
+      padding: 0 8px;
+    }
+
+    .settings-subtab-panel.active {
+      display: block;
+    }
+
+    /* Device list in settings audio panel — hidden on desktop too
+       (connection UI lives in the "연결" sub-tab instead) */
+    .settings-device-section {
+      display: none;
+    }
+
+    /* Connect sub-panel content — match 20px inner padding of other panels */
+    #desktop-connect-content .qr-container,
+    #desktop-connect-content .administrator-list,
+    #desktop-connect-content .device-list,
+    #desktop-connect-content .room-password-code-row {
+      margin-inline-start: 20px;
+      margin-inline-end: 20px;
+    }
+
+    /* ---------------------------------------------------
+       9. Setup/Onboarding Overlay — Desktop Dimension Overrides
+       Structure lives in @layer base (unified 2-column section).
+       Here we only override dimension tokens + add desktop-only rules.
+       --------------------------------------------------- */
+    #setup-overlay {
+      --setup-panel-w: 480px;
+      --setup-px: 44px;
+      --setup-px-end: 44px;
+      --setup-head-py: clamp(48px, 7vh, 80px);
+      --setup-head-px: clamp(48px, 5vw, 80px);
+      --setup-logo-h: clamp(22px, calc(-34px + 4.375vw), 29px);
+      --setup-logo-mt: clamp(3px, calc(-18px + 1.625vw), 5px);
+      --setup-logo-mb: 12px;
+      --setup-h2: clamp(24px, calc(-40px + 5vw), 32px);
+      --setup-h2-mb: 8px;
+      --setup-p: clamp(16px, 1.25vw, 18px);
+      --setup-p-lh: 1.5;
+      --setup-diagram-pad: clamp(16px, 3vh, 40px) clamp(40px, 6vw, 100px);
+      --setup-svg-max: clamp(480px, 60vw, 780px);
+      --setup-guide-gap: clamp(40px, 6vh, 72px);
+      --setup-guide-svg-max: clamp(420px, 55vw, 680px);
+      --setup-guide-svg-h: clamp(100px, 16vh, 200px);
+      --setup-guide-desc: clamp(14px, 1.3vw, 18px);
+      --setup-guide-mt: 0px;
+      --setup-icon: clamp(72px, 8vw, 100px);
+      --setup-icon-svg: clamp(32px, 3.5vw, 44px);
+      --setup-slider-w: clamp(320px, 60%, 560px);
+      --setup-ob-title: clamp(22px, 2.2vw, 28px);
+      --setup-ob-title-mb: 8px;
+      --setup-ob-desc: clamp(13px, 1.1vw, 15px);
+      --setup-nav-mt: 24px;
+      --setup-nav-arrow: flex;
+      --setup-actions-top: 16px;
+      --setup-actions-bottom: 40px;
+
+      position: fixed;
+      inset: 0;
+      z-index: 5000;
+      background: var(--bg);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+
+    /* Desktop-only: full-viewport card positioning */
+    #setup-overlay .setup-card.full-screen {
+      position: fixed;
+      inset: 0;
+      width: var(--desktop-viewport-width);
+      max-width: none;
+      height: var(--desktop-viewport-height);
+      max-height: var(--desktop-viewport-height);
+      outline: none;
+      box-shadow: none;
+      transform: none;
+    }
+
+    #setup-overlay .setup-mobile-view {
+      box-shadow: none;
+    }
+
+    /* Desktop-only: slider scale by viewport height */
+    .desktop-diagram-area #ob-slider-area {
+      transform: scale(1);
+      transform-origin: center center;
+    }
+
+    @media (min-height: 750px) {
+      .desktop-diagram-area #ob-slider-area {
+        transform: scale(1.1);
+      }
+    }
+
+    @media (min-height: 900px) {
+      .desktop-diagram-area #ob-slider-area {
+        transform: scale(1.2);
+      }
+    }
+
+    /* Desktop-only: nav arrow sizing (landscape hides them via token) */
+    .ob-nav-arrow {
+      width: 22px;
+      height: 22px;
+    }
+
+    /* Reset narrow-layout offsets on the role diagram. */
+    #setup-role-area .setup-graphic-container {
+      margin-inline-start: 0;
+      margin-inline-end: 0;
+      width: 100%;
+    }
+
+    /* Map media/youtube overlays into the main Play grid area instead of full-screen popups */
+    #media-source-overlay,
+    #youtube-url-overlay {
+      position: relative;
+      grid-area: tab-play;
+      z-index: 5000;
+      background: var(--bg);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+      border-inline-end: 1px solid var(--divider);
+      padding: 0;
+      border-radius: 0;
+      overflow-x: hidden;
+      overflow-y: scroll;
+      display: none;
+      height: 100%;
+      max-height: 100%;
+      min-height: 0;
+      min-width: 0;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
+      inset: auto;
+    }
+
+    #media-source-overlay.active,
+    #youtube-url-overlay.active {
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* When an overlay is active, `inert` on body children already blocks
+       interaction on the side panels (set in dom.ts). Add a visual dim so the
+       spatial cue matches the blocked state. Setup overlay covers the whole
+       viewport on desktop, so this is harmless there. */
+    #tab-playlist,
+    .chat-drawer,
+    #tab-settings {
+      transition: opacity 0.2s ease;
+    }
+
+    body.overlay-open #tab-playlist,
+    body.overlay-open .chat-drawer,
+    body.overlay-open #tab-settings {
+      opacity: 0.4;
+    }
+
+    #media-source-overlay .setup-card.full-screen,
+    #youtube-url-overlay .setup-card.full-screen {
+      position: relative;
+      top: 0;
+      left: 0;
+      transform: none;
+      width: 100%;
+      height: auto;
+      min-height: 100%;
+      max-height: none;
+      border-radius: 0;
+      border: none;
+      box-shadow: none;
+      background: transparent;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Keep the role diagram within the desktop panel. */
+    #setup-role-area .setup-graphic-container {
+      margin-inline-start: 0;
+      margin-inline-end: 0;
+      width: 100%;
+    }
+
+    /* Overlay sections retain their intrinsic height. */
+    .setup-card.full-screen > * {
+      flex-shrink: 0;
+    }
+
+    /* The media choices stay top-aligned, but this is the one desktop card
+       section that may shrink and scroll when the viewport is unusually
+       short. The generic rule above must not clip its final choice. */
+    #media-source-overlay .setup-card.full-screen > .setup-slot-list {
+      flex-shrink: 1;
+      min-height: 0;
+      overflow-y: auto;
+    }
+
+    /* Padding for inner content (media/youtube overlays) */
+    #media-source-overlay .setup-card.full-screen > div:not(.ob-actions):not(.cscroll-track),
+    #youtube-url-overlay .setup-card.full-screen > div:not(.ob-actions):not(.cscroll-track) {
+      padding-inline-start: 40px;
+      padding-inline-end: 40px;
+    }
+
+    /* Use desktop horizontal padding while preserving the action-bar rhythm. */
+    #media-source-overlay .setup-card.full-screen .ob-actions,
+    #youtube-url-overlay .setup-card.full-screen .ob-actions {
+      background: transparent;
+      padding-inline-start: 40px;
+      padding-inline-end: 40px;
+      padding-bottom: 40px;
+    }
+
+    /* YouTube URL overlay: keep buttons always visible, let middle content scroll */
+    #youtube-url-overlay .setup-card.full-screen {
+      height: 100%;
+      max-height: 100%;
+      overflow: hidden;
+    }
+
+    #youtube-url-overlay .setup-card.full-screen .setup-join-area {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+    }
+
+    #youtube-url-overlay .setup-card.full-screen .ob-actions {
+      flex-shrink: 0;
+      margin-top: auto;
+    }
+
+    /* Limit preview thumbnail to avoid pushing buttons off-screen */
+    #youtube-url-overlay #youtube-preview {
+      max-height: calc(var(--desktop-viewport-height) - 420px);
+      overflow-y: auto;
+    }
+
+    #youtube-url-overlay #youtube-preview-thumb {
+      max-height: calc(40vh * var(--desktop-layout-ratio));
+      width: 100%;
+      object-fit: cover;
+    }
+
+    .desktop-help-section {
+      display: block;
+      margin-top: 28px; /* 28px + help-block padding-top 16px = 44px, matching other sub-tabs */
+    }
+
+    button[data-tab='guide'] {
+      display: none;
+    }
+
+    /* Desktop section groups use a divider-only treatment. */
+    .section-group {
+      background: transparent;
+      margin: 0 12px;
+      box-shadow: none;
+      border: none;
+      border-radius: 0;
+      border-bottom: 1px solid var(--divider);
+    }
+
+    .section-group:last-of-type,
+    #last-setting-section {
+      border-bottom: none;
+    }
+
+    #tab-settings .channel-grid {
+      padding: 12px 20px 12px;
+    }
+
+    .section-header-row {
+      border-bottom: none;
+      padding: 44px 20px 16px;
+    }
+
+    .accent-action-btn,
+    .leave-session-btn {
+      margin-inline-start: 20px;
+      margin-inline-end: 20px;
+      width: calc(100% - 40px);
+    }
+
+    body.mode-demo .demo-finish-content .demo-large-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      width: 100%;
+      max-width: 100%;
+      align-self: stretch;
+      gap: 8px;
+    }
+
+    body.mode-demo .demo-finish-content .demo-large-actions .accent-action-btn,
+    body.mode-demo .demo-finish-content .demo-large-actions .leave-session-btn {
+      flex: none;
+      width: 100%;
+      margin-inline-start: 0;
+      margin-inline-end: 0;
+    }
+
+    /* Align the first audio section with the other settings sections. */
+    #youtube-settings-disabled-wrap .section-group:first-of-type .section-header-row {
+      padding-top: 44px;
+    }
+
+    .section-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text-main);
+      text-transform: none;
+      letter-spacing: normal;
+    }
+
+    /* Keep supporting copy on the same desktop inset as its title and
+       controls. Base/mobile already shares the section's 44px edge. */
+    .settings-option-description {
+      margin: -8px 20px 16px;
+    }
+
+    .settings-option-description.settings-role-description {
+      margin-bottom: 24px;
+    }
+
+    .slider-wrap {
+      padding: 6px 20px;
+    }
+
+    /* Subdue control labels so section titles retain hierarchy. */
+    .slider-header {
+      font-weight: 500;
+      color: var(--text-sub);
+      margin-bottom: 8px;
+    }
+
+    .slider-header > span {
+      color: var(--text-sub);
+    }
+
+    .slider-header .val-disp {
+      font-weight: 700;
+      color: var(--primary);
+    }
+
+    .help-block {
+      background: transparent;
+      margin: 0 16px 16px;
+      padding: 16px;
+      border: none;
+      box-shadow: none;
+    }
+
+    .help-block.legal-block {
+      border-top: 1px solid var(--divider);
+      margin-top: 16px;
+      padding-top: 28px;
+    }
+
+    .playlist-ul {
+      margin: 0 16px;
+    }
+
+    /* Desktop tab-body scroll setup */
+    .tab-body {
+      overflow-y: auto;
+    }
+
+    /* Chat scroll wrapper: relative container for custom scrollbar overlay */
+    .chat-scroll-wrapper {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+    }
+
+    /* Desktop: custom scrollbar inside each panel (not viewport edge) */
+    .cscroll-track {
+      position: absolute;
+    }
+
+    /* Symmetric padding is safe because the overlay scrollbar does not consume
+       content width. */
+    .chat-drawer-messages {
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding-inline-start: 16px;
+      padding-inline-end: 16px;
+      height: 100%;
+    }
+
+    /* System messages: full-bleed override to reach both padding edges */
+    .chat-group.system .chat-row {
+      width: calc(100% + 32px);
+      margin: 0 -16px;
+    }
+
+    .track-item {
+      border-bottom: none;
+    }
+
+    .chat-drawer-input {
+      background: transparent;
+    }
+
+    /* Keep the action buttons consistently sized on all desktop viewports rather than full-width */
+    .play-action-buttons {
+      justify-content: center;
+    }
+
+    .play-action-buttons .file-select-btn {
+      min-height: 56px;
+      height: auto;
+      padding: 10px 16px;
+      border-radius: 20px;
+      justify-content: center;
+      align-items: center;
+    }
+
+    /* Desktop action buttons show labels beside their icons. */
+    .play-action-buttons span {
+      display: block;
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .play-action-buttons .file-select-btn svg {
+      width: 22px;
+      height: 22px;
+      margin: 0;
+    }
+  }
+} /* end @layer desktop */
+
+/* These base components use viewport units outside cascade layers. Once the
+   desktop dashboard is transformed, give them the same inverse viewport so
+   dialogs and full-screen flows are enlarged exactly once. */
+@media (min-width: 1280px) {
+  /* This must remain unlayered so it can override the shared unlayered
+     `.flex-1` utility without relying on cross-layer !important semantics. */
+  .play-action-buttons .file-select-btn {
+    width: 160px;
+    min-width: 160px;
+    flex: none;
+  }
+
+  .dialog.account-dialog,
+  .dialog.administrator-permissions-dialog {
+    max-height: calc(var(--desktop-viewport-height) - 48px);
+  }
+
+  .onboarding-overlay {
+    max-height: var(--desktop-viewport-height) !important;
+  }
+
+  .onboarding-overlay .setup-card.full-screen {
+    height: var(--desktop-viewport-height) !important;
+    max-height: var(--desktop-viewport-height) !important;
+  }
+
+  .onboarding-overlay .setup-mobile-view {
+    max-height: var(--desktop-viewport-height) !important;
+  }
+
+  .demo-mobile-shell {
+    height: var(--desktop-viewport-height);
+    min-height: var(--desktop-viewport-height);
+  }
+
+  /* Fake fullscreen must use the physical viewport and therefore temporarily
+     opts out of dashboard density scaling. */
+  body.has-fake-fullscreen {
+    --desktop-ui-scale: 1;
+    --desktop-layout-ratio: 1;
+  }
+}
